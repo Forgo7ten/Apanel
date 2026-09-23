@@ -1,0 +1,9 @@
+node_modules
+.next
+npm-debug.log*
+.DS_Store
+.git
+.gitignore
+.env*
+!.env.example
+tests

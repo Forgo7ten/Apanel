@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+
+  /* Apanel v1 design tokens. Values are RGB triplets for Tailwind alpha utilities. */
+  --color-app: 15 17 21;
+  --color-panel: 21 25 34;
+  --color-card: 17 24 39;
+  --color-line: 39 48 65;
+  --color-primary: 229 231 235;
+  --color-secondary: 148 163 184;
+  /* #94A3B8 keeps supporting copy above WCAG AA on the dark surfaces. */
+  --color-muted: 148 163 184;
+  --color-brand: 37 99 235;
+  --color-positive: 34 197 94;
+  --color-warning: 234 179 8;
+  --color-negative: 239 68 68;
+  --color-neutral: 148 163 184;
+
+  /* Layout and type tokens from the v1 design system. */
+  --space-page: 24px;
+  --space-card: 16px;
+  --font-size-title: 20px;
+}
+
+* {
+  border-color: rgb(var(--color-line) / 1);
+}
+
+html {
+  min-width: 320px;
+  background: rgb(var(--color-app) / 1);
+}
+
+body {
+  min-height: 100vh;
+  background: rgb(var(--color-app) / 1);
+  color: rgb(var(--color-primary) / 1);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid rgb(var(--color-brand) / 1);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgb(var(--color-brand) / 0.32);
+  color: rgb(var(--color-primary) / 1);
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
