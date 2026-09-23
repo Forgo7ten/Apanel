@@ -36,6 +36,19 @@ URL-safe 字符），并通过反向代理或防火墙限制 PostgreSQL、Redis 
 迁移与调度器只执行数据库/任务基础设施，不接收或校验 `JWT_SECRET_KEY`；只有
 backend API 进程需要生产 JWT 密钥。
 
+## Sprint 2 行情服务
+
+行情服务使用 `MARKET_DATA_PROVIDER=tdx` 和 `PROVIDER_TIMEOUT_SECONDS`，并通过
+Compose 传入实际的 PostgreSQL/Redis 地址。内部同步接口为
+`POST /internal/sync/daily` 与 `POST /internal/sync/securities`，必须使用
+`X-Internal-Token: <INTERNAL_API_TOKEN>`（或 Bearer）；这个服务间 token 只传给
+`market-data-service`，不会传给 frontend。Compose 缺少 `INTERNAL_API_TOKEN` 会
+明确失败；`.env.example` 已提供可运行的本地占位值，生产环境必须替换为随机密钥。
+
+TDX 依赖 `pytdx`，该项目存在归档/维护中断风险，公网 TDX 节点也可能不可用；本次
+集成未宣称已完成真实网络验证。`pytdx` 原始日线不提供前复权，`qfq` 必须配置
+factor transformer 后才能使用，不能把未复权数据标记为 `qfq`。
+
 ## 首次创建管理员与邀请注册
 
 迁移完成、后端容器可用后，在 backend 容器内执行一次：

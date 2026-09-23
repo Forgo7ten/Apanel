@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.config import get_settings
 
@@ -30,6 +35,23 @@ def create_engine(
         echo=settings.database_echo if echo is None else echo,
         pool_pre_ping=True,
         connect_args=connect_args,
+    )
+
+
+def create_session_factory(
+    database_engine: AsyncEngine,
+) -> async_sessionmaker[AsyncSession]:
+    """Create the application-scoped async session factory.
+
+    Repositories own one transaction per public write operation.  Sessions
+    are intentionally not shared across requests or sync symbols.
+    """
+
+    return async_sessionmaker(
+        bind=database_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
     )
 
 

@@ -6,6 +6,20 @@ from app.core.config import Settings
 from app.main import create_app
 
 
+class ClosingProvider:
+    async def get_symbols(self):
+        return ()
+
+    async def get_quote(self, symbol):
+        raise NotImplementedError
+
+    async def get_daily_bars(self, symbol, start, end, adjustment="none"):
+        raise NotImplementedError
+
+    async def get_dividends(self, symbol):
+        return ()
+
+
 def test_lifespan_closes_the_app_scoped_resources() -> None:
     app = create_app(Settings(app_env="test"))
     assert not hasattr(app.state, "db_engine")
@@ -21,3 +35,19 @@ def test_lifespan_closes_the_app_scoped_resources() -> None:
 
     close_redis.assert_awaited_once_with(app.state.redis_client)
     dispose_engine.assert_awaited_once_with(app.state.db_engine)
+
+
+def test_lifespan_initializes_and_closes_provider_resource() -> None:
+    app = create_app(Settings(app_env="test"))
+    provider = ClosingProvider()
+    with (
+        patch("app.main.create_provider", return_value=provider) as create_provider,
+        patch("app.main.close_provider", new_callable=AsyncMock) as close_provider,
+        patch("app.main.close_redis_client", new_callable=AsyncMock),
+        patch("app.main.dispose_engine", new_callable=AsyncMock),
+    ):
+        with TestClient(app):
+            assert app.state.provider is provider
+
+    create_provider.assert_called_once()
+    close_provider.assert_awaited_once_with(provider)

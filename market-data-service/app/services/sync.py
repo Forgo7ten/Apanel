@@ -1,0 +1,336 @@
+"""Provider-to-repository synchronization services."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import date
+from typing import Literal
+
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from app.domain.market_data import (
+    Adjustment,
+    DailyBar,
+    InvalidMarketDataError,
+    Security,
+    normalize_adjustment,
+    normalize_symbol,
+)
+from app.providers.base import MarketDataProvider
+from app.providers.errors import (
+    ProviderConfigurationError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+)
+from app.repositories.market_data import (
+    DailyBarRepository,
+    PersistenceSystemError,
+    SecurityRepository,
+)
+
+SyncStatus = Literal["success", "failed"]
+
+
+@dataclass(frozen=True, slots=True)
+class SyncError:
+    """Safe, structured error data returned for one symbol."""
+
+    code: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class SyncItemResult:
+    """Outcome for one symbol (or ``*`` for a provider-wide failure)."""
+
+    symbol: str
+    status: SyncStatus
+    fetched: int = 0
+    persisted: int = 0
+    error: SyncError | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "success"
+
+
+@dataclass(frozen=True, slots=True)
+class SyncSummary:
+    """Deterministic sync result that callers can serialize directly."""
+
+    operation: str
+    items: tuple[SyncItemResult, ...]
+
+    @property
+    def total(self) -> int:
+        return len(self.items)
+
+    @property
+    def succeeded(self) -> int:
+        return sum(item.succeeded for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        return self.total - self.succeeded
+
+    @property
+    def ok(self) -> bool:
+        return self.failed == 0
+
+
+class SecuritySyncService:
+    """Synchronize security metadata with batch-first failure isolation."""
+
+    def __init__(self, *, provider: MarketDataProvider, repository: SecurityRepository) -> None:
+        self._provider = provider
+        self._repository = repository
+
+    async def sync(self) -> SyncSummary:
+        try:
+            raw_records = tuple(await self._provider.get_symbols())
+        except Exception as exc:
+            return SyncSummary(
+                operation="security",
+                items=(
+                    SyncItemResult(
+                        symbol="*",
+                        status="failed",
+                        error=_sync_error(exc),
+                    ),
+                ),
+            )
+
+        records: list[Security] = []
+        results: dict[str, SyncItemResult] = {}
+        for raw_record in raw_records:
+            try:
+                record = _require_security(raw_record)
+                if record.symbol in results:
+                    continue
+                records.append(record)
+                results[record.symbol] = SyncItemResult(
+                    symbol=record.symbol,
+                    status="success",
+                    fetched=1,
+                )
+            except Exception as exc:
+                symbol = _best_effort_symbol(raw_record)
+                results.setdefault(
+                    symbol,
+                    SyncItemResult(
+                        symbol=symbol,
+                        status="failed",
+                        error=_sync_error(exc),
+                    ),
+                )
+
+        if records:
+            persisted = await _persist_with_isolation(
+                records,
+                self._repository.upsert_many,
+            )
+            for symbol, error in persisted.items():
+                previous = results[symbol]
+                results[symbol] = (
+                    SyncItemResult(
+                        symbol=symbol,
+                        status="success",
+                        fetched=previous.fetched,
+                        persisted=1,
+                    )
+                    if error is None
+                    else SyncItemResult(
+                        symbol=symbol,
+                        status="failed",
+                        fetched=previous.fetched,
+                        error=error,
+                    )
+                )
+        return SyncSummary(operation="security", items=tuple(results.values()))
+
+
+class DailyBarSyncService:
+    """Fetch and persist bars while isolating provider/repository failures."""
+
+    def __init__(self, *, provider: MarketDataProvider, repository: DailyBarRepository) -> None:
+        self._provider = provider
+        self._repository = repository
+
+    async def sync(
+        self,
+        *,
+        symbols: Iterable[str],
+        start: date,
+        end: date,
+        adjustment: Adjustment | str = Adjustment.NONE,
+    ) -> SyncSummary:
+        selected_adjustment = normalize_adjustment(adjustment)
+        canonical_symbols: list[str] = []
+        results: dict[str, SyncItemResult] = {}
+        for raw_symbol in symbols:
+            try:
+                symbol = normalize_symbol(raw_symbol)
+            except Exception as exc:
+                symbol = _best_effort_symbol(raw_symbol)
+                results.setdefault(
+                    symbol,
+                    SyncItemResult(symbol=symbol, status="failed", error=_sync_error(exc)),
+                )
+                continue
+            if symbol not in results:
+                canonical_symbols.append(symbol)
+
+        pending: dict[str, tuple[DailyBar, ...]] = {}
+        for symbol in canonical_symbols:
+            try:
+                raw_bars = tuple(
+                    await self._provider.get_daily_bars(
+                        symbol,
+                        start,
+                        end,
+                        selected_adjustment,
+                    )
+                )
+                bars = _validated_bars(symbol, raw_bars, selected_adjustment)
+                pending[symbol] = bars
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="success",
+                    fetched=len(bars),
+                )
+            except Exception as exc:
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="failed",
+                    error=_sync_error(exc),
+                )
+
+        records = tuple(bar for bars in pending.values() for bar in bars)
+        if records:
+            persisted = await _persist_with_isolation(
+                records,
+                self._repository.upsert_many,
+                key=lambda record: record.symbol,
+            )
+            for symbol, error in persisted.items():
+                previous = results[symbol]
+                results[symbol] = (
+                    SyncItemResult(
+                        symbol=symbol,
+                        status="success",
+                        fetched=previous.fetched,
+                        persisted=previous.fetched,
+                    )
+                    if error is None
+                    else SyncItemResult(
+                        symbol=symbol,
+                        status="failed",
+                        fetched=previous.fetched,
+                        error=error,
+                    )
+                )
+        return SyncSummary(operation="daily_bar", items=tuple(results.values()))
+
+
+def _require_security(value: object) -> Security:
+    if not isinstance(value, Security):
+        raise InvalidMarketDataError("provider returned a non-Security record")
+    return value
+
+
+def _validated_bars(
+    symbol: str,
+    records: Sequence[object],
+    adjustment: Adjustment,
+) -> tuple[DailyBar, ...]:
+    unique: dict[tuple[str, date, Adjustment], DailyBar] = {}
+    for value in records:
+        if not isinstance(value, DailyBar):
+            raise InvalidMarketDataError("provider returned a non-DailyBar record")
+        if value.symbol != symbol:
+            raise InvalidMarketDataError(
+                f"provider returned bar for {value.symbol}, requested {symbol}"
+            )
+        if value.adjustment is not adjustment:
+            raise InvalidMarketDataError("provider returned a different adjustment mode")
+        unique[(value.symbol, value.trade_date, value.adjustment)] = value
+    return tuple(unique.values())
+
+
+async def _persist_with_isolation(
+    records: Sequence[object],
+    upsert_many,
+    *,
+    key=lambda record: record.symbol,
+) -> dict[str, SyncError | None]:
+    """Attempt one batch, then retry each symbol batch when it fails."""
+
+    grouped: dict[str, list[object]] = {}
+    for record in records:
+        grouped.setdefault(key(record), []).append(record)
+    try:
+        await upsert_many(tuple(records))
+        return {symbol: None for symbol in grouped}
+    except Exception as exc:
+        # A unique/foreign-key violation can be caused by one malformed
+        # record and is safe to isolate below.  Connection, timeout, and
+        # transaction failures indicate a broken database and must reach the
+        # API as a system error instead of being mislabeled per-symbol data.
+        if _is_systemic_persistence_error(exc):
+            raise
+        outcomes: dict[str, SyncError | None] = {}
+        for symbol, symbol_records in grouped.items():
+            try:
+                await upsert_many(tuple(symbol_records))
+            except Exception as exc:
+                outcomes[symbol] = SyncError(
+                    code="PERSISTENCE_ERROR",
+                    message=_safe_message(exc),
+                )
+            else:
+                outcomes[symbol] = None
+        return outcomes
+
+
+def _best_effort_symbol(value: object) -> str:
+    if isinstance(value, str):
+        try:
+            return normalize_symbol(value)
+        except Exception:
+            return value.strip() or "<invalid>"
+    if hasattr(value, "symbol"):
+        candidate = value.symbol
+        if isinstance(candidate, str):
+            return candidate
+    return "<invalid>"
+
+
+def _sync_error(exc: Exception) -> SyncError:
+    if isinstance(exc, (ProviderTimeoutError, TimeoutError, asyncio.TimeoutError)):
+        code = "PROVIDER_TIMEOUT"
+    elif isinstance(exc, ProviderConfigurationError):
+        code = "PROVIDER_NOT_CONFIGURED"
+    elif isinstance(exc, ProviderUnavailableError):
+        code = "PROVIDER_UNAVAILABLE"
+    elif isinstance(exc, InvalidMarketDataError):
+        code = "INVALID_MARKET_DATA"
+    else:
+        code = "PROVIDER_ERROR"
+    return SyncError(code=code, message=_safe_message(exc))
+
+
+def _safe_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message[:240] if message else exc.__class__.__name__
+
+
+def _is_systemic_persistence_error(exc: Exception) -> bool:
+    """Return whether retrying individual symbols would hide an outage."""
+
+    if isinstance(exc, PersistenceSystemError):
+        return True
+    # Integrity errors are the one SQLAlchemy failure we can safely retry per
+    # symbol; other SQLAlchemy errors include connection/transaction failures.
+    return isinstance(exc, SQLAlchemyError) and not isinstance(exc, IntegrityError)

@@ -31,3 +31,13 @@ def test_production_rejects_a_missing_database_password() -> None:
 
     with pytest.raises(ValueError, match="non-default PostgreSQL password"):
         settings.validate_runtime_credentials()
+
+
+def test_production_rejects_missing_internal_sync_token() -> None:
+    settings = Settings(
+        app_env="production",
+        database_url="postgresql+asyncpg://apanel:unique-secret@db/apanel",
+    )
+
+    with pytest.raises(ValueError, match="INTERNAL_API_TOKEN"):
+        settings.validate_runtime_credentials()
