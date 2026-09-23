@@ -9,8 +9,8 @@ from app.tasks.scheduler import celery_app as scheduler_app
 from app.tasks.worker import celery_app as worker_app
 
 
-def test_sprint0_has_no_business_tables() -> None:
-    assert list(Base.metadata.tables) == []
+def test_sprint1_auth_models_are_registered_for_migrations() -> None:
+    assert set(Base.metadata.tables) >= {"users", "invitations", "refresh_sessions"}
 
 
 def test_worker_and_scheduler_share_the_celery_application() -> None:

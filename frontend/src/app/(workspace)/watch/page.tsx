@@ -11,7 +11,7 @@ export default function WatchPage() {
       <section className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
         <div>
           <p className="text-xs font-medium uppercase tracking-[0.16em] text-brand">Watch workspace</p>
-        <h1 className="mt-2 text-title font-bold tracking-tight text-primary">股票监控</h1>
+          <h1 className="mt-2 text-title font-bold tracking-tight text-primary">股票监控</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-secondary">在一个高密度工作区里扫描价格、指标变化与可关注状态。</p>
         </div>
         <button type="button" disabled className="inline-flex h-9 items-center justify-center gap-2 rounded-panel bg-brand px-3.5 text-sm font-medium text-white opacity-60 shadow-panel" title="Sprint 1 开放">

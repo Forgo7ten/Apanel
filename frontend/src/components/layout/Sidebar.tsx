@@ -1,8 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { useState } from "react";
 
+import { useAuth } from "@/components/auth/AuthProvider";
 import { navItems } from "@/lib/navigation";
 
 import { NavIcon } from "./NavIcon";
@@ -13,6 +15,23 @@ function isActivePath(pathname: string, href: string) {
 
 export function Sidebar() {
   const pathname = usePathname() ?? "/watch";
+  const router = useRouter();
+  const { user, logout } = useAuth();
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  async function handleLogout() {
+    setLoggingOut(true);
+
+    try {
+      await logout();
+    } finally {
+      router.replace("/login");
+      setLoggingOut(false);
+    }
+  }
+
+  const displayName = user?.username ?? "当前用户";
+  const avatarText = displayName.slice(0, 1).toUpperCase();
 
   return (
     <aside className="flex w-full shrink-0 flex-col border-b border-line bg-panel lg:sticky lg:top-0 lg:h-screen lg:w-60 lg:border-b-0 lg:border-r">
@@ -52,17 +71,21 @@ export function Sidebar() {
         })}
       </nav>
 
-      <div className="hidden border-t border-line px-5 py-5 lg:block">
+      <div className="border-t border-line px-4 py-4 lg:px-5 lg:py-5">
         <div className="flex items-center gap-3">
-          <div className="grid size-8 place-items-center rounded-full border border-line bg-card text-xs font-semibold text-secondary">访</div>
+          <div className="grid size-8 place-items-center rounded-full border border-line bg-card text-xs font-semibold text-secondary" aria-hidden="true">{avatarText}</div>
           <div className="min-w-0">
-            <p className="truncate text-xs font-medium text-primary">访客工作区</p>
-            <p className="mt-0.5 truncate text-[11px] text-muted">Sprint 0 · 本地环境</p>
+            <p className="truncate text-xs font-medium text-primary">{displayName}</p>
+            <p className="mt-0.5 truncate text-[11px] text-muted">Apanel 用户</p>
           </div>
-          <span role="status" className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-muted">
-            <span aria-hidden="true" className="size-2 rounded-full bg-positive" />
-            <span>界面就绪</span>
-          </span>
+          <button
+            type="button"
+            onClick={handleLogout}
+            disabled={loggingOut}
+            className="ml-auto rounded border border-line bg-card px-2 py-1.5 text-[11px] font-medium text-secondary transition hover:border-brand/60 hover:text-primary focus:outline-none focus:ring-2 focus:ring-brand/40 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {loggingOut ? "退出中…" : "退出"}
+          </button>
         </div>
       </div>
     </aside>

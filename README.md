@@ -31,7 +31,25 @@ Compose 会先启动 PostgreSQL，再运行一次 `alembic upgrade head`；迁�
 `.env` 只用于本地配置，不要提交；在非本地环境中务必替换示例数据库密码（使用
 URL-safe 字符），并通过反向代理或防火墙限制 PostgreSQL、Redis 和内部服务的
 访问。数据库与 Redis 数据分别保存在 `postgres_data` 和 `redis_data` Compose
-命名卷中。
+命名卷中。认证配置也必须替换 `JWT_SECRET_KEY`；生产环境使用
+`APP_ENV=production`、`REFRESH_COOKIE_SECURE=true` 和 HTTPS。
+迁移与调度器只执行数据库/任务基础设施，不接收或校验 `JWT_SECRET_KEY`；只有
+backend API 进程需要生产 JWT 密钥。
+
+## 首次创建管理员与邀请注册
+
+迁移完成、后端容器可用后，在 backend 容器内执行一次：
+
+```bash
+docker compose exec backend python -m app.cli bootstrap-admin \
+  --username admin --email admin@example.com
+```
+
+命令会安全地交互式读取管理员密码；也可以在自动化环境中用 stdin 提供两行密码。
+管理员登录 <http://localhost:8080/login> 后，调用 `POST /api/v1/auth/invitations`
+创建邀请。响应中的 token 只返回一次，把它放入注册地址的 URL fragment：
+`http://localhost:8080/register#token=<token>`。受邀用户提交用户名和密码完成注册，
+然后登录进入工作台。refresh token 只通过 HttpOnly cookie 传输，不会出现在 JSON 响应中。
 
 ## 本地验证
 

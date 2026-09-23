@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 
-import { WorkspaceShell } from "@/components/layout/WorkspaceShell";
+import { AuthProvider } from "@/components/auth/AuthProvider";
 
 import "./globals.css";
 
@@ -20,7 +20,7 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body>
-        <WorkspaceShell>{children}</WorkspaceShell>
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

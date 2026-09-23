@@ -18,6 +18,17 @@ KNOWN_DEFAULT_DATABASE_PASSWORDS = frozenset(
     }
 )
 
+KNOWN_DEFAULT_JWT_SECRETS = frozenset(
+    {
+        "development-only-jwt-secret-change-me-at-least-32-bytes",
+        "change-me",
+        "changeme",
+        "secret",
+        "your-secret-key",
+        "replace_with_a_long_random_jwt_secret_at_least_32_bytes",
+    }
+)
+
 
 class Settings(BaseSettings):
     """Environment-backed settings with safe local development defaults."""
@@ -64,6 +75,17 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     log_level: str = "INFO"
     timezone: str = "Asia/Shanghai"
+    jwt_secret_key: str = Field(
+        default="development-only-jwt-secret-change-me-at-least-32-bytes",
+        validation_alias=AliasChoices("JWT_SECRET_KEY", "JWT_SECRET"),
+    )
+    jwt_issuer: str = Field(default="apanel", validation_alias=AliasChoices("JWT_ISSUER"))
+    jwt_audience: str = Field(default="apanel-web", validation_alias=AliasChoices("JWT_AUDIENCE"))
+    access_token_ttl_seconds: int = Field(default=900, gt=0)
+    refresh_token_ttl_seconds: int = Field(default=60 * 60 * 24 * 30, gt=0)
+    invitation_ttl_seconds: int = Field(default=60 * 60 * 24 * 7, gt=0)
+    refresh_cookie_name: str = "refresh_token"
+    refresh_cookie_secure: bool | None = None
 
     @model_validator(mode="after")
     def normalize_environment(self) -> "Settings":
@@ -74,8 +96,13 @@ class Settings(BaseSettings):
         self.environment = self.app_env
         return self
 
-    def validate_runtime_credentials(self) -> None:
-        """Reject known development database credentials in production."""
+    def validate_database_credentials(self) -> None:
+        """Reject known development database credentials in production.
+
+        Migrations and scheduler processes use this narrow check.  They must
+        not need the application's JWT signing secret merely to connect to the
+        database.
+        """
 
         if self.app_env.casefold() != "production":
             return
@@ -89,6 +116,32 @@ class Settings(BaseSettings):
                 "Production requires a non-default PostgreSQL password; "
                 "set POSTGRES_PASSWORD/DATABASE_URL to a unique secret."
             )
+
+    def validate_auth_credentials(self) -> None:
+        """Require strong authentication credentials for the API process."""
+
+        if self.app_env.casefold() != "production":
+            return
+
+        if (
+            self.jwt_secret_key in KNOWN_DEFAULT_JWT_SECRETS
+            or len(self.jwt_secret_key.encode("utf-8")) < 32
+        ):
+            raise ValueError(
+                "Production requires a JWT secret with at least 32 bytes; "
+                "set JWT_SECRET_KEY to a unique secret."
+            )
+        if self.refresh_cookie_secure is False:
+            raise ValueError(
+                "Production requires a secure refresh cookie; "
+                "set REFRESH_COOKIE_SECURE=true or leave it unset."
+            )
+
+    def validate_runtime_credentials(self) -> None:
+        """Validate all credentials required by the backend API process."""
+
+        self.validate_database_credentials()
+        self.validate_auth_credentials()
 
 
 @lru_cache(maxsize=1)

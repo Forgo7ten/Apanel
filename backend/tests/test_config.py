@@ -31,3 +31,15 @@ def test_production_rejects_a_missing_database_password() -> None:
 
     with pytest.raises(ValueError, match="non-default PostgreSQL password"):
         settings.validate_runtime_credentials()
+
+
+def test_infrastructure_validation_does_not_require_the_jwt_secret() -> None:
+    settings = Settings(
+        app_env="production",
+        database_url="postgresql+asyncpg://apanel:unique@db/apanel",
+    )
+
+    settings.validate_database_credentials()
+
+    with pytest.raises(ValueError, match="JWT secret"):
+        settings.validate_auth_credentials()

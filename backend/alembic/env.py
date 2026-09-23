@@ -20,6 +20,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.core.config import get_settings  # noqa: E402
 from app.db.base import Base  # noqa: E402
+from app import models as _models  # noqa: E402,F401
 
 config = context.config
 target_metadata = Base.metadata
@@ -29,7 +30,7 @@ def run_migrations_offline() -> None:
     """Render SQL without connecting to PostgreSQL."""
 
     settings = get_settings()
-    settings.validate_runtime_credentials()
+    settings.validate_database_credentials()
     context.configure(
         url=settings.database_url,
         target_metadata=target_metadata,
@@ -50,7 +51,7 @@ async def run_async_migrations() -> None:
     """Run migrations through SQLAlchemy's async engine bridge."""
 
     settings = get_settings()
-    settings.validate_runtime_credentials()
+    settings.validate_database_credentials()
     section = config.get_section(config.config_ini_section, {})
     section["sqlalchemy.url"] = settings.database_url
     connectable = async_engine_from_config(
