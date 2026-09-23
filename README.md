@@ -1,82 +1,114 @@
-# Apanel v1
+# Apanel
 
-Apanel 是面向 A 股技术指标监控与预警的 Docker Compose 应用。Sprint 0
-提供前端、FastAPI 后端、行情服务、调度器、PostgreSQL、Redis 与 Nginx
-的可运行编排骨架。
+Apanel 是一个面向 A 股的技术指标监控与提醒工作台。它把行情数据、指标计算和状态识别放在后端，把可操作的监控界面放在前端，帮助用户发现值得关注的变化。
 
-## 最短运行方式
+Apanel 不预测价格、不提供买卖建议，也不执行自动交易。当前仓库提供可运行的认证、行情数据服务、指标与状态计算内核，以及工作台界面骨架。
+
+## 当前能力
+
+- 管理员初始化、邀请注册、登录、刷新和退出登录。
+- FastAPI 后端健康检查，统一 JSON 成功/错误响应。
+- 可插拔的指标注册表，内置 MA、Projected MA、RSI、KDJ、BOLL 和 MACD。
+- 可复用的状态注册表与状态引擎，内置交叉、方向、带宽变化和突破状态。
+- 独立的行情数据服务，提供 TDX provider、证券元数据、日线、报价快照和分红事件的持久化边界。
+- Next.js 工作台，包括登录、邀请注册、股票监控、通知和设置页面。
+- Docker Compose 编排 PostgreSQL、Redis、迁移、后端、行情服务、调度器、前端和 Nginx。
+
+## 架构组件
+
+| 组件 | 作用 | Compose 网络中的端口 |
+| --- | --- | --- |
+| `nginx` | 对外入口；转发 Web、前端健康检查和后端 API | 宿主机 `${HTTP_PORT}`，默认 `8080` |
+| `frontend` | Next.js 页面、浏览器认证会话和 `/api/health` | `3000`（仅内部暴露） |
+| `backend` | FastAPI 认证、健康检查、指标与状态内核 | `8000`（仅内部暴露） |
+| `market-data-service` | provider 适配、行情读取与同步、市场数据持久化 | `8001`（仅内部暴露） |
+| `migrate` | 启动前执行 Alembic 数据库迁移 | 一次性容器 |
+| `scheduler` | Celery Beat 进程入口 | 无 HTTP 端口 |
+| `postgres` | PostgreSQL 16，认证和行情数据存储 | 仅内部网络 |
+| `redis` | 健康检查客户端、Celery broker/result backend | 仅内部网络 |
+
+## 技术栈
+
+- Python 3.12、FastAPI、Pydantic Settings、SQLAlchemy 2、Alembic、asyncpg。
+- PostgreSQL 16、Redis 7、Celery 5。
+- Next.js 16.3.6、React 18.3.1、TypeScript 5.8.3、Tailwind CSS 3.4.17。
+- Nginx 1.27 作为同源反向代理。
+- 后端密码使用 Argon2id；访问令牌使用 JWT，刷新令牌使用 HttpOnly Cookie。
+
+## 快速启动
+
+需要 Docker Engine 和 Docker Compose。先创建本地环境文件，并替换其中的凭据：
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-首次运行必须先复制 `.env.example` 为 `.env`，并在其中显式提供
-`APP_ENV` 与 `POSTGRES_PASSWORD`；Compose 不会替你选择运行环境或使用公开的
-固定数据库密码。`.env.example` 仅用于本地开发示例，暴露到其他环境前请替换为
-唯一的 URL-safe 密码。
-
-Compose 会先启动 PostgreSQL，再运行一次 `alembic upgrade head`；迁移成功后才会
-启动后端与行情服务。停止服务时使用 `docker compose down`，不会删除数据库卷。
-
-启动后访问：
+首次启动会等待 PostgreSQL 和 Redis 就绪，运行 `alembic upgrade head`，然后按依赖顺序启动后端、行情服务、调度器、前端和 Nginx。默认访问地址：
 
 - Web：<http://localhost:8080>
-- 网关健康检查：<http://localhost:8080/health>
-- API：<http://localhost:8080/api/v1>
+- Nginx 存活检查：<http://localhost:8080/health>
+- 前端进程检查：<http://localhost:8080/api/health>
+- 后端健康检查：<http://localhost:8080/api/v1/health>
 
-后台运行可使用 `docker compose up --build -d`，查看状态使用
-`docker compose ps`，停止并保留数据库卷使用 `docker compose down`。
+Compose 只把 Nginx 的 `${HTTP_PORT}` 发布到宿主机；后端和行情服务的 `8000`/`8001` 只在 Compose 网络中可见。
 
-`.env` 只用于本地配置，不要提交；在非本地环境中务必替换示例数据库密码（使用
-URL-safe 字符），并通过反向代理或防火墙限制 PostgreSQL、Redis 和内部服务的
-访问。数据库与 Redis 数据分别保存在 `postgres_data` 和 `redis_data` Compose
-命名卷中。认证配置也必须替换 `JWT_SECRET_KEY`；生产环境使用
-`APP_ENV=production`、`REFRESH_COOKIE_SECURE=true` 和 HTTPS。
-迁移与调度器只执行数据库/任务基础设施，不接收或校验 `JWT_SECRET_KEY`；只有
-backend API 进程需要生产 JWT 密钥。
+## 初始化管理员
 
-## Sprint 2 行情服务
-
-行情服务使用 `MARKET_DATA_PROVIDER=tdx` 和 `PROVIDER_TIMEOUT_SECONDS`，并通过
-Compose 传入实际的 PostgreSQL/Redis 地址。内部同步接口为
-`POST /internal/sync/daily` 与 `POST /internal/sync/securities`，必须使用
-`X-Internal-Token: <INTERNAL_API_TOKEN>`（或 Bearer）；这个服务间 token 只传给
-`market-data-service`，不会传给 frontend。Compose 缺少 `INTERNAL_API_TOKEN` 会
-明确失败；`.env.example` 已提供可运行的本地占位值，生产环境必须替换为随机密钥。
-
-TDX 依赖 `pytdx`，该项目存在归档/维护中断风险，公网 TDX 节点也可能不可用；本次
-集成未宣称已完成真实网络验证。`pytdx` 原始日线不提供前复权，`qfq` 必须配置
-factor transformer 后才能使用，不能把未复权数据标记为 `qfq`。
-
-## 首次创建管理员与邀请注册
-
-迁移完成、后端容器可用后，在 backend 容器内执行一次：
+迁移完成且后端容器健康后，创建第一个管理员：
 
 ```bash
 docker compose exec backend python -m app.cli bootstrap-admin \
   --username admin --email admin@example.com
 ```
 
-命令会安全地交互式读取管理员密码；也可以在自动化环境中用 stdin 提供两行密码。
-管理员登录 <http://localhost:8080/login> 后，调用 `POST /api/v1/auth/invitations`
-创建邀请。响应中的 token 只返回一次，把它放入注册地址的 URL fragment：
-`http://localhost:8080/register#token=<token>`。受邀用户提交用户名和密码完成注册，
-然后登录进入工作台。refresh token 只通过 HttpOnly cookie 传输，不会出现在 JSON 响应中。
+命令会交互式读取并确认至少 8 个字符的密码。第一个管理员只能创建一次；管理员登录后可调用 `POST /api/v1/auth/invitations` 创建邀请，再让受邀用户使用 `/register#token=<token>` 完成注册。
 
-## 本地验证
-
-后端和行情服务是两个独立的 Python 项目，都包含名为 `app` 的包；Python 测试和
-工具命令必须分别在对应目录运行，避免顶层包名冲突：
+## 常用命令
 
 ```bash
-(cd backend && python -m pytest)
-(cd backend && ruff check .)
-(cd market-data-service && python -m pytest)
-(cd market-data-service && ruff check .)
-(cd frontend && npm test)
-(cd frontend && npm run lint && npm run typecheck && npm run build)
+docker compose up --build -d       # 构建并后台启动
+docker compose ps                  # 查看服务状态
+docker compose logs -f backend     # 跟踪后端日志
+docker compose logs -f market-data-service
+docker compose down                # 停止服务，保留命名卷
 ```
 
-`APP_ENV=production` 时，后端和行情服务会拒绝已知默认数据库密码；本地开发可在
-复制出的 `.env` 中保留 `APP_ENV=development`，但仍应按需替换示例数据库密码。
+本地 Python 与前端校验命令见 [开发指南](docs/development.md)。删除数据库和 Redis 数据需要显式使用 `docker compose down -v`，请确认数据不再需要后再执行。
+
+## 目录结构
+
+```text
+backend/                 FastAPI、认证、Alembic、指标和状态引擎
+  app/api/               HTTP 路由与依赖
+  app/services/          应用服务
+  app/repositories/      数据访问边界
+  app/indicators/        指标输入、结果和注册表
+  app/states/            状态定义、注册表和识别引擎
+  alembic/                数据库迁移
+market-data-service/     独立行情服务与 provider 适配器
+frontend/                Next.js 工作台
+nginx/                   同源反向代理配置
+compose.yaml             本地服务编排
+.env.example             Compose 环境变量模板
+```
+
+## 文档
+
+- [架构](docs/architecture.md)：服务边界、请求流和持久化边界。
+- [开始使用](docs/getting-started.md)：从启动到管理员邀请注册的完整流程。
+- [开发指南](docs/development.md)：本地依赖、测试、代码检查和迁移命令。
+- [配置参考](docs/configuration.md)：Compose 与各服务环境变量。
+- [API 参考](docs/api.md)：后端、前端和行情服务端点。
+- [安全说明](docs/security.md)：凭据、认证会话和内部接口安全边界。
+- [行情数据](docs/market-data.md)：provider、同步、存储和复权口径。
+- [指标与状态](docs/indicators-and-states.md)：指标输入输出和状态识别语义。
+
+## 当前限制
+
+- 工作台中的股票监控表、通知中心和设置页目前是展示骨架；仓库尚未提供监控表、提醒规则、通知记录或用户级行情查询 API。
+- 指标结果和状态结果目前是后端纯计算对象，尚未写入 `IndicatorSnapshot` 等持久化表，也没有把它们接入前端表格。
+- 通知 provider 目前只有抽象边界，没有可用的飞书、邮件或其他发送实现。
+- `scheduler` 会启动 Celery Beat，但当前 Beat schedule 为空；Compose 没有单独的 Celery worker 服务。
+- provider 注册表当前只注册 `tdx`。TDX 默认客户端的原始日线是未复权数据；请求 `qfq` 需要注入复权因子转换器。默认行情服务没有注入该转换器，因此实际同步未复权日线时应显式使用 `adjustment=none`。
+- TDX 网络节点和第三方数据可用性不由本仓库保证；部署前应自行验证数据授权、连通性和数据口径。
