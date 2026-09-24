@@ -70,13 +70,23 @@ class DailyBarRepository(Protocol):
 class QuoteRepository(Protocol):
     """Repository seam consumed by quote API reads and quote writers."""
 
+    async def upsert_many(self, records: Sequence[Quote]) -> None: ...
+
     async def get_latest(self, symbol: str) -> Quote | None: ...
 
 
 class DividendRepository(Protocol):
-    """Repository seam consumed by dividend writers."""
+    """Repository seam consumed by dividend synchronization and reads."""
 
     async def upsert_many(self, records: Sequence[Dividend]) -> None: ...
+
+    async def list_by_symbol(
+        self,
+        symbol: str,
+        *,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> tuple[Dividend, ...]: ...
 
 
 class SqlAlchemySecurityRepository:
@@ -288,6 +298,31 @@ class SqlAlchemyDividendEventRepository:
                     )
                 )
 
+    async def list_by_symbol(
+        self,
+        symbol: str,
+        *,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> tuple[Dividend, ...]:
+        """Return persisted cash-dividend events in chronological order."""
+
+        canonical_symbol = normalize_symbol(symbol)
+        statement = (
+            select(DividendEventModel, SecurityModel.symbol)
+            .join(SecurityModel, DividendEventModel.security_id == SecurityModel.id)
+            .where(SecurityModel.symbol == canonical_symbol)
+            .order_by(DividendEventModel.date)
+        )
+        if start is not None:
+            statement = statement.where(DividendEventModel.date >= start)
+        if end is not None:
+            statement = statement.where(DividendEventModel.date <= end)
+        async with self._session_factory() as session:
+            result = await session.execute(statement)
+            rows = result.all()
+        return tuple(_dividend_from_model(row[0], row[1]) for row in rows)
+
 
 async def _security_ids(session: AsyncSession, symbols: Sequence[str]) -> dict[str, int]:
     result = await session.execute(
@@ -383,6 +418,14 @@ def _quote_from_model(model: QuoteSnapshotModel, symbol: str) -> Quote:
         change=model.change,
         change_percent=model.change_percent,
         timestamp=timestamp.astimezone(UTC),
+    )
+
+
+def _dividend_from_model(model: DividendEventModel, symbol: str) -> Dividend:
+    return Dividend(
+        symbol=symbol,
+        date=model.date,
+        cash_amount=model.cash_amount,
     )
 
 

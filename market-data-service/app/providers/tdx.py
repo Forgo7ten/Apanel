@@ -127,7 +127,7 @@ class TDXProvider(MarketDataProvider):
         symbol: str,
         start: date,
         end: date,
-        adjustment: Adjustment | str = Adjustment.NONE,
+        adjustment: Adjustment | str = Adjustment.QFQ,
     ) -> Sequence[DailyBar]:
         canonical_symbol = normalize_symbol(symbol)
         selected_adjustment = normalize_adjustment(adjustment)

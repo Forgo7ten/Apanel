@@ -210,6 +210,29 @@ def test_qfq_requires_explicit_factor_transformer_and_never_labels_raw_data() ->
     assert all(record["adjustment"] == "qfq" for record in records)
 
 
+def test_qfq_is_available_by_default_when_tdx_exposes_corporate_actions() -> None:
+    class WithCorporateActions(FakeLowLevelClient):
+        def get_xdxr_info(self, market, code):
+            return [{"year": 2026, "month": 1, "day": 2, "fenhong": "1", "pre_close": "10"}]
+
+    low_level = WithCorporateActions()
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=lambda: low_level,
+    )
+
+    qfq = client.fetch_daily_bars("000001", date(2026, 1, 1), date(2026, 1, 2))
+    none = client.fetch_daily_bars(
+        "000001", date(2026, 1, 1), date(2026, 1, 2), Adjustment.NONE
+    )
+
+    assert [record["close"] for record in qfq] == [Decimal("9.0"), Decimal("11")]
+    assert [record["close"] for record in none] == [10, 11]
+    assert all(record["adjustment"] == "qfq" for record in qfq)
+    assert all(record["adjustment"] == "none" for record in none)
+
+
 def test_client_wraps_low_level_response_errors_and_closes_connection() -> None:
     class BrokenBars(FakeLowLevelClient):
         def get_security_bars(self, category, market, code, start, count):

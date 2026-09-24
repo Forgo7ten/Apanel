@@ -7,13 +7,14 @@ connection is therefore always closed in the same worker thread that used it,
 including failed setup and failover attempts.
 
 ``pytdx``'s standard ``get_security_bars`` endpoint returns raw, unadjusted
-bars.  It has no qfq argument.  The adapter consequently rejects qfq unless a
-caller supplies an explicit factor transformer; it never labels raw bars as
-qfq.
+bars.  It has no qfq argument, so qfq is calculated from the exchange's
+corporate-action records in the same operation.  A caller may still inject an
+explicit transformer when a deployment has a richer factor source.
 """
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.config import DEFAULT_TDX_SERVERS
+from app.domain.adjustments import apply_qfq
 from app.domain.market_data import (
     Adjustment,
     Market,
@@ -139,6 +141,10 @@ class PytdxClient:
         self._bar_max_pages = bar_max_pages
         self._client_factory = client_factory or _default_pytdx_factory
         self._qfq_transformer = qfq_transformer
+        self._builtin_qfq_available = (
+            qfq_transformer is not None
+            or _factory_supports_corporate_actions(self._client_factory)
+        )
 
     @property
     def servers(self) -> tuple[TDXServer, ...]:
@@ -226,23 +232,25 @@ class PytdxClient:
         symbol: str,
         start: date,
         end: date,
-        adjustment: Adjustment,
+        adjustment: Adjustment = Adjustment.QFQ,
     ) -> Sequence[Mapping[str, Any]]:
-        """Fetch raw daily bars, or use an explicitly supplied qfq seam."""
+        """Fetch daily bars with qfq as the safe, usable default."""
 
         canonical_symbol = normalize_symbol(symbol)
         selected_adjustment = normalize_adjustment(adjustment)
-        if selected_adjustment is Adjustment.QFQ and self._qfq_transformer is None:
+        if selected_adjustment is Adjustment.QFQ and not self._builtin_qfq_available:
             raise ProviderUnsupportedError(
-                "TDX get_security_bars returns unadjusted bars; qfq requires a configured "
-                "qfq_transformer/factor provider"
+                "TDX get_security_bars returns unadjusted bars; qfq requires corporate-action "
+                "records or a configured qfq_transformer"
             )
         if start > end:
             raise ValueError("start must not be after end")
         market_code = TDX_MARKET_BY_DOMAIN[infer_market(canonical_symbol)]
 
-        def operation(client: Any) -> list[Mapping[str, Any]]:
-            raw_records: list[Mapping[str, Any]] = []
+        def operation(client: Any) -> list[Mapping[str, Any]] | tuple[
+            list[Mapping[str, Any]], Sequence[Mapping[str, Any]], list[Mapping[str, Any]]
+        ]:
+            all_records: list[Mapping[str, Any]] = []
             offset = 0
             for _ in range(self._bar_max_pages):
                 page = client.get_security_bars(
@@ -261,8 +269,7 @@ class PytdxClient:
                     if not isinstance(record, Mapping):
                         raise _TDXOperationError("TDX daily bars contain a non-mapping record")
                     normalized = _normalize_bar_record(record, canonical_symbol)
-                    if start <= normalized["trade_date"] <= end:
-                        raw_records.append(normalized)
+                    all_records.append(normalized)
                 offset += len(page_records)
                 if len(page_records) < self._bar_page_size:
                     break
@@ -270,16 +277,50 @@ class PytdxClient:
                 raise _TDXOperationError(
                     f"TDX daily bars exceeded {self._bar_max_pages} pages for {canonical_symbol}"
                 )
-            return _deduplicate_bars(raw_records)
+            records = _deduplicate_bars(
+                [
+                    record
+                    for record in all_records
+                    if start <= record["trade_date"] <= end
+                ]
+            )
+            if selected_adjustment is Adjustment.NONE or self._qfq_transformer is not None:
+                return records
+            action_method = getattr(client, "get_xdxr_info", None)
+            if action_method is None:
+                raise ProviderUnsupportedError(
+                    "TDX client does not expose corporate-action records for qfq"
+                )
+            actions = action_method(market_code, canonical_symbol)
+            if actions is None:
+                actions = ()
+            action_records = tuple(actions)
+            if any(not isinstance(record, Mapping) for record in action_records):
+                raise _TDXOperationError(
+                    "TDX corporate-action response contains a non-mapping record"
+                )
+            return (
+                records,
+                tuple(_normalize_corporate_action(record) for record in action_records),
+                _deduplicate_bars(all_records),
+            )
 
-        records = self._with_failover("daily bars", operation)
+        fetched = self._with_failover("daily bars", operation)
         if selected_adjustment is Adjustment.NONE:
-            return tuple({**record, "adjustment": Adjustment.NONE.value} for record in records)
+            return tuple({**record, "adjustment": Adjustment.NONE.value} for record in fetched)
 
         transformer = self._qfq_transformer
-        if transformer is None:  # pragma: no cover - guarded above, keeps the seam explicit
-            raise ProviderUnsupportedError("qfq transformer is not configured")
-        transformed = transformer(canonical_symbol, records)
+        if transformer is not None:
+            records = fetched
+            transformed = transformer(canonical_symbol, records)
+        else:
+            records, actions, context_records = fetched
+            transformed = apply_qfq(context_records, actions)
+            transformed = tuple(
+                record
+                for record in transformed
+                if start <= _parse_date(record["trade_date"]) <= end
+            )
         result: list[Mapping[str, Any]] = []
         for record in transformed:
             if not isinstance(record, Mapping):
@@ -307,17 +348,28 @@ class PytdxClient:
                 raise _TDXOperationError("TDX returned no dividend response")
             result: list[Mapping[str, Any]] = []
             for row in rows:
-                if not isinstance(row, Mapping) or row.get("fenhong") is None:
+                if not isinstance(row, Mapping):
                     continue
-                result.append(
-                    {
-                        "symbol": canonical_symbol,
-                        "date": date(
+                cash_amount = row.get("cash_amount", row.get("cash", row.get("fenhong")))
+                if cash_amount is None:
+                    continue
+                event_date = row.get("date", row.get("ex_date"))
+                if event_date is None:
+                    try:
+                        event_date = date(
                             int(row["year"]),
                             int(row["month"]),
                             int(row["day"]),
-                        ),
-                        "cash_amount": row["fenhong"],
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise _TDXOperationError(
+                            "TDX dividend is missing a valid date"
+                        ) from exc
+                result.append(
+                    {
+                        "symbol": canonical_symbol,
+                        "date": event_date,
+                        "cash_amount": cash_amount,
                     }
                 )
             return result
@@ -420,6 +472,22 @@ def _normalize_bar_record(record: Mapping[str, Any], symbol: str) -> dict[str, A
     return normalized
 
 
+def _normalize_corporate_action(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize TDX's year/month/day action shape for the qfq helper."""
+
+    normalized = dict(record)
+    if not any(key in normalized for key in ("date", "ex_date", "trade_date")):
+        try:
+            normalized["date"] = date(
+                int(normalized["year"]),
+                int(normalized["month"]),
+                int(normalized["day"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _TDXOperationError("TDX corporate action is missing a valid date") from exc
+    return normalized
+
+
 def _deduplicate_bars(records: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     unique: dict[date, Mapping[str, Any]] = {}
     for record in records:
@@ -493,3 +561,33 @@ def _ratio_percent(numerator: Decimal | None, denominator: Any) -> Decimal | Non
     if numerator is None or denominator in (None, 0, "0"):
         return None
     return numerator / Decimal(str(denominator)) * 100
+
+
+def _factory_supports_corporate_actions(factory: TDXClientFactory) -> bool:
+    """Check an injected client seam before opening a network connection.
+
+    This preserves a useful fail-fast error for test doubles and deployments
+    whose TDX client has no corporate-action endpoint, while the default
+    ``pytdx`` factory is known to expose ``get_xdxr_info``.  Lambdas used by
+    tests commonly close over their client, so their closure values are also
+    inspected without invoking user code.
+    """
+
+    if factory is _default_pytdx_factory:
+        return True
+    if callable(getattr(factory, "get_xdxr_info", None)):
+        return True
+    try:
+        closure = inspect.getclosurevars(factory)
+    except (TypeError, ValueError):
+        base_factory = getattr(factory, "func", None)
+        return (
+            base_factory is not None
+            and base_factory is not factory
+            and _factory_supports_corporate_actions(base_factory)
+        )
+    candidates = (*closure.nonlocals.values(), *closure.globals.values())
+    return any(
+        callable(getattr(value, "get_xdxr_info", None))
+        for value in candidates
+    )

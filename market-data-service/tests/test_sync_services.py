@@ -1,5 +1,6 @@
 from collections.abc import Sequence
-from datetime import date
+from dataclasses import replace
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -8,7 +9,12 @@ from sqlalchemy.exc import OperationalError
 from app.domain.market_data import Adjustment, DailyBar, Dividend, Quote, Security
 from app.providers.base import MarketDataProvider
 from app.providers.errors import ProviderTimeoutError
-from app.services.sync import DailyBarSyncService, SecuritySyncService
+from app.services.sync import (
+    DailyBarSyncService,
+    DividendSyncService,
+    QuoteSyncService,
+    SecuritySyncService,
+)
 
 
 def bar(symbol: str, day: int = 23) -> DailyBar:
@@ -51,6 +57,12 @@ class FakeProvider(MarketDataProvider):
         return ()
 
 
+class QfqProvider(FakeProvider):
+    async def get_daily_bars(self, symbol, start, end, adjustment="none") -> Sequence[DailyBar]:
+        records = await super().get_daily_bars(symbol, start, end, adjustment)
+        return tuple(replace(record, adjustment=adjustment) for record in records)
+
+
 class MemoryRepository:
     def __init__(self, failing_symbols: set[str] | None = None) -> None:
         self.failing_symbols = failing_symbols or set()
@@ -75,6 +87,64 @@ class MemoryRepository:
 class SystemicRepository(MemoryRepository):
     async def upsert_many(self, records) -> None:
         raise OperationalError("INSERT", {}, OSError("database offline"))
+
+
+class QuoteRepositoryMemory:
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, datetime], Quote] = {}
+        self.calls = 0
+
+    async def upsert_many(self, records) -> None:
+        self.calls += 1
+        for record in records:
+            self.records[(record.symbol, record.timestamp)] = record
+
+
+class DividendRepositoryMemory:
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, date], Dividend] = {}
+        self.calls = 0
+
+    async def upsert_many(self, records) -> None:
+        self.calls += 1
+        for record in records:
+            self.records[(record.symbol, record.date)] = record
+
+
+class QuoteDividendProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.quotes = {
+            "600519": Quote(
+                symbol="600519",
+                price="10.50",
+                timestamp=datetime(2026, 9, 23, 2, 30, tzinfo=UTC),
+            ),
+            "000001": Quote(
+                symbol="000001",
+                price="11.50",
+                timestamp=datetime(2026, 9, 23, 2, 30, tzinfo=UTC),
+            ),
+        }
+        self.dividends = {
+            "600519": (
+                Dividend(symbol="600519", date=date(2026, 6, 30), cash_amount="2"),
+                Dividend(symbol="600519", date=date(2026, 6, 30), cash_amount="2.10"),
+            ),
+            "000001": (),
+        }
+        self.fail_quotes: set[str] = set()
+        self.fail_dividends: set[str] = set()
+
+    async def get_quote(self, symbol: str) -> Quote:
+        if symbol in self.fail_quotes:
+            raise ProviderTimeoutError("quote timed out")
+        return self.quotes[symbol]
+
+    async def get_dividends(self, symbol: str) -> Sequence[Dividend]:
+        if symbol in self.fail_dividends:
+            raise ProviderTimeoutError("dividends timed out")
+        return self.dividends[symbol]
 
 
 @pytest.mark.asyncio
@@ -126,6 +196,7 @@ async def test_daily_sync_keeps_other_symbols_when_one_persistence_batch_fails()
         symbols=["600519", "000001"],
         start=date(2026, 9, 1),
         end=date(2026, 9, 23),
+        adjustment=Adjustment.NONE,
     )
 
     outcomes = {item.symbol: item for item in result.items}
@@ -146,6 +217,7 @@ async def test_daily_sync_deduplicates_bars_before_upsert() -> None:
         symbols=["SH.600519", "600519"],
         start=date(2026, 9, 1),
         end=date(2026, 9, 23),
+        adjustment=Adjustment.NONE,
     )
 
     assert result.succeeded == 1
@@ -162,4 +234,54 @@ async def test_daily_sync_does_not_mask_systemic_database_failures() -> None:
             symbols=["600519", "000001"],
             start=date(2026, 9, 1),
             end=date(2026, 9, 23),
+            adjustment=Adjustment.NONE,
         )
+
+
+@pytest.mark.asyncio
+async def test_daily_sync_defaults_to_qfq() -> None:
+    repository = MemoryRepository()
+    service = DailyBarSyncService(provider=QfqProvider(), repository=repository)
+
+    result = await service.sync(
+        symbols=["600519"],
+        start=date(2026, 9, 1),
+        end=date(2026, 9, 23),
+    )
+
+    assert result.ok
+    assert next(iter(repository.records.values())).adjustment is Adjustment.QFQ
+
+
+@pytest.mark.asyncio
+async def test_quote_sync_persists_idempotently_and_deduplicates_symbols() -> None:
+    provider = QuoteDividendProvider()
+    repository = QuoteRepositoryMemory()
+    service = QuoteSyncService(provider=provider, repository=repository)
+
+    first = await service.sync(symbols=["SH.600519", "600519", "000001"])
+    second = await service.sync(symbols=["600519", "000001"])
+
+    assert first.succeeded == 2
+    assert second.succeeded == 2
+    assert first.items[0].persisted == 1
+    assert len(repository.records) == 2
+    assert repository.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_dividend_sync_upserts_duplicate_events_and_reports_provider_failure() -> None:
+    provider = QuoteDividendProvider()
+    provider.fail_dividends.add("000001")
+    repository = DividendRepositoryMemory()
+    service = DividendSyncService(provider=provider, repository=repository)
+
+    result = await service.sync(symbols=["600519", "000001"])
+
+    outcomes = {item.symbol: item for item in result.items}
+    assert outcomes["600519"].succeeded
+    assert outcomes["600519"].fetched == 1
+    assert outcomes["600519"].persisted == 1
+    assert outcomes["000001"].error is not None
+    assert outcomes["000001"].error.code == "PROVIDER_TIMEOUT"
+    assert repository.records[("600519", date(2026, 6, 30))].cash_amount == Decimal("2.10")

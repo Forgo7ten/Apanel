@@ -1,5 +1,6 @@
 """Market data domain value objects and validation rules."""
 
+from .adjustments import adjust_forward, apply_qfq, forward_adjust_bars
 from .market_data import (
     Adjustment,
     AdjustmentType,
@@ -22,8 +23,10 @@ from .market_data import (
 )
 
 __all__ = [
+    "adjust_forward",
     "Adjustment",
     "AdjustmentType",
+    "apply_qfq",
     "DailyBar",
     "Dividend",
     "InvalidMarketDataError",
@@ -40,4 +43,5 @@ __all__ = [
     "normalize_market",
     "normalize_security_type",
     "normalize_symbol",
+    "forward_adjust_bars",
 ]

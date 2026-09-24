@@ -22,6 +22,8 @@ from app.providers.errors import (
 )
 from app.repositories.market_data import (
     DailyBarRepository,
+    DividendRepository,
+    PersistenceSystemError,
     QuoteRepository,
 )
 from app.schemas.common import ErrorResponse
@@ -30,11 +32,22 @@ from app.schemas.market_data import (
     DailyBarData,
     DailyBarsData,
     DailySyncRequest,
+    DividendData,
+    DividendsData,
+    DividendSyncRequest,
     QuoteData,
+    QuoteSyncRequest,
     SyncItemData,
     SyncSummaryData,
 )
-from app.services.sync import DailyBarSyncService, SecuritySyncService, SyncError, SyncSummary
+from app.services.sync import (
+    DailyBarSyncService,
+    DividendSyncService,
+    QuoteSyncService,
+    SecuritySyncService,
+    SyncError,
+    SyncSummary,
+)
 
 try:
     from sqlalchemy.exc import SQLAlchemyError
@@ -49,6 +62,24 @@ def get_quote_repository(request: Request) -> QuoteRepository:
     """Resolve the app-scoped quote repository; replaceable in API tests."""
 
     return request.app.state.quote_repository
+
+
+def get_dividend_repository(request: Request) -> DividendRepository:
+    """Resolve the app-scoped dividend repository; replaceable in tests."""
+
+    return request.app.state.dividend_repository
+
+
+def get_quote_sync_service(request: Request) -> QuoteSyncService:
+    """Resolve the app-scoped quote synchronization service."""
+
+    return request.app.state.quote_sync_service
+
+
+def get_dividend_sync_service(request: Request) -> DividendSyncService:
+    """Resolve the app-scoped dividend synchronization service."""
+
+    return request.app.state.dividend_sync_service
 
 
 def get_daily_bar_repository(request: Request) -> DailyBarRepository:
@@ -119,6 +150,51 @@ async def get_quote(
         change=quote.change,
         change_percent=quote.change_percent,
         timestamp=quote.timestamp,
+    )
+    return _success(data.model_dump(mode="json"))
+
+
+@router.get("/dividends/{symbol}")
+async def get_dividends(
+    symbol: str,
+    start: date | None = None,
+    end: date | None = None,
+    repository: DividendRepository = Depends(get_dividend_repository),  # noqa: B008
+) -> JSONResponse:
+    """Return persisted cash-dividend events for one canonical symbol."""
+
+    canonical_symbol = _canonical_symbol(symbol)
+    if start is not None and end is not None and start > end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_DATE_RANGE", "message": "start must not be after end."},
+        )
+    try:
+        dividends = await repository.list_by_symbol(
+            canonical_symbol,
+            start=start,
+            end=end,
+        )
+    except Exception as exc:
+        _raise_public_dependency_error(exc)
+    if not dividends:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "DIVIDENDS_NOT_FOUND", "message": "Dividends were not found."},
+        )
+    items = [
+        DividendData(
+            symbol=dividend.symbol,
+            date=dividend.date,
+            cash_amount=dividend.cash_amount,
+        ).model_dump(mode="json")
+        for dividend in dividends
+    ]
+    data = DividendsData(
+        symbol=canonical_symbol,
+        start=start,
+        end=end,
+        items=items,
     )
     return _success(data.model_dump(mode="json"))
 
@@ -199,6 +275,68 @@ async def sync_daily(
             end=request.end,
             adjustment=request.adjustment,
         )
+    except Exception as exc:
+        _raise_public_dependency_error(exc)
+    data = _summary_data(summary)
+    return _success(
+        data.model_dump(mode="json"),
+        success=summary.ok,
+        error=None
+        if summary.ok
+        else ErrorResponse(
+            code="PARTIAL_SYNC_FAILURE",
+            message="One or more symbols could not be synchronized.",
+        ),
+    )
+
+
+@router.post(
+    "/sync/quotes",
+    dependencies=[Depends(require_internal_token)],  # noqa: B008
+)
+@router.post(
+    "/sync/quote",
+    dependencies=[Depends(require_internal_token)],  # noqa: B008
+)
+async def sync_quotes(
+    request: QuoteSyncRequest,
+    service: QuoteSyncService = Depends(get_quote_sync_service),  # noqa: B008
+) -> JSONResponse:
+    """Synchronize latest quote snapshots with authenticated persistence."""
+
+    try:
+        summary = await service.sync(symbols=request.symbols)
+    except Exception as exc:
+        _raise_public_dependency_error(exc)
+    data = _summary_data(summary)
+    return _success(
+        data.model_dump(mode="json"),
+        success=summary.ok,
+        error=None
+        if summary.ok
+        else ErrorResponse(
+            code="PARTIAL_SYNC_FAILURE",
+            message="One or more symbols could not be synchronized.",
+        ),
+    )
+
+
+@router.post(
+    "/sync/dividends",
+    dependencies=[Depends(require_internal_token)],  # noqa: B008
+)
+@router.post(
+    "/sync/dividend",
+    dependencies=[Depends(require_internal_token)],  # noqa: B008
+)
+async def sync_dividends(
+    request: DividendSyncRequest,
+    service: DividendSyncService = Depends(get_dividend_sync_service),  # noqa: B008
+) -> JSONResponse:
+    """Synchronize cash-dividend events with authenticated persistence."""
+
+    try:
+        summary = await service.sync(symbols=request.symbols)
     except Exception as exc:
         _raise_public_dependency_error(exc)
     data = _summary_data(summary)
@@ -323,7 +461,7 @@ def _raise_public_dependency_error(exc: Exception) -> None:
                 "message": "Market data provider is unavailable.",
             },
         ) from exc
-    if isinstance(exc, SQLAlchemyError):
+    if isinstance(exc, (PersistenceSystemError, SQLAlchemyError)):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -340,7 +478,10 @@ def _raise_public_dependency_error(exc: Exception) -> None:
 __all__ = [
     "get_daily_bar_repository",
     "get_daily_sync_service",
+    "get_dividend_repository",
+    "get_dividend_sync_service",
     "get_quote_repository",
+    "get_quote_sync_service",
     "get_security_sync_service",
     "require_internal_token",
     "router",
