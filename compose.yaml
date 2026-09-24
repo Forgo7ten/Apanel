@@ -107,6 +107,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required; copy .env.example to .env}
       JWT_ISSUER: ${JWT_ISSUER:-apanel}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-apanel-web}
@@ -120,6 +122,12 @@ services:
       DATABASE_COMMAND_TIMEOUT_SECONDS: ${DATABASE_COMMAND_TIMEOUT_SECONDS:-5}
       REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS: ${REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS:-5}
       REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
+      QUOTE_REFRESH_INTERVAL_MINUTES: ${QUOTE_REFRESH_INTERVAL_MINUTES:-5}
+      EOD_PIPELINE_HOUR: ${EOD_PIPELINE_HOUR:-15}
+      EOD_PIPELINE_MINUTE: ${EOD_PIPELINE_MINUTE:-20}
+      SCHEDULER_LOCK_TTL_SECONDS: ${SCHEDULER_LOCK_TTL_SECONDS:-3600}
+      SCHEDULER_RETRY_MAX_ATTEMPTS: ${SCHEDULER_RETRY_MAX_ATTEMPTS:-3}
+      SCHEDULER_RETRY_BACKOFF_SECONDS: ${SCHEDULER_RETRY_BACKOFF_SECONDS:-60}
     expose:
       - "8000"
     depends_on:
@@ -159,6 +167,14 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
+      QUOTE_REFRESH_INTERVAL_MINUTES: ${QUOTE_REFRESH_INTERVAL_MINUTES:-5}
+      EOD_PIPELINE_HOUR: ${EOD_PIPELINE_HOUR:-15}
+      EOD_PIPELINE_MINUTE: ${EOD_PIPELINE_MINUTE:-20}
+      SCHEDULER_LOCK_TTL_SECONDS: ${SCHEDULER_LOCK_TTL_SECONDS:-3600}
+      SCHEDULER_RETRY_MAX_ATTEMPTS: ${SCHEDULER_RETRY_MAX_ATTEMPTS:-3}
+      SCHEDULER_RETRY_BACKOFF_SECONDS: ${SCHEDULER_RETRY_BACKOFF_SECONDS:-60}
     command: ["celery", "-A", "app.tasks.scheduler:celery_app", "beat", "--loglevel=INFO", "--pidfile="]
     depends_on:
       postgres:
@@ -178,6 +194,52 @@ services:
           import os;
           command = open('/proc/1/cmdline', 'rb').read().decode(errors='ignore');
           raise SystemExit(0 if 'celery' in command and 'beat' in command else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - apanel
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:?APP_ENV is required; copy .env.example to .env}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-apanel}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required; copy .env.example to .env}@postgres:5432/${POSTGRES_DB:-apanel}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
+      QUOTE_REFRESH_INTERVAL_MINUTES: ${QUOTE_REFRESH_INTERVAL_MINUTES:-5}
+      EOD_PIPELINE_HOUR: ${EOD_PIPELINE_HOUR:-15}
+      EOD_PIPELINE_MINUTE: ${EOD_PIPELINE_MINUTE:-20}
+      SCHEDULER_LOCK_TTL_SECONDS: ${SCHEDULER_LOCK_TTL_SECONDS:-3600}
+      SCHEDULER_RETRY_MAX_ATTEMPTS: ${SCHEDULER_RETRY_MAX_ATTEMPTS:-3}
+      SCHEDULER_RETRY_BACKOFF_SECONDS: ${SCHEDULER_RETRY_BACKOFF_SECONDS:-60}
+    command:
+      ["celery", "-A", "app.tasks.worker:celery_app", "worker", "--loglevel=INFO", "--hostname=apanel@%h", "--queues=default,market-data,pipeline"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      market-data-service:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os;
+          command = open('/proc/1/cmdline', 'rb').read().decode(errors='ignore');
+          raise SystemExit(0 if 'celery' in command and 'worker' in command else 1)
       interval: 10s
       timeout: 5s
       retries: 3
