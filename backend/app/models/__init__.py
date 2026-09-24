@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
+from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,6 +49,164 @@ class InvitationStatus(StrEnum):
     ACCEPTED = "ACCEPTED"
     REVOKED = "REVOKED"
     EXPIRED = "EXPIRED"
+
+
+class Security(Base):
+    """A security record shared with the market-data service."""
+
+    __tablename__ = "securities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(6), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    market: Mapped[str] = mapped_column(String(2), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(2), nullable=False)
+    security_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DailyBar(Base):
+    """One persisted daily OHLC bar from the shared market-data schema."""
+
+    __tablename__ = "daily_bars"
+    __table_args__ = (
+        UniqueConstraint(
+            "security_id",
+            "trade_date",
+            "adjust_type",
+            name="uq_daily_bars_security_date_adjust",
+        ),
+        Index("ix_daily_bars_security_trade_date", "security_id", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    open: Mapped[Any] = mapped_column(Numeric(asdecimal=True), nullable=False)
+    high: Mapped[Any] = mapped_column(Numeric(asdecimal=True), nullable=False)
+    low: Mapped[Any] = mapped_column(Numeric(asdecimal=True), nullable=False)
+    close: Mapped[Any] = mapped_column(Numeric(asdecimal=True), nullable=False)
+    volume: Mapped[Any] = mapped_column(Numeric(asdecimal=True), nullable=False)
+    amount: Mapped[Any | None] = mapped_column(Numeric(asdecimal=True), nullable=True)
+    adjust_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class IndicatorSnapshot(Base):
+    """Durable indicator values for one security, day and indicator type."""
+
+    __tablename__ = "indicator_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "security_id",
+            "trade_date",
+            "indicator_type",
+            name="uq_indicator_snapshots_security_date_type",
+        ),
+        Index(
+            "ix_indicator_snapshots_security_indicator_date",
+            "security_id",
+            "indicator_type",
+            "trade_date",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    values: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    previous_values: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    delta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class StateDefinition(Base):
+    """Persisted public metadata for one registered indicator state."""
+
+    __tablename__ = "state_definitions"
+    __table_args__ = (UniqueConstraint("state_code", name="uq_state_definitions_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    state_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="INFO")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, nullable=False, default=dict
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        # SQLAlchemy reserves ``metadata`` on declarative classes.  Keep the
+        # database column name/document vocabulary while exposing a friendly
+        # constructor alias for callers that build the domain projection.
+        if "metadata" in kwargs:
+            kwargs["metadata_json"] = kwargs.pop("metadata")
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "metadata":
+            return object.__getattribute__(self, "metadata_json")
+        return super().__getattribute__(name)
+
+
+class IndicatorState(Base):
+    """One durable state observation, including inactive days for history."""
+
+    __tablename__ = "indicator_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "security_id",
+            "trade_date",
+            "state_code",
+            name="uq_indicator_states_security_date_code",
+        ),
+        Index("ix_indicator_states_security_trade_date", "security_id", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    state_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        if "metadata" in kwargs:
+            kwargs["metadata_json"] = kwargs.pop("metadata")
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "metadata":
+            return object.__getattribute__(self, "metadata_json")
+        return super().__getattribute__(name)
 
 
 class User(Base):
@@ -113,9 +286,14 @@ class RefreshSession(Base):
 
 
 __all__ = [
+    "DailyBar",
+    "IndicatorSnapshot",
+    "IndicatorState",
     "Invitation",
     "InvitationStatus",
     "RefreshSession",
+    "Security",
+    "StateDefinition",
     "User",
     "UserRole",
     "UserStatus",
