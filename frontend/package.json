@@ -11,9 +11,12 @@
     "test": "node --test tests/**/*.test.mjs"
   },
   "dependencies": {
+    "@tanstack/react-query": "5.66.11",
+    "@tanstack/react-table": "8.21.3",
     "next": "16.3.6",
     "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react-dom": "18.3.1",
+    "zustand": "5.0.3"
   },
   "devDependencies": {
     "@types/node": "20.17.30",
