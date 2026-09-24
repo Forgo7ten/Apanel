@@ -125,13 +125,18 @@ class FeishuWebhookProvider(NotificationProvider):
         if isinstance(user, str):
             return _validate_webhook_url(user)
         if isinstance(user, Mapping):
-            for key in ("feishu_webhook_url", "webhook_url", "notification_webhook"):
+            for key in (
+                "feishu_webhook_url",
+                "feishu_webhook",
+                "webhook_url",
+                "notification_webhook",
+            ):
                 candidate = user.get(key)
                 if candidate is not None:
                     return _validate_webhook_url(candidate)
             settings = user.get("settings")
             if isinstance(settings, Mapping):
-                for key in ("feishu_webhook_url", "webhook_url"):
+                for key in ("feishu_webhook_url", "feishu_webhook", "webhook_url"):
                     candidate = settings.get(key)
                     if candidate is not None:
                         return _validate_webhook_url(candidate)

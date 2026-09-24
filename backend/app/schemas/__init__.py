@@ -1,5 +1,11 @@
 """Pydantic API schemas."""
 
+from .alerts import (
+    AlertRuleCreateRequest,
+    AlertRuleData,
+    AlertRuleUpdateRequest,
+    NotificationData,
+)
 from .indicator_state import (
     IndicatorHistoryData,
     IndicatorSnapshotData,
@@ -26,6 +32,10 @@ from .watch import (
 )
 
 __all__ = [
+    "AlertRuleCreateRequest",
+    "AlertRuleData",
+    "AlertRuleUpdateRequest",
+    "NotificationData",
     "IndicatorHistoryData",
     "IndicatorSnapshotData",
     "StateData",
