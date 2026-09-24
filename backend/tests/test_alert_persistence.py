@@ -13,11 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.dependencies import get_current_user
 from app.core.config import Settings
+from app.core.errors import ApiError
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import create_app
 from app.models import (
     AlertInstance,
+    AlertRule,
     IndicatorSnapshot,
     IndicatorState,
     Notification,
@@ -26,7 +28,7 @@ from app.models import (
     UserSetting,
     UserStatus,
 )
-from app.providers.notification import FeishuWebhookError
+from app.providers.notification import FeishuWebhookError, NotificationProviderRegistry
 from app.schemas.alerts import AlertRuleCreateRequest
 from app.services.alert_service import AlertService
 from app.services.settings_service import UserSettingsService
@@ -148,6 +150,21 @@ async def test_alert_crud_and_user_isolation(alert_context) -> None:
     assert rule["state_id"] == rule["state_code"] == "BOLL_WIDTH_NARROWING"
     assert rule["symbol"] == "600519"
 
+    unknown = await client.post(
+        "/api/v1/alerts",
+        json={
+            "security_id": alert_context["security"].id,
+            "condition_type": "STATE",
+            "state_code": "UNKNOWN_STATE",
+        },
+    )
+    assert unknown.status_code == 400
+    unknown_update = await client.put(
+        f"/api/v1/alerts/{rule['id']}",
+        json={"state_code": "UNKNOWN_STATE"},
+    )
+    assert unknown_update.status_code == 400
+
     alert_context["current_user"]["value"] = alert_context["user_two"]
     assert (await client.get("/api/v1/alerts")).json()["data"] == []
     assert (
@@ -231,6 +248,133 @@ async def test_state_trigger_and_provider_failure_are_persisted(alert_context) -
         assert "webhook" not in (notification.error_message or "").lower()
         held = await AlertService(session, notification_provider=provider).evaluate_user(user.id)
         assert held[0].triggered is False
+
+
+@pytest.mark.asyncio
+async def test_notification_destination_failure_is_persisted_as_failed(alert_context) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    async with session_factory() as session:
+        await AlertService(session).create(
+            user.id,
+            AlertRuleCreateRequest(
+                security_id=security.id,
+                condition_type="STATE",
+                state_id="BOLL_WIDTH_NARROWING",
+            ),
+        )
+        service = AlertService(session)
+
+        async def fail_destination(_user_id: int) -> str | None:
+            raise RuntimeError("destination lookup failed")
+
+        service.notification_service._user_webhook = fail_destination
+        result = await service.evaluate_user(user.id)
+        notification = (await session.execute(select(Notification))).scalar_one()
+
+        assert result[0].triggered is True
+        assert notification.status == "FAILED"
+        assert notification.error_code == "PROVIDER_ERROR"
+        assert notification.error_message == "Notification provider failed."
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_can_be_retried_without_retriggering_success(
+    alert_context,
+) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    async with session_factory() as session:
+        await AlertService(session).create(
+            user.id,
+            AlertRuleCreateRequest(
+                security_id=security.id,
+                condition_type="VALUE",
+                indicator="RSI",
+                operator=">=",
+                threshold=70,
+            ),
+        )
+        failed_provider = FakeProvider(FeishuWebhookError("temporary failure"))
+        first = await AlertService(
+            session,
+            notification_provider=failed_provider,
+        ).evaluate_user(user.id)
+        notification = (await session.execute(select(Notification))).scalar_one()
+        assert first[0].triggered is True
+        assert notification.status == "FAILED"
+
+        replacement_provider = FakeProvider()
+        retried = await AlertService(
+            session,
+            notification_provider=replacement_provider,
+        ).retry_notification(user.id, notification.id)
+        assert retried.status == "SENT"
+        assert replacement_provider.calls == 1
+
+        # A second explicit retry and a normal active-edge evaluation are both
+        # no-ops after the provider has already accepted the message.
+        await AlertService(
+            session,
+            notification_provider=replacement_provider,
+        ).retry_notification(user.id, notification.id)
+        held = await AlertService(
+            session,
+            notification_provider=replacement_provider,
+        ).evaluate_user(user.id)
+        assert replacement_provider.calls == 1
+        assert held[0].triggered is False
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_can_replace_feishu_adapter(alert_context) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    replacement_provider = FakeProvider()
+    registry = NotificationProviderRegistry()
+    registry.register("FEISHU", lambda _destination: replacement_provider)
+
+    async with session_factory() as session:
+        await AlertService(session, provider_registry=registry).create(
+            user.id,
+            AlertRuleCreateRequest(
+                security_id=security.id,
+                condition_type="VALUE",
+                indicator="RSI",
+                operator=">=",
+                threshold=70,
+            ),
+        )
+        result = await AlertService(
+            session,
+            provider_registry=registry,
+        ).evaluate_user(user.id)
+
+        assert result[0].triggered is True
+        assert replacement_provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluation_rejects_unknown_persisted_state(alert_context) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    async with session_factory() as session:
+        rule = AlertRule(
+            user_id=user.id,
+            security_id=security.id,
+            condition_type="STATE",
+            state_code="UNKNOWN_STATE",
+            enabled=True,
+        )
+        session.add(rule)
+        await session.commit()
+
+        with pytest.raises(ApiError, match="State condition is invalid"):
+            await AlertService(session).evaluate_rule(user.id, rule.id)
 
 
 @pytest.mark.asyncio

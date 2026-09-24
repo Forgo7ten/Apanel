@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Protocol
 
 from sqlalchemy import select
@@ -12,10 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Notification, NotificationChannel, NotificationStatus, UserSetting
 from app.providers.notification import (
-    FeishuProvider,
+    DEFAULT_PROVIDER_REGISTRY,
     NotificationMessage,
     NotificationProvider,
     NotificationProviderError,
+    NotificationProviderRegistry,
 )
 
 
@@ -39,10 +40,12 @@ class NotificationService:
         *,
         provider: NotificationProvider | None = None,
         provider_factory: ProviderFactory | None = None,
+        provider_registry: NotificationProviderRegistry | None = None,
     ) -> None:
         self.session = session
         self.provider = provider
-        self.provider_factory = provider_factory or (lambda url: FeishuProvider(url))
+        self.provider_factory = provider_factory
+        self.provider_registry = provider_registry or DEFAULT_PROVIDER_REGISTRY
 
     async def deliver(
         self,
@@ -78,12 +81,84 @@ class NotificationService:
         self.session.add(notification)
         await self.session.commit()
 
-        webhook = await self._user_webhook(user_id)
+        return await self._deliver_existing(notification, message, provider=provider)
+
+    async def retry(
+        self,
+        *,
+        user_id: int,
+        notification_id: int,
+        provider: NotificationProvider | None = None,
+    ) -> Notification:
+        """Retry one failed delivery without re-evaluating its alert edge.
+
+        A failed notification is an explicit retry boundary.  The alert
+        instance remains ACTIVE, so normal evaluations cannot duplicate a
+        successful delivery; a caller can retry the durable FAILED row when
+        the provider becomes healthy.  SENT rows are idempotent no-ops.
+        """
+
+        notification = (
+            await self.session.execute(
+                select(Notification).where(
+                    Notification.id == notification_id,
+                    Notification.user_id == user_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if notification is None:
+            raise LookupError("notification was not found")
+        if notification.status == NotificationStatus.SENT:
+            return notification
+        if notification.status != NotificationStatus.FAILED:
+            raise ValueError("only failed notifications can be retried")
+
+        try:
+            message = _message_from_content(notification.content)
+        except Exception:
+            # Keep malformed historical rows diagnosable and never turn a
+            # retry request into an untracked PENDING attempt.
+            notification.status = NotificationStatus.FAILED
+            notification.error_code = "INVALID_NOTIFICATION_CONTENT"
+            notification.error_message = "Notification content cannot be retried."
+            await self.session.commit()
+            return notification
+
+        content = message.to_dict()
+        content["title"] = notification.title
+        notification.status = NotificationStatus.PENDING
+        notification.error_code = None
+        notification.error_message = None
+        notification.content = content
+        await self.session.commit()
+        return await self._deliver_existing(notification, message, provider=provider)
+
+    async def _deliver_existing(
+        self,
+        notification: Notification,
+        message: NotificationMessage,
+        *,
+        provider: NotificationProvider | None,
+    ) -> Notification:
+        """Send an already committed row and persist a terminal outcome."""
+
+        webhook: str | None = None
         active_provider = provider if provider is not None else self.provider
         owns_provider = False
+        content = dict(notification.content or {})
         try:
+            # The destination lookup is part of the provider boundary.  It
+            # must be covered by the same failure handling as provider.send so
+            # an exception can never leave this row PENDING.
+            webhook = await self._user_webhook(notification.user_id)
             if active_provider is None:
-                active_provider = self.provider_factory(webhook)
+                if self.provider_factory is not None:
+                    active_provider = self.provider_factory(webhook)
+                else:
+                    active_provider = self.provider_registry.create(
+                        NotificationChannel.FEISHU,
+                        webhook,
+                    )
                 owns_provider = True
             await active_provider.send({"settings": {"feishu_webhook": webhook}}, message)
         except Exception as exc:
@@ -97,7 +172,10 @@ class NotificationService:
             }
         else:
             notification.status = NotificationStatus.SENT
+            notification.error_code = None
+            notification.error_message = None
             notification.sent_at = datetime.now(UTC)
+            notification.content = content
         finally:
             if owns_provider and active_provider is not None:
                 close = getattr(active_provider, "close", None)
@@ -110,7 +188,32 @@ class NotificationService:
                         # A close failure must not hide the already recorded
                         # provider outcome or leak transport diagnostics.
                         pass
-        await self.session.commit()
+        return await self._commit_delivery(notification)
+
+    async def _commit_delivery(self, notification: Notification) -> Notification:
+        """Commit a terminal outcome, recovering from a failed lookup txn."""
+
+        outcome = {
+            "status": notification.status,
+            "error_code": notification.error_code,
+            "error_message": notification.error_message,
+            "sent_at": notification.sent_at,
+            "content": dict(notification.content or {}),
+        }
+        try:
+            await self.session.commit()
+        except Exception:
+            # A destination query can leave SQLAlchemy's transaction in a
+            # failed state.  Roll it back, reload the already committed row,
+            # and persist the terminal FAILED/SENT outcome again.
+            await self.session.rollback()
+            persisted = await self.session.get(Notification, notification.id)
+            if persisted is None:
+                raise
+            for field, value in outcome.items():
+                setattr(persisted, field, value)
+            await self.session.commit()
+            return persisted
         return notification
 
     async def summarize_deliveries(
@@ -168,6 +271,24 @@ async def summarize_deliveries(
     """Stable scheduler entry point for one notification batch summary."""
 
     return await NotificationService(session).summarize_deliveries(notification_ids)
+
+
+def _message_from_content(content: object) -> NotificationMessage:
+    if not isinstance(content, dict):
+        raise ValueError("notification content must be an object")
+    raw_date = content.get("date")
+    if not isinstance(raw_date, str):
+        raise ValueError("notification date is missing")
+    return NotificationMessage(
+        stock_name=content["stock_name"],
+        stock_code=content["stock_code"],
+        indicator=content["indicator"],
+        state=content.get("state"),
+        current_value=content.get("current_value"),
+        previous_value=content.get("previous_value"),
+        change=content.get("change"),
+        date=date.fromisoformat(raw_date),
+    )
 
 
 def _safe_delivery_error(error: Exception, webhook: str | None) -> tuple[str, str]:

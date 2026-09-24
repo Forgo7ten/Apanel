@@ -22,7 +22,7 @@ from app.models import (
     Security,
     StateDefinition,
 )
-from app.services.indicator_service import IndicatorService
+from app.services.indicator_service import IndicatorService, serialize_current_indicators
 from app.services.state_service import StateService
 
 
@@ -145,3 +145,31 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
     assert states.status_code == 200
     assert state_history.status_code == 200
     assert state_history.json()["data"]["items"]
+
+
+def test_indicator_projection_has_stable_delta_for_missing_and_present_values() -> None:
+    missing = IndicatorSnapshot(
+        security_id=1,
+        trade_date=date(2026, 9, 24),
+        indicator_type="RSI",
+        parameters={"period": 14},
+        values={"value": 70},
+        previous_values=None,
+        delta=None,
+    )
+    present = IndicatorSnapshot(
+        security_id=1,
+        trade_date=date(2026, 9, 24),
+        indicator_type="RSI",
+        parameters={"period": 14},
+        values={"value": 71},
+        previous_values={"value": 70},
+        delta={"value": 1},
+    )
+
+    data = serialize_current_indicators([missing, present])
+
+    assert data["RSI"]["delta"] == 1.0
+
+    missing_only = serialize_current_indicators([missing])
+    assert missing_only["RSI"]["delta"] is None

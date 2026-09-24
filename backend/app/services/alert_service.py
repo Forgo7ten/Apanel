@@ -32,7 +32,11 @@ from app.models import (
     Notification,
     Security,
 )
-from app.providers.notification import NotificationMessage, NotificationProvider
+from app.providers.notification import (
+    NotificationMessage,
+    NotificationProvider,
+    NotificationProviderRegistry,
+)
 from app.repositories.alert import AlertRepository
 from app.repositories.notification import NotificationRepository
 from app.schemas.alerts import (
@@ -43,6 +47,7 @@ from app.schemas.alerts import (
 )
 from app.schemas.security import SecurityData
 from app.services.notification_service import NotificationService, ProviderFactory
+from app.states import DEFAULT_REGISTRY, StateRegistry, UnknownStateError
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,14 +69,18 @@ class AlertService:
         *,
         notification_provider: NotificationProvider | None = None,
         provider_factory: ProviderFactory | None = None,
+        provider_registry: NotificationProviderRegistry | None = None,
+        state_registry: StateRegistry | None = None,
     ) -> None:
         self.session = session
         self.repository = AlertRepository(session)
         self.notification_repository = NotificationRepository(session)
+        self.state_registry = state_registry or DEFAULT_REGISTRY
         self.notification_service = NotificationService(
             session,
             provider=notification_provider,
             provider_factory=provider_factory,
+            provider_registry=provider_registry,
         )
         self.evaluator = AlertEvaluator()
 
@@ -89,6 +98,7 @@ class AlertService:
             indicator=payload.indicator,
             operator=payload.operator,
             threshold=payload.threshold,
+            registry=self.state_registry,
         )
         rule = AlertRule(
             user_id=user_id,
@@ -138,6 +148,7 @@ class AlertService:
             indicator=indicator,
             operator=operator,
             threshold=threshold,
+            registry=self.state_registry,
         )
         rule.security_id = security.id
         rule.condition_type = condition_type
@@ -179,6 +190,21 @@ class AlertService:
     async def notifications(self, user_id: int, *, limit: int = 100) -> list[NotificationData]:
         records = await self.notification_repository.list_for_user(user_id, limit=limit)
         return [_notification_data(item) for item in records]
+
+    async def retry_notification(
+        self,
+        user_id: int,
+        notification_id: int,
+        *,
+        provider: NotificationProvider | None = None,
+    ) -> Notification:
+        """Retry a failed notification while preserving its alert edge."""
+
+        return await self.notification_service.retry(
+            user_id=user_id,
+            notification_id=notification_id,
+            provider=provider,
+        )
 
     async def evaluate_user(
         self,
@@ -230,10 +256,11 @@ class AlertService:
         if locked_rule is None:
             raise ApiError("ALERT_NOT_FOUND", "Alert rule was not found.", 404)
         rule = locked_rule
+        _validate_rule_state(rule, self.state_registry)
         snapshots = await self.repository.latest_snapshots(rule.security_id)
         states = await self.repository.latest_states(rule.security_id)
         observation, context = _observation_for_rule(rule, snapshots, states)
-        domain_rule = _domain_rule(rule)
+        domain_rule = _domain_rule(rule, registry=self.state_registry)
         instance = await self.repository.get_instance(rule.id, rule.security_id)
         prior_status = instance.status if instance is not None else AlertInstanceStatus.RESET
         evaluation = self.evaluator.evaluate(
@@ -300,22 +327,20 @@ def _condition_fields(
     indicator: str | None,
     operator: str | None,
     threshold: float | None,
+    registry: StateRegistry = DEFAULT_REGISTRY,
 ) -> dict[str, Any]:
     kind = condition_type.strip().upper() if isinstance(condition_type, str) else condition_type
     if kind == "STATE":
         if (
             state_id is not None
             and state_code is not None
-            and state_id.upper() != state_code.upper()
+            and state_id.strip().upper() != state_code.strip().upper()
         ):
             raise ApiError("INVALID_ALERT_RULE", "State condition fields do not match.", 400)
         resolved = state_id or state_code
         if not resolved:
             raise ApiError("INVALID_ALERT_RULE", "State condition is required.", 400)
-        try:
-            StateCondition(resolved)
-        except ValueError as exc:
-            raise ApiError("INVALID_ALERT_RULE", "State condition is invalid.", 400) from exc
+        resolved = _validated_state_code(registry, resolved)
         return {
             "condition_type": "STATE",
             "indicator_type": None,
@@ -347,10 +372,14 @@ def _condition_fields(
     }
 
 
-def _domain_rule(rule: AlertRule) -> DomainAlertRule:
+def _domain_rule(
+    rule: AlertRule,
+    *,
+    registry: StateRegistry = DEFAULT_REGISTRY,
+) -> DomainAlertRule:
     if rule.condition_type == "STATE":
         return DomainAlertRule(
-            condition=StateCondition(rule.state_code or ""),
+            condition=StateCondition(_validated_state_code(registry, rule.state_code)),
             security_id=rule.security_id,
             enabled=bool(rule.enabled),
             rule_id=rule.id,
@@ -362,6 +391,18 @@ def _domain_rule(rule: AlertRule) -> DomainAlertRule:
         enabled=bool(rule.enabled),
         rule_id=rule.id,
     )
+
+
+def _validate_rule_state(rule: AlertRule, registry: StateRegistry) -> None:
+    if rule.condition_type == "STATE":
+        _validated_state_code(registry, rule.state_code)
+
+
+def _validated_state_code(registry: StateRegistry, state_code: str | None) -> str:
+    try:
+        return registry.get(state_code or "").code
+    except (UnknownStateError, TypeError, ValueError) as exc:
+        raise ApiError("INVALID_ALERT_RULE", "State condition is invalid.", 400) from exc
 
 
 def _rule_signature(rule: AlertRule) -> tuple[Any, ...]:

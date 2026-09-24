@@ -9,11 +9,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
-from app.models import IndicatorSnapshot, IndicatorState
+from app.models import IndicatorState
 from app.schemas.common import SuccessResponse
 from app.schemas.indicator_state import (
     IndicatorHistoryData,
-    IndicatorSnapshotData,
     StateData,
     StateHistoryData,
 )
@@ -31,8 +30,8 @@ async def get_indicators(
 ) -> SuccessResponse[dict[str, Any]]:
     """Return the latest indicator values grouped by indicator type."""
 
-    snapshots = await IndicatorService(session).latest(symbol, adjustment=adjustment)
-    return SuccessResponse(data=_current_indicator_data(snapshots))
+    data = await IndicatorService(session).latest_data(symbol, adjustment=adjustment)
+    return SuccessResponse(data=data)
 
 
 @router.get(
@@ -46,15 +45,13 @@ async def get_indicator_history(
     adjustment: str | None = Query(default=None, alias="adjust"),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[IndicatorHistoryData]:
-    snapshots = await IndicatorService(session).history(
+    data = await IndicatorService(session).history_data(
         symbol,
         start=start,
         end=end,
         adjustment=adjustment,
     )
-    return SuccessResponse(
-        data=IndicatorHistoryData(items=[_indicator_data(item) for item in snapshots])
-    )
+    return SuccessResponse(data=data)
 
 
 @router.get(
@@ -88,38 +85,6 @@ async def get_state_history(
         adjustment=adjustment,
     )
     return SuccessResponse(data=StateHistoryData(items=[_state_data(item) for item in states]))
-
-
-def _current_indicator_data(snapshots: list[IndicatorSnapshot]) -> dict[str, Any]:
-    data: dict[str, Any] = {}
-    for snapshot in snapshots:
-        values = dict(snapshot.values)
-        if snapshot.delta is not None:
-            if snapshot.indicator_type in {"RSI", "PROJECTED_MA"} and "value" in snapshot.delta:
-                values["delta"] = float(snapshot.delta["value"])
-        else:
-            values["delta"] = dict(snapshot.delta)
-        data[snapshot.indicator_type] = values
-    return data
-
-
-def _indicator_data(snapshot: IndicatorSnapshot) -> IndicatorSnapshotData:
-    return IndicatorSnapshotData(
-        trade_date=snapshot.trade_date,
-        indicator_type=snapshot.indicator_type,
-        parameters=dict(snapshot.parameters),
-        values={key: float(value) for key, value in snapshot.values.items()},
-        previous_values=(
-            {key: float(value) for key, value in snapshot.previous_values.items()}
-            if snapshot.previous_values is not None
-            else None
-        ),
-        delta=(
-            {key: float(value) for key, value in snapshot.delta.items()}
-            if snapshot.delta is not None
-            else None
-        ),
-    )
 
 
 def _state_data(state: IndicatorState) -> StateData:

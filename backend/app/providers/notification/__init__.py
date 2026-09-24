@@ -9,6 +9,11 @@ from .feishu import (
     NotificationProviderError,
 )
 from .message import NotificationMessage
+from .registry import (
+    DEFAULT_PROVIDER_REGISTRY,
+    NotificationProviderRegistry,
+    create_default_registry,
+)
 
 __all__ = [
     "FeishuNotificationProvider",
@@ -18,4 +23,7 @@ __all__ = [
     "NotificationMessage",
     "NotificationProvider",
     "NotificationProviderError",
+    "NotificationProviderRegistry",
+    "DEFAULT_PROVIDER_REGISTRY",
+    "create_default_registry",
 ]
