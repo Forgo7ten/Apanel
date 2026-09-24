@@ -14,7 +14,7 @@ from .dividend_service import (
     ttm_window,
 )
 from .indicator_service import IndicatorService
-from .notification_service import NotificationService
+from .notification_service import NotificationService, summarize_deliveries
 from .security_service import SecurityService
 from .settings_service import UserSettingsService
 from .state_service import StateService
@@ -30,6 +30,7 @@ __all__ = [
     "DividendYieldService",
     "IndicatorService",
     "NotificationService",
+    "summarize_deliveries",
     "SecurityService",
     "StateService",
     "UserSettingsService",

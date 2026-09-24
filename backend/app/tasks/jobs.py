@@ -183,6 +183,7 @@ async def execute_eod_pipeline(
     alert_runner: Any | None = None,
     notification_runner: Any | None = None,
     delta_runner: Any | None = None,
+    notification_provider: Any | None = None,
 ) -> dict[str, Any]:
     """Run the strict seven-step EOD sequence under one distributed lease."""
 
@@ -251,6 +252,7 @@ async def execute_eod_pipeline(
                 alert_runner=alert_runner,
                 notification_runner=notification_runner,
                 delta_runner=delta_runner,
+                notification_provider=notification_provider,
             )
         context = PipelineContext(
             trade_date=selected_date,
@@ -260,6 +262,7 @@ async def execute_eod_pipeline(
                 "settings": app_settings,
                 "session_factory": session_factory,
                 "market_data_client": client,
+                "notification_provider": notification_provider,
             },
         )
         result = await EODPipeline(steps).run(context)

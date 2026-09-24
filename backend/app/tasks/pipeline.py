@@ -35,38 +35,14 @@ class PipelineDataError(RuntimeError):
 ALERT_ENTRYPOINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "app.services.alert_service",
-        ("run_eod", "run_eod_pipeline", "evaluate_and_persist", "evaluate_alerts"),
-    ),
-    (
-        "app.alerts.persistence",
-        ("run_eod", "run_eod_pipeline", "evaluate_and_persist", "evaluate_alerts"),
-    ),
-    (
-        "app.services.alert_persistence",
-        ("run_eod", "run_eod_pipeline", "evaluate_and_persist", "evaluate_alerts"),
-    ),
-    (
-        "app.services.alerts",
-        ("run_eod", "run_eod_pipeline", "evaluate_and_persist", "evaluate_alerts"),
-    ),
-    (
-        "app.repositories.alert",
-        ("run_eod", "run_eod_pipeline", "evaluate_and_persist", "evaluate_alerts"),
+        ("evaluate_all_alerts",),
     ),
 )
 
 NOTIFICATION_ENTRYPOINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "app.services.notification_service",
-        ("run_eod", "send_pending", "send_notifications", "deliver_notifications"),
-    ),
-    (
-        "app.providers.notification.service",
-        ("run_eod", "send_pending", "send_notifications", "deliver_notifications"),
-    ),
-    (
-        "app.services.notifications",
-        ("run_eod", "send_pending", "send_notifications", "deliver_notifications"),
+        ("summarize_deliveries",),
     ),
 )
 
@@ -141,6 +117,7 @@ def build_default_eod_steps(
     alert_runner: Integration | None = None,
     notification_runner: Integration | None = None,
     delta_runner: Integration | None = None,
+    notification_provider: Any | None = None,
 ) -> tuple[PipelineStep, ...]:
     """Build production steps while leaving every external boundary injectable."""
 
@@ -205,6 +182,8 @@ def build_default_eod_steps(
         return counts
 
     async def alerts(context: PipelineContext) -> Any:
+        if notification_provider is not None:
+            context.resources.setdefault("notification_provider", notification_provider)
         runner = alert_runner or resolve_alert_runner()
         return await _invoke_integration(runner, context)
 
@@ -231,15 +210,25 @@ async def _invoke_integration(target: Integration, context: PipelineContext) -> 
 
 
 def resolve_alert_runner() -> Integration:
-    """Resolve the parallel alert persistence entrypoint only when executed."""
+    """Resolve the explicit alert service and adapt it to ``PipelineContext``."""
 
-    return _resolve_integration("alert", ALERT_ENTRYPOINTS)
+    service = _resolve_integration("alert", ALERT_ENTRYPOINTS)
+
+    async def runner(context: PipelineContext) -> Any:
+        return await _run_alert_service(service, context)
+
+    return runner
 
 
 def resolve_notification_runner() -> Integration:
-    """Resolve the notification service boundary only when executed."""
+    """Resolve the explicit notification summary service adapter."""
 
-    return _resolve_integration("notification", NOTIFICATION_ENTRYPOINTS)
+    service = _resolve_integration("notification", NOTIFICATION_ENTRYPOINTS)
+
+    async def runner(context: PipelineContext) -> Any:
+        return await _run_notification_service(service, context)
+
+    return runner
 
 
 def _resolve_integration(
@@ -257,10 +246,96 @@ def _resolve_integration(
             candidate = getattr(module, attribute, None)
             if callable(candidate):
                 return candidate
-            runner = getattr(candidate, "run", None)
-            if callable(runner):
-                return runner
     raise PipelineConfigurationError(f"{label} integration entrypoint is unavailable")
+
+
+async def _run_alert_service(service: Callable[..., Any], context: PipelineContext) -> Any:
+    if "session_factory" not in context.resources or context.resources["session_factory"] is None:
+        raise PipelineConfigurationError("alert session factory is not configured")
+    provider = context.resources.get("notification_provider")
+
+    async def invoke(session: Any) -> Any:
+        return await _invoke_callable(service, session, provider=provider)
+
+    return await _run_in_session(context.resources["session_factory"], invoke)
+
+
+async def _run_notification_service(
+    service: Callable[..., Any],
+    context: PipelineContext,
+) -> Mapping[str, int]:
+    if "session_factory" not in context.resources or context.resources["session_factory"] is None:
+        raise PipelineConfigurationError("notification session factory is not configured")
+    notification_ids = _notification_ids(context.artifacts.get("alerts"))
+
+    async def invoke(session: Any) -> Any:
+        return await _invoke_callable(service, session, notification_ids)
+
+    summary = await _run_in_session(context.resources["session_factory"], invoke)
+    if not isinstance(summary, Mapping):
+        raise PipelineDataError("notification delivery summary is invalid")
+    required = ("total", "sent", "failed", "pending")
+    if any(key not in summary for key in required):
+        raise PipelineDataError("notification delivery summary is incomplete")
+    return {key: int(summary[key]) for key in required}
+
+
+async def _run_in_session(session_factory: Any, operation: Callable[[Any], Any]) -> Any:
+    async with session_factory() as session:
+        try:
+            result = await _invoke_callable(operation, session)
+            await _invoke_callable(session.commit)
+            return result
+        except BaseException:
+            rollback = getattr(session, "rollback", None)
+            if rollback is not None:
+                try:
+                    await _invoke_callable(rollback)
+                except Exception:
+                    logger.warning(
+                        "scheduled_pipeline_session_rollback_failed",
+                        extra={"event": "scheduled_pipeline_session_rollback_failed"},
+                    )
+            raise
+
+
+async def _invoke_callable(target: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    result = target(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _notification_ids(value: Any) -> tuple[int, ...]:
+    if value is None or isinstance(value, (str, bytes, Mapping)):
+        raise PipelineDataError("alert evaluation results are unavailable")
+    try:
+        results = tuple(value)
+    except TypeError as exc:
+        raise PipelineDataError("alert evaluation results are invalid") from exc
+    notification_ids: list[int] = []
+    for result in results:
+        if isinstance(result, Mapping):
+            triggered = result.get("triggered")
+            notification_id = result.get("notification_id")
+        else:
+            triggered = getattr(result, "triggered", None)
+            notification_id = getattr(result, "notification_id", None)
+        if not isinstance(triggered, bool):
+            raise PipelineDataError("alert evaluation result is invalid")
+        if triggered and notification_id is None:
+            raise PipelineDataError("triggered alert has no notification record")
+        if not triggered and notification_id is not None:
+            raise PipelineDataError("inactive alert has a notification record")
+        if notification_id is not None:
+            try:
+                normalized_id = int(notification_id)
+            except (TypeError, ValueError) as exc:
+                raise PipelineDataError("notification record id is invalid") from exc
+            if normalized_id in notification_ids:
+                raise PipelineDataError("alert batch contains duplicate notification records")
+            notification_ids.append(normalized_id)
+    return tuple(notification_ids)
 
 
 def _require_success(value: Any, label: str) -> None:
