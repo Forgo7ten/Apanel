@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -51,6 +52,36 @@ class InvitationStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class AlertConditionType(StrEnum):
+    """Persisted alert condition kinds."""
+
+    VALUE = "VALUE"
+    STATE = "STATE"
+
+
+class AlertInstanceStatus(StrEnum):
+    """Durable Edge Trigger state for one alert/security pair."""
+
+    ACTIVE = "ACTIVE"
+    RESET = "RESET"
+
+
+class NotificationChannel(StrEnum):
+    """Notification channels supported by the persistence contract."""
+
+    FEISHU = "FEISHU"
+    WECHAT = "WECHAT"
+    EMAIL = "EMAIL"
+
+
+class NotificationStatus(StrEnum):
+    """Delivery lifecycle persisted for every notification attempt."""
+
+    PENDING = "PENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+
+
 class Security(Base):
     """A security record shared with the market-data service."""
 
@@ -81,6 +112,13 @@ class Security(Base):
     watch_table_symbols: Mapped[list[WatchTableSymbol]] = relationship(
         back_populates="security", cascade="all, delete-orphan"
     )
+    alert_rules: Mapped[list[AlertRule]] = relationship(
+        back_populates="security", cascade="all, delete-orphan"
+    )
+    alert_instances: Mapped[list[AlertInstance]] = relationship(
+        back_populates="security", cascade="all, delete-orphan"
+    )
+    notifications: Mapped[list[Notification]] = relationship(back_populates="security")
 
 
 class DailyBar(Base):
@@ -288,6 +326,12 @@ class User(Base):
     settings: Mapped[UserSetting | None] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
     )
+    alert_rules: Mapped[list[AlertRule]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    notifications: Mapped[list[Notification]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Invitation(Base):
@@ -450,6 +494,139 @@ class UserSetting(Base):
     user: Mapped[User] = relationship(back_populates="settings")
 
 
+class AlertRule(Base):
+    """A user-owned rule evaluated against one shared security."""
+
+    __tablename__ = "alert_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "condition_type IN ('VALUE', 'STATE')",
+            name="ck_alert_rules_condition_type",
+        ),
+        CheckConstraint(
+            "((condition_type = 'VALUE' AND indicator_type IS NOT NULL "
+            "AND operator IS NOT NULL AND threshold IS NOT NULL AND state_code IS NULL) "
+            "OR (condition_type = 'STATE' AND state_code IS NOT NULL "
+            "AND indicator_type IS NULL AND operator IS NULL AND threshold IS NULL))",
+            name="ck_alert_rules_condition_fields",
+        ),
+        Index("ix_alert_rules_user_id", "user_id"),
+        Index("ix_alert_rules_user_security", "user_id", "security_id"),
+        Index("ix_alert_rules_security_id", "security_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    condition_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    indicator_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    state_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    operator: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    threshold: Mapped[Any | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    user: Mapped[User] = relationship(back_populates="alert_rules")
+    security: Mapped[Security] = relationship(back_populates="alert_rules")
+    instances: Mapped[list[AlertInstance]] = relationship(
+        back_populates="alert_rule", cascade="all, delete-orphan"
+    )
+    notifications: Mapped[list[Notification]] = relationship(back_populates="alert_rule")
+
+
+class AlertInstance(Base):
+    """The persisted state used to implement restart-safe Edge Trigger logic."""
+
+    __tablename__ = "alert_instances"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('ACTIVE', 'RESET')",
+            name="ck_alert_instances_status",
+        ),
+        UniqueConstraint(
+            "alert_rule_id",
+            "security_id",
+            name="uq_alert_instances_rule_security",
+        ),
+        Index("ix_alert_instances_rule_status", "alert_rule_id", "status"),
+        Index("ix_alert_instances_security_id", "security_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    alert_rule_id: Mapped[int] = mapped_column(
+        ForeignKey("alert_rules.id", ondelete="CASCADE"), nullable=False
+    )
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=AlertInstanceStatus.RESET, server_default="RESET"
+    )
+    last_trigger_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    alert_rule: Mapped[AlertRule] = relationship(back_populates="instances")
+    security: Mapped[Security] = relationship(back_populates="alert_instances")
+
+
+class Notification(Base):
+    """A user-scoped notification attempt and its safe delivery outcome."""
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        CheckConstraint(
+            "channel IN ('FEISHU', 'WECHAT', 'EMAIL')",
+            name="ck_notifications_channel",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'SENT', 'FAILED')",
+            name="ck_notifications_status",
+        ),
+        Index("ix_notifications_user_created_at", "user_id", "created_at"),
+        Index("ix_notifications_user_status", "user_id", "status"),
+        Index("ix_notifications_alert_rule_id", "alert_rule_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    alert_rule_id: Mapped[int | None] = mapped_column(
+        ForeignKey("alert_rules.id", ondelete="SET NULL"), nullable=True
+    )
+    security_id: Mapped[int | None] = mapped_column(
+        ForeignKey("securities.id", ondelete="SET NULL"), nullable=True
+    )
+    channel: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=NotificationChannel.FEISHU
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=NotificationStatus.PENDING, server_default="PENDING"
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    user: Mapped[User] = relationship(back_populates="notifications")
+    alert_rule: Mapped[AlertRule | None] = relationship(back_populates="notifications")
+    security: Mapped[Security | None] = relationship(back_populates="notifications")
+
+
 __all__ = [
     "DailyBar",
     "QuoteSnapshot",
@@ -457,6 +634,10 @@ __all__ = [
     "IndicatorState",
     "Invitation",
     "InvitationStatus",
+    "AlertConditionType",
+    "AlertInstance",
+    "AlertInstanceStatus",
+    "AlertRule",
     "RefreshSession",
     "Security",
     "StateDefinition",
@@ -467,4 +648,7 @@ __all__ = [
     "WatchTableSymbol",
     "TableColumn",
     "UserSetting",
+    "Notification",
+    "NotificationChannel",
+    "NotificationStatus",
 ]

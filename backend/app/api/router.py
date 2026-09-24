@@ -2,9 +2,11 @@
 
 from fastapi import APIRouter
 
+from app.api.alerts import router as alerts_router
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.api.indicator_state import router as indicator_state_router
+from app.api.notifications import router as notifications_router
 from app.api.securities import router as securities_router
 from app.api.settings import router as settings_router
 from app.api.watch_tables import router as watch_tables_router
@@ -16,3 +18,5 @@ api_router.include_router(indicator_state_router, tags=["indicators", "states"])
 api_router.include_router(securities_router, tags=["securities", "market-data"])
 api_router.include_router(watch_tables_router, tags=["watch-tables"])
 api_router.include_router(settings_router, tags=["settings"])
+api_router.include_router(alerts_router, tags=["alerts"])
+api_router.include_router(notifications_router, tags=["notifications"])

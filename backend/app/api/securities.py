@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.common import SuccessResponse
-from app.schemas.security import DailyBarData, QuoteData, SecurityData
+from app.schemas.security import DailyBarData, DividendYieldData, QuoteData, SecurityData
 from app.services.security_service import SecurityService
 
 router = APIRouter()
@@ -49,6 +49,31 @@ async def get_quote(
                 float(quote.change_percent) if quote.change_percent is not None else None
             ),
             timestamp=quote.timestamp,
+        )
+    )
+
+
+@router.get(
+    "/securities/{symbol}/dividend-yield",
+    response_model=SuccessResponse[DividendYieldData],
+)
+async def get_dividend_yield(
+    symbol: str,
+    session: AsyncSession = Depends(get_db),  # noqa: B008
+) -> SuccessResponse[DividendYieldData]:
+    """Return the TTM cash-dividend yield and its calculation inputs."""
+
+    result = await SecurityService(session).dividend_yield(symbol)
+    return SuccessResponse(
+        data=DividendYieldData(
+            dividend_total=result.dividend_total,
+            price=result.price,
+            dividend_yield=result.dividend_yield,
+            as_of=result.as_of,
+            price_source=result.price_source,
+            window_start=result.window_start,
+            window_end=result.window_end,
+            dividend_event_count=result.dividend_event_count,
         )
     )
 

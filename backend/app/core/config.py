@@ -73,8 +73,57 @@ class Settings(BaseSettings):
     database_command_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_socket_connect_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
+    market_data_service_url: str = Field(
+        default="http://market-data-service:8001",
+        validation_alias=AliasChoices("MARKET_DATA_SERVICE_URL", "MARKET_DATA_URL"),
+    )
+    internal_api_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "INTERNAL_API_TOKEN",
+            "INTERNAL_SYNC_TOKEN",
+            "MARKET_DATA_INTERNAL_TOKEN",
+        ),
+        description="Shared secret for backend-to-market-data internal writes.",
+    )
+    market_data_request_timeout_seconds: float = Field(default=10.0, gt=0)
+    quote_refresh_interval_minutes: int = Field(
+        default=5,
+        ge=5,
+        le=10,
+        validation_alias=AliasChoices(
+            "CELERY_QUOTE_REFRESH_MINUTES",
+            "QUOTE_REFRESH_INTERVAL_MINUTES",
+        ),
+    )
+    eod_pipeline_hour: int = Field(
+        default=15,
+        ge=15,
+        le=23,
+        validation_alias=AliasChoices(
+            "EOD_PIPELINE_HOUR",
+            "CELERY_EOD_HOUR",
+            "CELERY_EOD_PIPELINE_HOUR",
+        ),
+    )
+    eod_pipeline_minute: int = Field(
+        default=20,
+        ge=0,
+        le=59,
+        validation_alias=AliasChoices(
+            "EOD_PIPELINE_MINUTE",
+            "CELERY_EOD_MINUTE",
+            "CELERY_EOD_PIPELINE_MINUTE",
+        ),
+    )
+    scheduler_lock_ttl_seconds: int = Field(default=3600, gt=0)
+    scheduler_retry_max_attempts: int = Field(default=3, ge=0, le=20)
+    scheduler_retry_backoff_seconds: int = Field(default=60, gt=0)
     log_level: str = "INFO"
-    timezone: str = "Asia/Shanghai"
+    timezone: str = Field(
+        default="Asia/Shanghai",
+        validation_alias=AliasChoices("TIMEZONE", "CELERY_TIMEZONE"),
+    )
     jwt_secret_key: str = Field(
         default="development-only-jwt-secret-change-me-at-least-32-bytes",
         validation_alias=AliasChoices("JWT_SECRET_KEY", "JWT_SECRET"),

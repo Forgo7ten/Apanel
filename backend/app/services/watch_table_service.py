@@ -23,6 +23,7 @@ from app.schemas.watch import (
     WatchTableStockData,
     WatchTableSummaryData,
 )
+from app.services.dividend_service import DividendYieldResult, DividendYieldService
 
 _COLUMN_TYPES = {"PRICE", "INDICATOR", "STATE"}
 _VIEW_MODES = {"NUMBER", "DELTA", "STATUS", "COMPOSITE"}
@@ -35,6 +36,7 @@ class WatchTableService:
         self.session = session
         self.repository = WatchTableRepository(session)
         self.security_repository = SecurityRepository(session)
+        self.dividend_yield_service = DividendYieldService(self.security_repository)
 
     async def list(self, user_id: int) -> list[WatchTableSummaryData]:
         rows = await self.repository.list_for_user(user_id)
@@ -75,6 +77,11 @@ class WatchTableService:
 
     async def detail(self, user_id: int, table_id: int) -> WatchTableDetailsData:
         table = await self._owned(table_id, user_id, with_details=True)
+        has_dividend_yield_column = any(
+            column.column_type.upper() == "INDICATOR"
+            and (column.indicator_type or "").upper() == "DIVIDEND_YIELD"
+            for column in table.columns
+        )
         stocks: list[WatchTableStockData] = []
         for membership in table.symbols:
             security = membership.security
@@ -85,6 +92,10 @@ class WatchTableService:
                 snapshot.indicator_type: _json_numbers(snapshot.values)
                 for snapshot in snapshots
             }
+            if has_dividend_yield_column:
+                indicators["DIVIDEND_YIELD"] = await self._dividend_yield_projection(
+                    security.id
+                )
             price = _price_data(quote)
             state_data = [_state_data(state) for state in states]
             stocks.append(
@@ -110,6 +121,26 @@ class WatchTableService:
             columns=columns,
             stocks=stocks,
         )
+
+    async def _dividend_yield_projection(self, security_id: int) -> dict[str, Any]:
+        """Project the explainable yield value for a dynamic watch column."""
+
+        try:
+            result = await self.dividend_yield_service.calculate_for_security(security_id)
+        except ApiError as error:
+            if error.code not in {"PRICE_NOT_FOUND", "INVALID_PRICE", "INVALID_DIVIDEND_DATA"}:
+                raise
+            return {
+                "value": None,
+                "yield": None,
+                "dividend_yield": None,
+                "dividend_total": None,
+                "price": None,
+                "as_of": None,
+                "price_source": None,
+                "error_code": error.code,
+            }
+        return _dividend_yield_data(result)
 
     async def add_stock(
         self, user_id: int, table_id: int, security_id: int
@@ -389,6 +420,26 @@ def _state_data(state) -> CurrentStateData:
         transition=bool(metadata.get("transition", False)),
         trade_date=state.trade_date,
         metadata=metadata,
+    )
+
+
+def _dividend_yield_data(result: DividendYieldResult) -> dict[str, Any]:
+    """Keep both generic indicator ``value`` and yield explanation fields."""
+
+    value = result.dividend_yield
+    return _json_numbers(
+        {
+            "value": value,
+            "yield": value,
+            "dividend_yield": value,
+            "dividend_total": result.dividend_total,
+            "price": result.price,
+            "as_of": result.as_of,
+            "price_source": result.price_source,
+            "window_start": result.window_start,
+            "window_end": result.window_end,
+            "dividend_event_count": result.dividend_event_count,
+        }
     )
 
 

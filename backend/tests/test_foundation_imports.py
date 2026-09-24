@@ -16,7 +16,13 @@ def test_sprint1_auth_models_are_registered_for_migrations() -> None:
 def test_worker_and_scheduler_share_the_celery_application() -> None:
     assert scheduler_app is celery_app
     assert worker_app is celery_app
-    assert celery_app.conf.beat_schedule == {}
+    assert set(celery_app.conf.beat_schedule) == {
+        "refresh-intraday-quotes",
+        "run-end-of-day-pipeline",
+    }
+    assert celery_app.conf.timezone == "Asia/Shanghai"
+    assert celery_app.conf.enable_utc is False
+    assert set(celery_app.amqp.queues) >= {"default", "market-data", "pipeline"}
 
 
 def test_database_resources_are_not_created_at_module_import() -> None:

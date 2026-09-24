@@ -18,11 +18,21 @@ export function LoadingState({ label = "正在加载数据…" }: { label?: stri
   );
 }
 
-export function QueryErrorState({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+export function QueryErrorState({
+  error,
+  onRetry,
+  missingTitle = "监控接口尚未就绪",
+  missingDescription = "后端尚未提供该监控接口，请完成服务端路由后重试。",
+}: {
+  error: unknown;
+  onRetry: () => void;
+  missingTitle?: string;
+  missingDescription?: string;
+}) {
   const isMissingEndpoint = isApiError(error) && error.status === 404;
-  const title = isMissingEndpoint ? "监控接口尚未就绪" : "数据加载失败";
+  const title = isMissingEndpoint ? missingTitle : "数据加载失败";
   const description = isMissingEndpoint
-    ? "后端尚未提供该监控接口，请完成服务端路由后重试。"
+    ? missingDescription
     : error instanceof Error
       ? error.message
       : "暂时无法获取监控数据，请检查网络后重试。";

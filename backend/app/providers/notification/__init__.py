@@ -1,5 +1,29 @@
-"""Notification provider interfaces and adapters."""
+"""Notification provider interfaces, messages, and adapters."""
 
 from .base import NotificationProvider
+from .feishu import (
+    FeishuNotificationProvider,
+    FeishuProvider,
+    FeishuWebhookError,
+    FeishuWebhookProvider,
+    NotificationProviderError,
+)
+from .message import NotificationMessage
+from .registry import (
+    DEFAULT_PROVIDER_REGISTRY,
+    NotificationProviderRegistry,
+    create_default_registry,
+)
 
-__all__ = ["NotificationProvider"]
+__all__ = [
+    "FeishuNotificationProvider",
+    "FeishuProvider",
+    "FeishuWebhookError",
+    "FeishuWebhookProvider",
+    "NotificationMessage",
+    "NotificationProvider",
+    "NotificationProviderError",
+    "NotificationProviderRegistry",
+    "DEFAULT_PROVIDER_REGISTRY",
+    "create_default_registry",
+]

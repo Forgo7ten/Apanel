@@ -15,6 +15,7 @@ from app.indicators.types import Candle
 from app.models import DailyBar
 from app.models import IndicatorSnapshot as IndicatorSnapshotModel
 from app.repositories.indicator_state import IndicatorStateRepository
+from app.schemas.indicator_state import IndicatorHistoryData, IndicatorSnapshotData
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +104,24 @@ class IndicatorService:
             return persisted
         return await self.repository.latest_snapshots(security.id)
 
+    async def latest_data(
+        self,
+        symbol: str,
+        *,
+        adjustment: str | None = DEFAULT_ADJUSTMENT,
+    ) -> dict[str, Any]:
+        """Return the public latest-indicator projection.
+
+        API controllers should not know how persistence rows map to the
+        public indicator contract.  Keeping this projection here also gives
+        ``delta`` one stable meaning: ``None`` means that no prior value
+        exists, while a present delta is normalized to numbers.
+        """
+
+        return serialize_current_indicators(
+            await self.latest(symbol, adjustment=adjustment)
+        )
+
     async def history(
         self,
         symbol: str,
@@ -132,6 +151,26 @@ class IndicatorService:
         if not snapshots:
             raise ApiError("INDICATOR_DATA_NOT_FOUND", "No indicator data is available.", 404)
         return snapshots
+
+    async def history_data(
+        self,
+        symbol: str,
+        *,
+        start: date | None = None,
+        end: date | None = None,
+        adjustment: str | None = DEFAULT_ADJUSTMENT,
+    ) -> IndicatorHistoryData:
+        """Return the public history projection for one security."""
+
+        snapshots = await self.history(
+            symbol,
+            start=start,
+            end=end,
+            adjustment=adjustment,
+        )
+        return IndicatorHistoryData(
+            items=[serialize_indicator_snapshot(item) for item in snapshots]
+        )
 
     async def _get_security(self, symbol: str):
         normalized = normalize_symbol(symbol)
@@ -251,6 +290,43 @@ def _float_values(values: dict[str, Any]) -> dict[str, float]:
     return {str(key): float(value) for key, value in values.items()}
 
 
+def serialize_current_indicators(
+    snapshots: Iterable[IndicatorSnapshotModel],
+) -> dict[str, Any]:
+    """Serialize latest snapshots using the public grouped-indicator shape."""
+
+    data: dict[str, Any] = {}
+    for snapshot in snapshots:
+        values: dict[str, Any] = _float_values(dict(snapshot.values))
+        if snapshot.delta is None:
+            values["delta"] = None
+        elif snapshot.indicator_type in {"RSI", "PROJECTED_MA"} and "value" in snapshot.delta:
+            values["delta"] = float(snapshot.delta["value"])
+        else:
+            values["delta"] = _float_values(dict(snapshot.delta))
+        data[snapshot.indicator_type] = values
+    return data
+
+
+def serialize_indicator_snapshot(snapshot: IndicatorSnapshotModel) -> IndicatorSnapshotData:
+    """Serialize one persisted snapshot for the history API."""
+
+    return IndicatorSnapshotData(
+        trade_date=snapshot.trade_date,
+        indicator_type=snapshot.indicator_type,
+        parameters=dict(snapshot.parameters),
+        values=_float_values(dict(snapshot.values)),
+        previous_values=(
+            _float_values(dict(snapshot.previous_values))
+            if snapshot.previous_values is not None
+            else None
+        ),
+        delta=(
+            _float_values(dict(snapshot.delta)) if snapshot.delta is not None else None
+        ),
+    )
+
+
 def _delta(
     values: dict[str, float], previous: dict[str, float] | None
 ) -> dict[str, float] | None:
@@ -304,4 +380,6 @@ __all__ = [
     "DEFAULT_ADJUSTMENT",
     "IndicatorService",
     "normalize_symbol",
+    "serialize_current_indicators",
+    "serialize_indicator_snapshot",
 ]

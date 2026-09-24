@@ -18,17 +18,22 @@ from app.models import (
 )
 from app.repositories.indicator_state import IndicatorStateRepository
 from app.services.indicator_service import IndicatorService, _validate_range, normalize_symbol
-from app.states import IndicatorSnapshot, StateEngine, StateStatus, create_default_registry
+from app.states import DEFAULT_REGISTRY, IndicatorSnapshot, StateEngine, StateRegistry, StateStatus
 
 
 class StateService:
     """Recognize and persist state rows using database-backed prior status."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        registry: StateRegistry | None = None,
+    ) -> None:
         self.session = session
         self.repository = IndicatorStateRepository(session)
         self.indicator_service = IndicatorService(session)
-        self.registry = create_default_registry()
+        self.registry = registry or DEFAULT_REGISTRY
 
     async def calculate(
         self,

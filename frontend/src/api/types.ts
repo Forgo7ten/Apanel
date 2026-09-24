@@ -112,3 +112,86 @@ export type UpdateColumnInput = Partial<{
   width: number;
   view_mode: IndicatorViewMode;
 }>;
+
+export type AlertConditionType = "STATE" | "VALUE";
+
+export type AlertOperator = ">" | ">=" | "<" | "<=" | "=" | "!=";
+
+export type AlertRule = {
+  id: Identifier;
+  security_id: Identifier;
+  condition_type: AlertConditionType | string;
+  state_id?: string | null;
+  state_code?: string | null;
+  indicator?: string | null;
+  indicator_type?: string | null;
+  operator?: AlertOperator | string | null;
+  threshold?: number | string | null;
+  enabled?: boolean;
+  symbol?: string | null;
+  name?: string | null;
+  security?: Security | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type CreateAlertInput = {
+  security_id: Identifier;
+  condition_type: AlertConditionType;
+  state_id?: string;
+  indicator?: string;
+  operator?: AlertOperator;
+  threshold?: number;
+};
+
+export type UpdateAlertInput = Partial<CreateAlertInput> & {
+  enabled?: boolean;
+};
+
+export type NotificationRecord = {
+  id?: Identifier;
+  alert_rule_id?: Identifier | null;
+  security_id?: Identifier | null;
+  symbol: string;
+  name?: string | null;
+  title: string;
+  channel: string;
+  status?: string | null;
+  content?: Record<string, unknown> | string | null;
+  indicator?: string | null;
+  state_id?: string | null;
+  created_at: string;
+  sent_at?: string | null;
+};
+
+export type AdjustmentType = "qfq" | "none";
+
+export type IndicatorParameterValue = string | number | boolean;
+
+export type IndicatorSettings = {
+  defaults?: string[];
+  parameters?: Record<string, Record<string, IndicatorParameterValue>>;
+};
+
+export type DisplaySettings = {
+  density?: "compact" | "comfortable";
+  show_states?: boolean;
+  show_deltas?: boolean;
+  show_mini_chart?: boolean;
+};
+
+export type NotificationSettings = {
+  /** Empty string is never sent; the UI maps it to null to clear the secret. */
+  feishu_webhook?: string | null;
+  /** Backends may expose configuration state without returning the secret. */
+  feishu_webhook_configured?: boolean;
+};
+
+export type UserSettings = {
+  adjust_type?: AdjustmentType;
+  indicator_settings?: IndicatorSettings;
+  display_settings?: DisplaySettings;
+  notification_settings?: NotificationSettings;
+};
+
+export type UpdateSettingsInput = UserSettings;
