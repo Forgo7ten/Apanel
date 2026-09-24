@@ -13,7 +13,9 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.domain.market_data import (
     Adjustment,
     DailyBar,
+    Dividend,
     InvalidMarketDataError,
+    Quote,
     Security,
     normalize_adjustment,
     normalize_symbol,
@@ -26,7 +28,9 @@ from app.providers.errors import (
 )
 from app.repositories.market_data import (
     DailyBarRepository,
+    DividendRepository,
     PersistenceSystemError,
+    QuoteRepository,
     SecurityRepository,
 )
 
@@ -164,7 +168,7 @@ class DailyBarSyncService:
         symbols: Iterable[str],
         start: date,
         end: date,
-        adjustment: Adjustment | str = Adjustment.NONE,
+        adjustment: Adjustment | str = Adjustment.QFQ,
     ) -> SyncSummary:
         selected_adjustment = normalize_adjustment(adjustment)
         canonical_symbols: list[str] = []
@@ -232,6 +236,153 @@ class DailyBarSyncService:
                     )
                 )
         return SyncSummary(operation="daily_bar", items=tuple(results.values()))
+
+
+class QuoteSyncService:
+    """Fetch and persist one latest quote snapshot per requested symbol."""
+
+    def __init__(self, *, provider: MarketDataProvider, repository: QuoteRepository) -> None:
+        self._provider = provider
+        self._repository = repository
+
+    async def sync(self, *, symbols: Iterable[str]) -> SyncSummary:
+        canonical_symbols, results = _canonicalize_symbols(symbols)
+        pending: dict[str, Quote] = {}
+        for symbol in canonical_symbols:
+            try:
+                raw_record = await self._provider.get_quote(symbol)
+                record = _validated_quote(symbol, raw_record)
+                pending[symbol] = record
+                results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
+            except Exception as exc:
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="failed",
+                    error=_sync_error(exc),
+                )
+
+        if pending:
+            persisted = await _persist_with_isolation(
+                tuple(pending.values()),
+                self._repository.upsert_many,
+            )
+            for symbol, error in persisted.items():
+                previous = results[symbol]
+                results[symbol] = (
+                    SyncItemResult(
+                        symbol=symbol,
+                        status="success",
+                        fetched=previous.fetched,
+                        persisted=1,
+                    )
+                    if error is None
+                    else SyncItemResult(
+                        symbol=symbol,
+                        status="failed",
+                        fetched=previous.fetched,
+                        error=error,
+                    )
+                )
+        return SyncSummary(operation="quote", items=tuple(results.values()))
+
+
+class DividendSyncService:
+    """Fetch and persist cash-dividend events with per-symbol isolation."""
+
+    def __init__(self, *, provider: MarketDataProvider, repository: DividendRepository) -> None:
+        self._provider = provider
+        self._repository = repository
+
+    async def sync(self, *, symbols: Iterable[str]) -> SyncSummary:
+        canonical_symbols, results = _canonicalize_symbols(symbols)
+        pending: dict[str, tuple[Dividend, ...]] = {}
+        for symbol in canonical_symbols:
+            try:
+                raw_records = tuple(await self._provider.get_dividends(symbol))
+                records = _validated_dividends(symbol, raw_records)
+                pending[symbol] = records
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="success",
+                    fetched=len(records),
+                )
+            except Exception as exc:
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="failed",
+                    error=_sync_error(exc),
+                )
+
+        records = tuple(record for values in pending.values() for record in values)
+        if records:
+            persisted = await _persist_with_isolation(
+                records,
+                self._repository.upsert_many,
+            )
+            for symbol, error in persisted.items():
+                previous = results[symbol]
+                results[symbol] = (
+                    SyncItemResult(
+                        symbol=symbol,
+                        status="success",
+                        fetched=previous.fetched,
+                        persisted=previous.fetched,
+                    )
+                    if error is None
+                    else SyncItemResult(
+                        symbol=symbol,
+                        status="failed",
+                        fetched=previous.fetched,
+                        error=error,
+                    )
+                )
+        return SyncSummary(operation="dividend", items=tuple(results.values()))
+
+
+def _canonicalize_symbols(
+    symbols: Iterable[str],
+) -> tuple[list[str], dict[str, SyncItemResult]]:
+    canonical_symbols: list[str] = []
+    results: dict[str, SyncItemResult] = {}
+    for raw_symbol in symbols:
+        try:
+            symbol = normalize_symbol(raw_symbol)
+        except Exception as exc:
+            symbol = _best_effort_symbol(raw_symbol)
+            results.setdefault(
+                symbol,
+                SyncItemResult(symbol=symbol, status="failed", error=_sync_error(exc)),
+            )
+            continue
+        if symbol not in results:
+            canonical_symbols.append(symbol)
+    return canonical_symbols, results
+
+
+def _validated_quote(symbol: str, value: object) -> Quote:
+    if not isinstance(value, Quote):
+        raise InvalidMarketDataError("provider returned a non-Quote record")
+    if value.symbol != symbol:
+        raise InvalidMarketDataError(
+            f"provider returned quote for {value.symbol}, requested {symbol}"
+        )
+    return value
+
+
+def _validated_dividends(
+    symbol: str,
+    records: Sequence[object],
+) -> tuple[Dividend, ...]:
+    unique: dict[tuple[str, date], Dividend] = {}
+    for value in records:
+        if not isinstance(value, Dividend):
+            raise InvalidMarketDataError("provider returned a non-Dividend record")
+        if value.symbol != symbol:
+            raise InvalidMarketDataError(
+                f"provider returned dividend for {value.symbol}, requested {symbol}"
+            )
+        unique[(value.symbol, value.date)] = value
+    return tuple(unique.values())
 
 
 def _require_security(value: object) -> Security:

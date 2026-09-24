@@ -33,6 +33,23 @@ class QuoteData(BaseModel):
     timestamp: datetime
 
 
+class DividendData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    date: date
+    cash_amount: Decimal
+
+
+class DividendsData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    start: date | None = None
+    end: date | None = None
+    items: list[DividendData]
+
+
 class DailyBarData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -67,6 +84,18 @@ class DailySyncRequest(BaseModel):
         default=Adjustment.QFQ,
         validation_alias=AliasChoices("adjustment", "adjust", "adjust_type"),
     )
+
+
+class QuoteSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] = Field(min_length=1)
+
+
+class DividendSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] = Field(min_length=1)
 
 
 class SyncItemData(BaseModel):

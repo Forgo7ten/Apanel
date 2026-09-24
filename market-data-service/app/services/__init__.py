@@ -2,6 +2,8 @@
 
 from .sync import (
     DailyBarSyncService,
+    DividendSyncService,
+    QuoteSyncService,
     SecuritySyncService,
     SyncError,
     SyncItemResult,
@@ -10,6 +12,8 @@ from .sync import (
 
 __all__ = [
     "DailyBarSyncService",
+    "DividendSyncService",
+    "QuoteSyncService",
     "SecuritySyncService",
     "SyncError",
     "SyncItemResult",

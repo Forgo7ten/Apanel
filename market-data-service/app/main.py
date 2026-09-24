@@ -25,7 +25,12 @@ from app.repositories.market_data import (
 from app.schemas.common import ErrorResponse
 from app.schemas.market_data import ApiEnvelope
 from app.services.health_service import HealthService
-from app.services.sync import DailyBarSyncService, SecuritySyncService
+from app.services.sync import (
+    DailyBarSyncService,
+    DividendSyncService,
+    QuoteSyncService,
+    SecuritySyncService,
+)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -81,6 +86,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.daily_sync_service = DailyBarSyncService(
                 provider=provider,
                 repository=daily_bar_repository,
+            )
+            app.state.quote_sync_service = QuoteSyncService(
+                provider=provider,
+                repository=quote_repository,
+            )
+            app.state.dividend_sync_service = DividendSyncService(
+                provider=provider,
+                repository=dividend_repository,
             )
             app.state.health_service = health_service
             yield

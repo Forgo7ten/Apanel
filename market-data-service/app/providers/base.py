@@ -30,7 +30,7 @@ class MarketDataProvider(ABC):
         symbol: str,
         start: date,
         end: date,
-        adjustment: Adjustment | str = Adjustment.NONE,
+        adjustment: Adjustment | str = Adjustment.QFQ,
     ) -> Sequence[DailyBar]:
         """Return validated daily bars for a date range."""
 
