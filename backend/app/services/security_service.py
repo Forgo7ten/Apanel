@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
 from app.repositories.security import SecurityRepository
+from app.services.dividend_service import DividendYieldResult, DividendYieldService
 from app.services.indicator_service import normalize_symbol
 
 
@@ -16,6 +17,7 @@ class SecurityService:
 
     def __init__(self, session: AsyncSession) -> None:
         self.repository = SecurityRepository(session)
+        self.dividend_yield_service = DividendYieldService(self.repository)
 
     async def search(self, query: str, *, limit: int = 50):
         normalized = query.strip()
@@ -37,6 +39,17 @@ class SecurityService:
         if quote is None:
             raise ApiError("QUOTE_NOT_FOUND", "No quote is available.", 404)
         return quote
+
+    async def dividend_yield(self, symbol: str) -> DividendYieldResult:
+        """Return explainable TTM cash-dividend yield for a public symbol."""
+
+        security = await self.get(symbol)
+        return await self.dividend_yield_service.calculate_for_security(security.id)
+
+    async def dividend_yield_for_security(self, security_id: int) -> DividendYieldResult:
+        """Calculate TTM yield for a known security id for watch aggregation."""
+
+        return await self.dividend_yield_service.calculate_for_security(security_id)
 
     async def daily_bars(
         self,

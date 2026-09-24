@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SecurityData(BaseModel):
@@ -35,6 +36,24 @@ class QuoteData(BaseModel):
     timestamp: datetime
 
 
+class DividendYieldData(BaseModel):
+    """TTM cash-dividend yield with the inputs needed to explain it."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # The application service calculates with Decimal.  Public API numbers
+    # follow the existing quote/bar contract and are JSON numbers rather than
+    # Decimal strings.
+    dividend_total: float
+    price: float
+    dividend_yield: float = Field(alias="yield")
+    as_of: datetime
+    price_source: Literal["QUOTE", "DAILY_BAR_CLOSE"]
+    window_start: date
+    window_end: date
+    dividend_event_count: int
+
+
 class DailyBarData(BaseModel):
     """A persisted daily OHLC bar."""
 
@@ -59,4 +78,10 @@ class DailyBarsData(BaseModel):
     items: list[DailyBarData]
 
 
-__all__ = ["DailyBarData", "DailyBarsData", "QuoteData", "SecurityData"]
+__all__ = [
+    "DailyBarData",
+    "DailyBarsData",
+    "DividendYieldData",
+    "QuoteData",
+    "SecurityData",
+]

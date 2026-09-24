@@ -12,7 +12,7 @@ from .indicator_state import (
     StateData,
     StateHistoryData,
 )
-from .security import DailyBarData, DailyBarsData, QuoteData, SecurityData
+from .security import DailyBarData, DailyBarsData, DividendYieldData, QuoteData, SecurityData
 from .settings import UserSettingsData, UserSettingsUpdateRequest
 from .watch import (
     AddStockRequest,
@@ -42,6 +42,7 @@ __all__ = [
     "StateHistoryData",
     "DailyBarData",
     "DailyBarsData",
+    "DividendYieldData",
     "QuoteData",
     "SecurityData",
     "UserSettingsData",

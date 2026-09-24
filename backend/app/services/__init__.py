@@ -6,6 +6,13 @@ from .alert_service import (
     AlertService,
     evaluate_all_alerts,
 )
+from .dividend_service import (
+    DividendYieldCalculationError,
+    DividendYieldResult,
+    DividendYieldService,
+    calculate_ttm_dividend_yield,
+    ttm_window,
+)
 from .indicator_service import IndicatorService
 from .notification_service import NotificationService
 from .security_service import SecurityService
@@ -18,10 +25,15 @@ __all__ = [
     "AlertEvaluationService",
     "AlertService",
     "evaluate_all_alerts",
+    "DividendYieldCalculationError",
+    "DividendYieldResult",
+    "DividendYieldService",
     "IndicatorService",
     "NotificationService",
     "SecurityService",
     "StateService",
     "UserSettingsService",
     "WatchTableService",
+    "calculate_ttm_dividend_yield",
+    "ttm_window",
 ]

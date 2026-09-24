@@ -2,12 +2,65 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import (
+    DATE,
+    INTEGER,
+    NUMERIC,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Select,
+    Table,
+    UniqueConstraint,
+    case,
+    func,
+    or_,
+    select,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.base import Base
 from app.models import DailyBar, IndicatorSnapshot, IndicatorState, QuoteSnapshot, Security
+
+_dividend_events_table = Base.metadata.tables.get("dividend_events")
+if _dividend_events_table is None:
+    # The table is created by the market-data migration and owned by the
+    # market-data service.  The backend only needs this Core read projection;
+    # deliberately do not add a second ORM model or a migration here.
+    _dividend_events_table = Table(
+        "dividend_events",
+        Base.metadata,
+        Column("id", INTEGER, primary_key=True, autoincrement=True),
+        Column(
+            "security_id",
+            INTEGER,
+            ForeignKey("securities.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        Column("date", DATE, nullable=False),
+        Column("cash_amount", NUMERIC(asdecimal=True), nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+        UniqueConstraint("security_id", "date", name="uq_dividend_events_security_date"),
+        Index("ix_dividend_events_security_date", "security_id", "date"),
+    )
+
+DIVIDEND_EVENTS_TABLE = _dividend_events_table
+
+
+@dataclass(frozen=True, slots=True)
+class DividendEventRecord:
+    """Read-only projection of one persisted cash dividend event."""
+
+    id: int
+    security_id: int
+    date: date
+    cash_amount: Decimal
 
 
 class SecurityRepository:
@@ -43,6 +96,65 @@ class SecurityRepository:
                 .limit(1)
             )
         ).scalar_one_or_none()
+
+    async def latest_daily_bar(self, security_id: int) -> DailyBar | None:
+        """Return the latest close, preferring an unadjusted bar on ties.
+
+        A quote is the authoritative current price.  This read exists only as
+        an explainable fallback for consumers such as TTM dividend yield when
+        no quote snapshot has been persisted yet.
+        """
+
+        return (
+            await self.session.execute(
+                select(DailyBar)
+                .where(DailyBar.security_id == security_id)
+                .order_by(
+                    DailyBar.trade_date.desc(),
+                    case((DailyBar.adjust_type == "none", 0), else_=1),
+                    DailyBar.id.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    async def dividend_events(
+        self,
+        security_id: int,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[DividendEventRecord]:
+        """Return cash dividend events in chronological order.
+
+        ``dividend_events`` is maintained by the market-data service.  Using
+        a Core table projection keeps the backend read-only and avoids adding
+        a competing ORM/Alembic definition for that shared table.
+        """
+
+        statement = select(
+            DIVIDEND_EVENTS_TABLE.c.id,
+            DIVIDEND_EVENTS_TABLE.c.security_id,
+            DIVIDEND_EVENTS_TABLE.c.date,
+            DIVIDEND_EVENTS_TABLE.c.cash_amount,
+        ).where(DIVIDEND_EVENTS_TABLE.c.security_id == security_id)
+        if start_date is not None:
+            statement = statement.where(DIVIDEND_EVENTS_TABLE.c.date >= start_date)
+        if end_date is not None:
+            statement = statement.where(DIVIDEND_EVENTS_TABLE.c.date <= end_date)
+        statement = statement.order_by(
+            DIVIDEND_EVENTS_TABLE.c.date.asc(), DIVIDEND_EVENTS_TABLE.c.id.asc()
+        )
+        rows = (await self.session.execute(statement)).mappings().all()
+        return [
+            DividendEventRecord(
+                id=int(row["id"]),
+                security_id=int(row["security_id"]),
+                date=row["date"],
+                cash_amount=_decimal(row["cash_amount"]),
+            )
+            for row in rows
+        ]
 
     async def daily_bars(
         self,
@@ -114,4 +226,12 @@ class SecurityRepository:
         )
 
 
-__all__ = ["SecurityRepository"]
+def _decimal(value: Any) -> Decimal:
+    """Normalize database numeric values without introducing float noise."""
+
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+__all__ = ["DIVIDEND_EVENTS_TABLE", "DividendEventRecord", "SecurityRepository"]
