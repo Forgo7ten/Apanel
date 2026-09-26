@@ -3,6 +3,7 @@ import type { IndicatorState } from "@/api/types";
 import { StateTag, stateToneFromLevel } from "@/components/ui/StateTag";
 
 import { getColumnFields } from "@/lib/indicator-contract.mjs";
+import { WATCH_COMPOSITE_LAYOUT } from "@/lib/watch-contract.mjs";
 
 import { formatMetricValue, getDirection, getFieldValue } from "./indicator-utils";
 
@@ -26,14 +27,14 @@ function getFieldLabel(key: string): string {
 
 export function CompositeCell({ value, states = [] }: { value: unknown; states?: IndicatorState[] }) {
   const fields = getColumnFields(value);
-  const displayStates = states.slice(0, 2);
+  const displayStates = states.slice(0, WATCH_COMPOSITE_LAYOUT.maxStateTags);
 
   if (fields.length === 0) {
     return <span className="text-sm tabular-nums text-muted">—</span>;
   }
 
   return (
-    <div className="min-w-[150px] space-y-1 py-1">
+    <div className="min-w-[150px] whitespace-nowrap py-1">
       <div className="space-y-0.5">
         {fields.map(([key, fieldValue]) => {
           const direction = getDirection(fieldValue);
@@ -41,10 +42,10 @@ export function CompositeCell({ value, states = [] }: { value: unknown; states?:
           const previousValue = getFieldValue(fieldValue, "previous_value");
           const delta = getFieldValue(fieldValue, "delta");
           return (
-            <div key={key} className="flex items-start justify-between gap-3 text-xs">
-              <span className="pt-0.5 text-muted">{getFieldLabel(key)}</span>
-              <span className="text-right tabular-nums text-secondary">
-                <span className="block">
+            <div key={key} className="flex h-8 items-start justify-between gap-3 text-xs leading-4">
+              <span className="pt-0.5 leading-4 text-muted">{getFieldLabel(key)}</span>
+              <span className="text-right tabular-nums leading-4 text-secondary">
+                <span className="block h-4 leading-4">
                   {formatMetricValue(currentValue)}
                   {direction ? (
                     <span
@@ -55,7 +56,7 @@ export function CompositeCell({ value, states = [] }: { value: unknown; states?:
                     </span>
                   ) : null}
                 </span>
-                <span className="block text-[10px] text-muted">
+                <span className="block h-4 text-[10px] leading-4 text-muted">
                   前 {formatMetricValue(previousValue)} · Δ {formatMetricValue(delta)}
                 </span>
               </span>
@@ -64,9 +65,9 @@ export function CompositeCell({ value, states = [] }: { value: unknown; states?:
         })}
       </div>
       {displayStates.length > 0 ? (
-        <div className="flex flex-wrap gap-1 pt-0.5">
+        <div className="mt-1 flex h-5 max-w-full flex-nowrap items-center gap-1 overflow-x-auto">
           {displayStates.map((state) => (
-            <StateTag key={state.state_id} tone={stateToneFromLevel(state.level ?? state.severity)}>
+            <StateTag key={state.state_id} compact tone={stateToneFromLevel(state.level ?? state.severity)}>
               {state.title}
             </StateTag>
           ))}

@@ -5,7 +5,6 @@ import { useEffect, useRef, type RefObject } from "react";
 import type { IndicatorState } from "@/api/types";
 import { getColumnFields } from "@/lib/indicator-contract.mjs";
 import {
-  focusLoopIndex,
   isDetailCloseKey,
   isValidDetailSelection,
   orderHistoryFields,
@@ -13,6 +12,7 @@ import {
 } from "@/lib/detail-contract.mjs";
 
 import { MiniChart } from "./MiniChart";
+import { trapDialogTab } from "../ui/dialog-focus";
 import type { DetailNotificationHandler, DetailSelection } from "./detail-types";
 import { formatMetricValue, getDirection, getFieldValue } from "./indicator-utils";
 import { useIndicatorDetailsData } from "./useIndicatorDetailsData";
@@ -104,12 +104,6 @@ function HistoryStateList({ items }: { items: Array<{
   );
 }
 
-function focusableElements(dialog: HTMLElement): HTMLElement[] {
-  return Array.from(dialog.querySelectorAll<HTMLElement>(
-    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-  ));
-}
-
 export function IndicatorDetailsDrawer({
   selection,
   onClose,
@@ -137,18 +131,8 @@ export function IndicatorDetailsDrawer({
         return;
       }
       if (event.key !== "Tab" || !dialogRef.current) return;
-      const elements = focusableElements(dialogRef.current);
-      if (elements.length === 0) return;
-      const currentIndex = elements.indexOf(document.activeElement as HTMLElement);
-      if (currentIndex < 0) {
+      if (trapDialogTab(dialogRef.current, event.shiftKey)) {
         event.preventDefault();
-        elements[event.shiftKey ? elements.length - 1 : 0].focus();
-        return;
-      }
-      const atBoundary = event.shiftKey ? currentIndex === 0 : currentIndex === elements.length - 1;
-      if (atBoundary) {
-        event.preventDefault();
-        elements[focusLoopIndex(currentIndex, elements.length, event.shiftKey)].focus();
       }
     };
     document.addEventListener("keydown", onKeyDown);

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import calendar
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.core.errors import ApiError
+from app.models import QuoteSnapshot
 from app.repositories.security import DividendEventRecord, SecurityRepository
 
 
@@ -77,6 +78,76 @@ class DividendYieldService:
             )
         except DividendYieldCalculationError as exc:
             raise ApiError(exc.code, exc.message, 422) from exc
+
+    async def calculate_for_securities(
+        self,
+        security_ids: Iterable[int],
+        *,
+        quotes: Mapping[int, QuoteSnapshot] | None = None,
+    ) -> dict[int, DividendYieldResult | ApiError]:
+        """Calculate yield for many securities with bounded repository reads.
+
+        Quotes and fallback closes are loaded in batches, and all dividend
+        events are read with one date-bounded query.  The pure calculation is
+        still performed independently for each security so one malformed row
+        cannot change another security's projection.
+        """
+
+        ids = tuple(dict.fromkeys(int(security_id) for security_id in security_ids))
+        if not ids:
+            return {}
+        quote_rows = (
+            quotes if quotes is not None else await self.repository.latest_quotes_batch(ids)
+        )
+        missing_quote_ids = tuple(
+            security_id for security_id in ids if security_id not in quote_rows
+        )
+        daily_bars = await self.repository.latest_daily_bars_batch(missing_quote_ids)
+
+        price_data: dict[int, tuple[Decimal, datetime, str]] = {}
+        results: dict[int, DividendYieldResult | ApiError] = {}
+        for security_id in ids:
+            quote = quote_rows.get(security_id)
+            if quote is not None:
+                price_data[security_id] = (
+                    quote.price,
+                    _utc_timestamp(quote.timestamp),
+                    "QUOTE",
+                )
+                continue
+            daily_bar = daily_bars.get(security_id)
+            if daily_bar is None:
+                results[security_id] = ApiError(
+                    "PRICE_NOT_FOUND",
+                    "No quote or daily close is available for this security.",
+                    404,
+                )
+                continue
+            price_data[security_id] = (
+                daily_bar.close,
+                datetime.combine(daily_bar.trade_date, time.min, tzinfo=UTC),
+                "DAILY_BAR_CLOSE",
+            )
+
+        if not price_data:
+            return results
+        windows = [ttm_window(as_of) for _, as_of, _ in price_data.values()]
+        events_by_security = await self.repository.dividend_events_batch(
+            price_data.keys(),
+            start_date=min(window[0] for window in windows),
+            end_date=max(window[1] for window in windows),
+        )
+        for security_id, (price, as_of, price_source) in price_data.items():
+            try:
+                results[security_id] = calculate_ttm_dividend_yield(
+                    events_by_security.get(security_id, ()),
+                    price=price,
+                    as_of=as_of,
+                    price_source=price_source,
+                )
+            except DividendYieldCalculationError as exc:
+                results[security_id] = ApiError(exc.code, exc.message, 422)
+        return results
 
 
 def calculate_ttm_dividend_yield(
