@@ -31,6 +31,24 @@ docker compose ps
 docker compose logs -f backend
 ```
 
+首次启动还会自动运行一次证券主数据 bootstrap。查看其状态或日志：
+
+```bash
+docker compose ps security-bootstrap
+docker compose logs -f security-bootstrap
+```
+
+如果行情 provider 在启动期间暂时不可用，bootstrap 会独立重试，不会阻塞 Web；需要手工重跑时执行：
+
+```bash
+docker compose run --rm security-bootstrap
+```
+
+可在 `.env` 中通过 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 和
+`SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 调整请求超时与重试间隔；默认
+bootstrap 请求超时为 180 秒，覆盖行情服务 TDX 证券列表的 60 秒超时、AKShare
+完整批次的 90 秒超时和收尾开销。
+
 ## 检查健康状态
 
 ```bash

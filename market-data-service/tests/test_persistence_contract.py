@@ -1,10 +1,15 @@
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+import pytest
+from sqlalchemy import create_engine, select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from app.domain.market_data import Adjustment, DailyBar, Dividend, Quote, Security
 from app.models.market_data import (
+    Base,
     DailyBarModel,
     DividendEventModel,
     QuoteSnapshotModel,
@@ -16,6 +21,7 @@ from app.repositories.market_data import (
     SqlAlchemyQuoteSnapshotRepository,
     SqlAlchemySecurityRepository,
 )
+from app.services.sync import SecuritySyncService
 
 
 class RecordingTransaction:
@@ -50,6 +56,51 @@ class RecordingSessionFactory:
                 return False
 
         return SessionContext()
+
+
+class SyncTransactionAdapter:
+    """Async context seam backed by SQLAlchemy's real synchronous transaction."""
+
+    def __init__(self, transaction):
+        self._transaction = transaction
+
+    async def __aenter__(self):
+        self._transaction.__enter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return self._transaction.__exit__(exc_type, exc, traceback)
+
+
+class SyncSessionAdapter:
+    """Keep this test dependency-free while exercising a real SQLite session."""
+
+    def __init__(self, engine):
+        self._session = Session(engine)
+
+    @property
+    def bind(self):
+        return self._session.bind
+
+    def begin(self):
+        return SyncTransactionAdapter(self._session.begin())
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self._session.close()
+
+
+class SyncSessionFactory:
+    def __init__(self, engine):
+        self._engine = engine
+
+    def __call__(self):
+        return SyncSessionAdapter(self._engine)
 
 
 def test_market_models_preserve_decimal_and_utc_columns() -> None:
@@ -129,3 +180,53 @@ async def test_security_repository_uses_one_explicit_transaction_for_a_batch() -
     assert "ON CONFLICT (symbol) DO UPDATE" in str(
         session.statements[0].compile(dialect=postgresql.dialect())
     )
+
+
+@pytest.mark.asyncio
+async def test_security_sync_rolls_back_a_real_sqlalchemy_batch_on_a_later_constraint_failure(
+) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER reject_second_security
+            BEFORE INSERT ON securities
+            WHEN NEW.symbol = '000001'
+            BEGIN
+                SELECT RAISE(ABORT, 'second security rejected');
+            END
+            """
+        )
+
+    repository = SqlAlchemySecurityRepository(SyncSessionFactory(engine))
+
+    class Provider:
+        async def get_symbols(self):
+            return (
+                Security(
+                    symbol="600519",
+                    name="贵州茅台",
+                    market="SH",
+                    security_type="STOCK",
+                ),
+                Security(
+                    symbol="000001",
+                    name="平安银行",
+                    market="SZ",
+                    security_type="STOCK",
+                ),
+            )
+
+    result = await SecuritySyncService(provider=Provider(), repository=repository).sync()
+
+    assert result.failed == 1
+    assert result.items[0].error is not None
+    assert result.items[0].error.code == "PERSISTENCE_ERROR"
+    with engine.connect() as connection:
+        assert connection.execute(select(SecurityModel)).all() == []
+    engine.dispose()

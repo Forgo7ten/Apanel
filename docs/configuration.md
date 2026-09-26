@@ -60,18 +60,47 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | --- | --- | --- |
 | `MARKET_DATA_PROVIDER` | `tdx` | provider 注册表名称；当前只注册 `tdx` |
 | `PROVIDER_TIMEOUT_SECONDS` | `5` | provider 适配器操作超时 |
-| `INTERNAL_API_TOKEN` | Compose 必填；生产环境必填 | 保护两个同步写入接口的共享 token |
-| `TDX_SERVERS` | `119.147.212.81:7709,101.227.73.20:7709` | 逗号分隔或 JSON 数组的 TDX host:port 列表 |
-| `TDX_SERVER_LIST` | `TDX_SERVERS` 的别名 | TDX 服务器列表别名 |
+| `SECURITY_MASTER_FALLBACK_PROVIDER` | `akshare` | 证券主数据 fallback；`none`/`disabled` 可关闭；不会替代 TDX 行情 provider |
+| `AKSHARE_SECURITY_TIMEOUT_SECONDS` | `90` | AKShare 股票与 ETF 完整批次的总超时（秒）；超时后不启动重叠请求 |
+| `AKSHARE_MIN_STOCK_COUNT` | `1000` | AKShare 股票源的最低记录数；低于阈值时整批失败 |
+| `AKSHARE_MIN_ETF_COUNT` | `1` | AKShare ETF 源的最低记录数；低于阈值时整批失败 |
+| `TDX_SERVERS` | `119.147.212.81:7709,101.227.73.20:7709` | 逗号分隔或 JSON 数组的 TDX host:port 列表；按配置顺序去重，最多 4 个 |
 | `TDX_CONNECT_TIMEOUT_SECONDS` | `5` | 单个 TDX 连接超时 |
 | `TDX_RETRY_ATTEMPTS` | `1` | TDX 连接重试次数，范围 `0..10` |
+| `TDX_SYMBOL_TIMEOUT_SECONDS` | `60` | 证券列表同步独立超时；不影响 quote/daily/dividend |
 | `TDX_SYMBOL_MAX_PAGES` | `100` | 证券列表最大分页数 |
 | `TDX_BAR_PAGE_SIZE` | `800` | 单页日线数量，范围 `1..800` |
 | `TDX_BAR_MAX_PAGES` | `64` | 日线最大分页数 |
+| `INTERNAL_API_TOKEN` | Compose 必填；生产环境必填 | 保护两个同步写入接口的共享 token；Compose 注入行情服务、后端任务和 `security-bootstrap`，不注入 frontend |
+| `TDX_SERVER_LIST` | `TDX_SERVERS` 的别名 | TDX 服务器列表别名 |
 
-Compose 当前只把 `MARKET_DATA_PROVIDER`、`PROVIDER_TIMEOUT_SECONDS` 和 `INTERNAL_API_TOKEN` 显式传入行情服务；TDX 细化变量在直接运行服务时生效。若需要在 Compose 中覆盖 TDX 细化参数，应在 Compose 服务环境中显式添加它们。
+Compose 会把上述 TDX 连接、failover、证券列表和日线分页变量显式传入行情服务。
+
+### 行情服务出站代理
+
+行情服务需要访问外部行情 provider 时，可以在根目录 `.env` 中为它单独配置代理：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MARKET_DATA_HTTP_PROXY` | 空 | 注入行情服务的 `HTTP_PROXY` |
+| `MARKET_DATA_HTTPS_PROXY` | 空 | 注入行情服务的 `HTTPS_PROXY` |
+| `MARKET_DATA_ALL_PROXY` | 空 | 注入行情服务的 `ALL_PROXY` |
+| `MARKET_DATA_NO_PROXY` | 空 | 额外的 `NO_PROXY` 主机；Compose 会始终追加 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-service` |
+
+这四个变量只会映射到 `market-data-service`，不会传给 PostgreSQL、Redis、backend 或其他容器。默认空值不会启用代理。若代理运行在 Docker 宿主机，Compose 会为行情服务添加跨 Linux 可用的 `host.docker.internal:host-gateway`；宿主代理必须监听 Docker 可达的接口（不能只监听宿主机的 `127.0.0.1`）。
+
+代理 URL 可能包含凭据。`.env` 不纳入版本库，应用日志不会打印这些值；不要把真实代理 URL、用户名或密码写入文档、命令行历史或共享的 `docker compose config` 输出。
 
 行情服务还识别 `INTERNAL_SYNC_TOKEN` 和 `MARKET_DATA_INTERNAL_TOKEN` 作为 `INTERNAL_API_TOKEN` 的别名。生产环境若缺少内部 token，服务启动校验会失败。
+
+## 证券主数据 bootstrap
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` | `30` | Compose 中 `security-bootstrap` 在可重试失败之间等待的秒数；必须为正数 |
+| `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` | `180` | Compose 中 `security-bootstrap` 每次行情服务请求的总预算；覆盖 TDX 证券列表超时（默认 `60`）、AKShare 完整批次总超时（默认 `90`）、worker 收尾（最多 `5`）及少量 HTTP 开销 |
+
+Compose 会创建一个 `security-bootstrap` 一次性任务。它等待 `market-data-service` 健康后，使用 `INTERNAL_API_TOKEN` 执行 `bootstrap-securities --retry-until-success`；网络/超时、HTTP `408`/`429`/`5xx`、HTTP 200 错误 envelope 中稳定的 `PROVIDER_TIMEOUT`/`PROVIDER_UNAVAILABLE`（包括同步摘要 item 的 `error.code`）和空同步结果会按间隔持续重试，协议错误、其他 `4xx`、业务/鉴权/验证失败、非 provider 的部分失败和意外错误会立即以非零退出。该任务设置 `restart: "no"`，不阻塞 backend 启动；需要手工重跑时执行 `docker compose run --rm security-bootstrap`。上述两个变量只影响该一次性任务，不会传给 frontend。
 
 ## 前端
 

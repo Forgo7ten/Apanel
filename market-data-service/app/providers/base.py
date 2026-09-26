@@ -5,8 +5,20 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import date
+from typing import Protocol, runtime_checkable
 
 from app.domain.market_data import Adjustment, DailyBar, Dividend, Quote, Security
+
+
+@runtime_checkable
+class SecurityMasterProvider(Protocol):
+    """Minimal provider boundary consumed by security synchronization."""
+
+    async def get_symbols(self) -> Sequence[Security]:
+        """Return one complete, validated security-master batch."""
+
+
+SymbolProvider = SecurityMasterProvider
 
 
 class MarketDataProvider(ABC):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -43,8 +44,13 @@ TDX_DAILY_CATEGORY = 9
 TDX_MARKET_BY_DOMAIN = {
     Market.SZ: 0,
     Market.SH: 1,
-    Market.BJ: 2,
+    # TDX's standard security lists do not expose a separate Beijing list in
+    # deployments we support.  Individual BJ queries prefer market 0 and may
+    # use market 2 only when the endpoint explicitly has no support/data.
+    Market.BJ: 0,
 }
+TDX_BJ_FALLBACK_MARKET = 2
+TDX_LIST_MARKETS = (0, 1)
 DOMAIN_MARKET_BY_TDX = {value: key for key, value in TDX_MARKET_BY_DOMAIN.items()}
 
 
@@ -97,6 +103,10 @@ class _TDXOperationError(RuntimeError):
     """Internal marker for false/empty low-level responses."""
 
 
+class _TDXMarketEmpty(_TDXOperationError):
+    """A response that permits one bounded alternate market query."""
+
+
 class PytdxClient:
     """Adapt ``pytdx.hq.TdxHq_API`` to the provider's blocking protocol.
 
@@ -141,6 +151,7 @@ class PytdxClient:
         self._bar_max_pages = bar_max_pages
         self._client_factory = client_factory or _default_pytdx_factory
         self._qfq_transformer = qfq_transformer
+        self._symbols_lock = threading.Lock()
         self._builtin_qfq_available = (
             qfq_transformer is not None
             or _factory_supports_corporate_actions(self._client_factory)
@@ -153,64 +164,97 @@ class PytdxClient:
         return self._servers
 
     def fetch_symbols(self) -> Sequence[Mapping[str, Any]]:
-        """Fetch and page security lists for SZ, SH, and BJ markets."""
+        """Fetch complete standard SZ/SH pages without classifying records."""
+
+        if not self._symbols_lock.acquire(blocking=False):
+            raise ProviderUnavailableError("TDX symbols request is already in progress")
 
         def operation(client: Any) -> list[Mapping[str, Any]]:
             records: list[Mapping[str, Any]] = []
-            for market_code, market in DOMAIN_MARKET_BY_TDX.items():
+            for market_code in TDX_LIST_MARKETS:
+                market = DOMAIN_MARKET_BY_TDX[market_code]
                 count_method = getattr(client, "get_security_count", None)
                 count = None if count_method is None else count_method(market_code)
                 if count_method is not None and count is None:
                     raise _TDXOperationError(f"TDX returned no security count for market {market}")
-                if count is not None and int(count) <= 0:
+                expected_count = None if count is None else int(count)
+                if expected_count is not None and expected_count < 0:
+                    raise _TDXOperationError(
+                        f"TDX returned an invalid security count for market {market}"
+                    )
+                if expected_count == 0:
                     continue
                 offset = 0
                 for _ in range(self._symbol_max_pages):
                     page = client.get_security_list(market_code, offset)
                     if page is None:
+                        if expected_count is not None and offset < expected_count:
+                            raise _TDXOperationError(
+                                f"TDX returned no security page for market {market} at {offset}"
+                            )
                         raise _TDXOperationError(
                             f"TDX returned no security page for market {market} at {offset}"
                         )
                     page_records = tuple(page)
                     if not page_records:
+                        if expected_count is not None and offset < expected_count:
+                            raise _TDXOperationError(
+                                f"TDX security list ended early for market {market} at {offset}"
+                            )
                         break
                     for record in page_records:
                         if not isinstance(record, Mapping):
                             raise _TDXOperationError(
                                 "TDX security list contains a non-mapping record"
                             )
-                        enriched = dict(record)
-                        enriched.setdefault("market", market.value)
-                        records.append(enriched)
+                        records.append(dict(record))
                     offset += len(page_records)
-                    if count is not None and offset >= int(count):
+                    if expected_count is not None and offset >= expected_count:
                         break
                 else:
                     raise _TDXOperationError(
                         f"TDX security list exceeded {self._symbol_max_pages} pages for {market}"
                     )
+                if expected_count is not None and offset < expected_count:
+                    raise _TDXOperationError(
+                        f"TDX security list ended before count for market {market}"
+                    )
             return records
 
-        return self._with_failover("symbols", operation)
+        try:
+            return self._with_failover("symbols", operation)
+        finally:
+            self._symbols_lock.release()
 
     def fetch_quote(self, symbol: str) -> Mapping[str, Any]:
         """Fetch one quote and normalize TDX's market/code response shape."""
 
         canonical_symbol = normalize_symbol(symbol)
         market = infer_market(canonical_symbol)
-        market_code = TDX_MARKET_BY_DOMAIN[market]
 
         def operation(client: Any) -> Mapping[str, Any]:
-            result = client.get_security_quotes([(market_code, canonical_symbol)])
-            if result is None:
-                raise _TDXOperationError("TDX returned no quote")
-            if isinstance(result, Mapping):
-                raw = result
-            else:
-                rows = tuple(result)
-                if not rows:
-                    raise _TDXOperationError("TDX returned an empty quote response")
-                raw = rows[0]
+            quote_method = getattr(client, "get_security_quotes", None)
+            if quote_method is None:
+                raise ProviderUnsupportedError(
+                    "TDX client does not provide get_security_quotes"
+                )
+
+            def query(market_code: int) -> Mapping[str, Any]:
+                result = quote_method([(market_code, canonical_symbol)])
+                if result is None:
+                    raise _TDXMarketEmpty("TDX returned no quote")
+                if isinstance(result, Mapping):
+                    raw = result
+                else:
+                    rows = tuple(result)
+                    if not rows:
+                        raise _TDXMarketEmpty("TDX returned an empty quote response")
+                    raw = rows[0]
+                if not isinstance(raw, Mapping):
+                    raise _TDXOperationError("TDX quote response is not a mapping")
+                return raw
+
+            _, raw = _query_single_security_market(client, market, query)
             if not isinstance(raw, Mapping):
                 raise _TDXOperationError("TDX quote response is not a mapping")
             record = dict(raw)
@@ -245,38 +289,28 @@ class PytdxClient:
             )
         if start > end:
             raise ValueError("start must not be after end")
-        market_code = TDX_MARKET_BY_DOMAIN[infer_market(canonical_symbol)]
+        market = infer_market(canonical_symbol)
 
         def operation(client: Any) -> list[Mapping[str, Any]] | tuple[
             list[Mapping[str, Any]], Sequence[Mapping[str, Any]], list[Mapping[str, Any]]
         ]:
-            all_records: list[Mapping[str, Any]] = []
-            offset = 0
-            for _ in range(self._bar_max_pages):
-                page = client.get_security_bars(
-                    TDX_DAILY_CATEGORY,
+            def query(market_code: int) -> list[Mapping[str, Any]]:
+                return _fetch_daily_pages(
+                    client,
                     market_code,
                     canonical_symbol,
-                    offset,
-                    self._bar_page_size,
+                    page_size=self._bar_page_size,
+                    max_pages=self._bar_max_pages,
                 )
-                if page is None:
-                    raise _TDXOperationError("TDX returned no daily-bar page")
-                page_records = tuple(page)
-                if not page_records:
-                    break
-                for record in page_records:
-                    if not isinstance(record, Mapping):
-                        raise _TDXOperationError("TDX daily bars contain a non-mapping record")
-                    normalized = _normalize_bar_record(record, canonical_symbol)
-                    all_records.append(normalized)
-                offset += len(page_records)
-                if len(page_records) < self._bar_page_size:
-                    break
-            else:
-                raise _TDXOperationError(
-                    f"TDX daily bars exceeded {self._bar_max_pages} pages for {canonical_symbol}"
-                )
+
+            _, all_records = _query_single_security_market(
+                client,
+                market,
+                query,
+                allow_empty=True,
+            )
+            if not all_records:
+                return []
             records = _deduplicate_bars(
                 [
                     record
@@ -291,9 +325,22 @@ class PytdxClient:
                 raise ProviderUnsupportedError(
                     "TDX client does not expose corporate-action records for qfq"
                 )
-            actions = action_method(market_code, canonical_symbol)
-            if actions is None:
-                actions = ()
+
+            def action_query(market_code: int) -> Sequence[Mapping[str, Any]]:
+                actions = action_method(market_code, canonical_symbol)
+                if actions is None:
+                    raise _TDXMarketEmpty("TDX returned an empty corporate-action response")
+                rows = tuple(actions)
+                if not rows:
+                    raise _TDXMarketEmpty("TDX returned an empty corporate-action response")
+                return rows
+
+            _, actions = _query_single_security_market(
+                client,
+                market,
+                action_query,
+                allow_empty=True,
+            )
             action_records = tuple(actions)
             if any(not isinstance(record, Mapping) for record in action_records):
                 raise _TDXOperationError(
@@ -337,15 +384,27 @@ class PytdxClient:
         """Map TDX category-1 ex-rights rows to cash dividend events."""
 
         canonical_symbol = normalize_symbol(symbol)
-        market_code = TDX_MARKET_BY_DOMAIN[infer_market(canonical_symbol)]
+        market = infer_market(canonical_symbol)
 
         def operation(client: Any) -> list[Mapping[str, Any]]:
             method = getattr(client, "get_xdxr_info", None)
             if method is None:
                 return []
-            rows = method(market_code, canonical_symbol)
-            if rows is None:
-                raise _TDXOperationError("TDX returned no dividend response")
+            def query(market_code: int) -> Sequence[Mapping[str, Any]]:
+                rows = method(market_code, canonical_symbol)
+                if rows is None:
+                    raise _TDXMarketEmpty("TDX returned an empty dividend response")
+                result = tuple(rows)
+                if not result:
+                    raise _TDXMarketEmpty("TDX returned an empty dividend response")
+                return result
+
+            _, rows = _query_single_security_market(
+                client,
+                market,
+                query,
+                allow_empty=True,
+            )
             result: list[Mapping[str, Any]] = []
             for row in rows:
                 if not isinstance(row, Mapping):
@@ -413,6 +472,90 @@ class PytdxClient:
                 f"TDX {operation_name} failed after {len(errors)} connection attempt(s)"
             ) from errors[-1]
         raise ProviderUnavailableError(f"TDX {operation_name} failed without an attempt")
+
+
+def _query_single_security_market(
+    client: Any,
+    market: Market,
+    query: Callable[[int], Any],
+    *,
+    allow_empty: bool = False,
+) -> tuple[int, Any]:
+    """Run one security query with a single, explicit BJ market fallback."""
+
+    primary = TDX_MARKET_BY_DOMAIN[market]
+    market_codes = (primary, TDX_BJ_FALLBACK_MARKET) if market is Market.BJ else (primary,)
+    for index, market_code in enumerate(market_codes):
+        try:
+            return market_code, query(market_code)
+        except _TDXMarketEmpty as exc:
+            if index + 1 < len(market_codes):
+                continue
+            if allow_empty and "empty" in str(exc).casefold():
+                return market_code, ()
+            raise exc
+        except ProviderUnsupportedError as exc:
+            if index + 1 < len(market_codes):
+                continue
+            raise exc
+        except Exception as exc:
+            if index + 1 < len(market_codes) and _is_explicit_market_unsupported(exc):
+                continue
+            raise
+    raise _TDXOperationError(f"TDX query failed for {market.value}")
+
+
+def _is_explicit_market_unsupported(exc: Exception) -> bool:
+    if isinstance(exc, AttributeError):
+        return False
+    if isinstance(exc, NotImplementedError):
+        return True
+    return "unsupported" in str(exc).casefold()
+
+
+def _fetch_daily_pages(
+    client: Any,
+    market_code: int,
+    symbol: str,
+    *,
+    page_size: int,
+    max_pages: int,
+) -> list[Mapping[str, Any]]:
+    """Fetch daily pages and distinguish first-page emptiness from a later error."""
+
+    bars_method = getattr(client, "get_security_bars", None)
+    if bars_method is None:
+        raise ProviderUnsupportedError("TDX client does not provide get_security_bars")
+
+    all_records: list[Mapping[str, Any]] = []
+    offset = 0
+    for page_number in range(max_pages):
+        page = bars_method(
+            TDX_DAILY_CATEGORY,
+            market_code,
+            symbol,
+            offset,
+            page_size,
+        )
+        if page is None:
+            if page_number == 0:
+                raise _TDXMarketEmpty("TDX returned no daily-bar page")
+            raise _TDXOperationError("TDX returned no daily-bar page")
+        page_records = tuple(page)
+        if not page_records:
+            if page_number == 0:
+                raise _TDXMarketEmpty("TDX returned an empty daily-bar page")
+            break
+        for record in page_records:
+            if not isinstance(record, Mapping):
+                raise _TDXOperationError("TDX daily bars contain a non-mapping record")
+            all_records.append(_normalize_bar_record(record, symbol))
+        offset += len(page_records)
+        if len(page_records) < page_size:
+            break
+    else:
+        raise _TDXOperationError(f"TDX daily bars exceeded {max_pages} pages for {symbol}")
+    return all_records
 
 
 # Names kept explicit for callers that prefer the provider-neutral spelling.

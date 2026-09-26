@@ -14,7 +14,11 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.redis import close_redis_client, create_redis_client
 from app.db.session import create_engine, create_session_factory, dispose_engine
-from app.providers.registry import close_provider, create_provider
+from app.providers.registry import (
+    close_provider,
+    create_provider,
+    create_security_master_provider,
+)
 from app.repositories.health import DatabaseHealthRepository, RedisHealthRepository
 from app.repositories.market_data import (
     SqlAlchemyDailyBarRepository,
@@ -52,6 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         redis_client = None
         provider = None
+        security_provider = None
         try:
             redis_client = create_redis_client(
                 app_settings.redis_url,
@@ -67,6 +72,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             session_factory = create_session_factory(database_engine)
             provider = create_provider(app_settings)
+            security_provider = create_security_master_provider(
+                app_settings,
+                primary=provider,
+            )
             security_repository = SqlAlchemySecurityRepository(session_factory)
             daily_bar_repository = SqlAlchemyDailyBarRepository(session_factory)
             quote_repository = SqlAlchemyQuoteSnapshotRepository(session_factory)
@@ -75,12 +84,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.db_session_factory = session_factory
             app.state.redis_client = redis_client
             app.state.provider = provider
+            app.state.security_provider = security_provider
             app.state.security_repository = security_repository
             app.state.daily_bar_repository = daily_bar_repository
             app.state.quote_repository = quote_repository
             app.state.dividend_repository = dividend_repository
             app.state.security_sync_service = SecuritySyncService(
-                provider=provider,
+                provider=security_provider,
                 repository=security_repository,
             )
             app.state.daily_sync_service = DailyBarSyncService(
@@ -102,10 +112,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await close_provider(provider)
             finally:
                 try:
-                    if redis_client is not None:
-                        await close_redis_client(redis_client)
+                    if security_provider is not None and security_provider is not provider:
+                        await close_provider(security_provider)
                 finally:
-                    await dispose_engine(database_engine)
+                    try:
+                        if redis_client is not None:
+                            await close_redis_client(redis_client)
+                    finally:
+                        await dispose_engine(database_engine)
 
     app = FastAPI(
         title=app_settings.app_name,

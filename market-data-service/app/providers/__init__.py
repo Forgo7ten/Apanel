@@ -1,6 +1,6 @@
 """Replaceable market data provider boundaries."""
 
-from .base import MarketDataProvider
+from .base import MarketDataProvider, SecurityMasterProvider, SymbolProvider
 from .errors import (
     MarketDataProviderError,
     ProviderConfigurationError,
@@ -15,8 +15,10 @@ from .registry import (
     UnknownProviderError,
     close_provider,
     create_provider,
+    create_security_master_provider,
     get_provider,
 )
+from .security import AkshareSecurityProvider, SecurityMasterFallbackProvider
 from .tdx import TDXClientProtocol, TDXProvider
 from .tdx_client import PytdxClient, TDXClient, TdxHqClient, TDXServer
 
@@ -30,6 +32,10 @@ __all__ = [
     "ProviderTimeoutError",
     "ProviderUnavailableError",
     "ProviderUnsupportedError",
+    "AkshareSecurityProvider",
+    "SecurityMasterFallbackProvider",
+    "SecurityMasterProvider",
+    "SymbolProvider",
     "TDXClientProtocol",
     "TDXProvider",
     "TDXClient",
@@ -39,5 +45,6 @@ __all__ = [
     "UnknownProviderError",
     "close_provider",
     "create_provider",
+    "create_security_master_provider",
     "get_provider",
 ]

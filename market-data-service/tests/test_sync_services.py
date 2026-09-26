@@ -8,7 +8,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.domain.market_data import Adjustment, DailyBar, Dividend, Quote, Security
 from app.providers.base import MarketDataProvider
-from app.providers.errors import ProviderTimeoutError
+from app.providers.errors import ProviderTimeoutError, ProviderUnavailableError
 from app.services.sync import (
     DailyBarSyncService,
     DividendSyncService,
@@ -89,6 +89,17 @@ class SystemicRepository(MemoryRepository):
         raise OperationalError("INSERT", {}, OSError("database offline"))
 
 
+class FailingSecurityRepository(MemoryRepository):
+    async def upsert_many(self, records) -> None:
+        self.batches.append(tuple(records))
+        raise RuntimeError("security persistence failed")
+
+
+class BothSecuritySourcesUnavailableProvider(FakeProvider):
+    async def get_symbols(self) -> Sequence[Security]:
+        raise ProviderUnavailableError("Security master providers are unavailable.")
+
+
 class QuoteRepositoryMemory:
     def __init__(self) -> None:
         self.records: dict[tuple[str, datetime], Quote] = {}
@@ -161,6 +172,71 @@ async def test_security_sync_is_idempotent_and_batch_upserts() -> None:
     assert second.succeeded == 2
     assert len(repository.records) == 2
     assert len(repository.batches) == 2
+
+
+@pytest.mark.asyncio
+async def test_security_sync_rejects_any_invalid_record_without_persisting_valid_records() -> None:
+    provider = FakeProvider()
+    provider.securities.append(object())
+    repository = MemoryRepository()
+    service = SecuritySyncService(provider=provider, repository=repository)
+
+    result = await service.sync()
+
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.items[0].error is not None
+    assert result.items[0].error.code == "INVALID_MARKET_DATA"
+    assert repository.batches == []
+
+
+@pytest.mark.asyncio
+async def test_security_sync_rejects_conflicting_duplicate_without_persisting() -> None:
+    provider = FakeProvider()
+    provider.securities.append(
+        Security(symbol="600519", name="不同名称", market="SH", security_type="STOCK")
+    )
+    repository = MemoryRepository()
+    service = SecuritySyncService(provider=provider, repository=repository)
+
+    result = await service.sync()
+
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.items[0].error is not None
+    assert result.items[0].error.code == "INVALID_MARKET_DATA"
+    assert repository.batches == []
+
+
+@pytest.mark.asyncio
+async def test_security_sync_calls_batch_repository_once_and_never_retries_per_security() -> None:
+    provider = FakeProvider()
+    repository = FailingSecurityRepository()
+    service = SecuritySyncService(provider=provider, repository=repository)
+
+    result = await service.sync()
+
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.items[0].error is not None
+    assert result.items[0].error.code == "PERSISTENCE_ERROR"
+    assert len(repository.batches) == 1
+
+
+@pytest.mark.asyncio
+async def test_security_sync_does_not_call_repository_when_both_sources_fail() -> None:
+    repository = MemoryRepository()
+    service = SecuritySyncService(
+        provider=BothSecuritySourcesUnavailableProvider(),
+        repository=repository,
+    )
+
+    result = await service.sync()
+
+    assert result.ok is False
+    assert result.items[0].error is not None
+    assert result.items[0].error.code == "PROVIDER_UNAVAILABLE"
+    assert repository.batches == []
 
 
 @pytest.mark.asyncio

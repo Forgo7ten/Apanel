@@ -1,5 +1,8 @@
 from unittest.mock import patch
 
+from greenlet import getcurrent
+from sqlalchemy.ext.asyncio import AsyncEngine
+
 from app.db.redis import create_redis_client
 from app.db.session import create_engine
 from app.providers.base import MarketDataProvider
@@ -28,6 +31,17 @@ def test_database_engine_passes_bounded_client_timeouts() -> None:
         pool_pre_ping=True,
         connect_args={"timeout": 1.25, "command_timeout": 2.5},
     )
+
+
+def test_async_database_engine_runtime_dependencies_are_available() -> None:
+    """The service startup path can create an async engine in a fresh runtime."""
+    assert getcurrent() is not None
+
+    engine = create_engine("postgresql+asyncpg://user:secret@db/apanel")
+    try:
+        assert isinstance(engine, AsyncEngine)
+    finally:
+        engine.sync_engine.dispose()
 
 
 def test_redis_client_passes_bounded_socket_timeouts() -> None:

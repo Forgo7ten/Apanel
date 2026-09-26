@@ -7,7 +7,7 @@
 - 根目录 `.env` 被 `.gitignore` 忽略；只提交 `.env.example` 模板。
 - `POSTGRES_PASSWORD` 会拼接到数据库 URL，应使用 URL-safe 字符，避免连接 URL 解析错误。
 - `JWT_SECRET_KEY`、`INTERNAL_API_TOKEN` 和生产数据库密码必须是每个环境独立生成的随机值。
-- 不要把 `INTERNAL_API_TOKEN` 传给前端；Compose 只将它传给行情服务。
+- 不要把 `INTERNAL_API_TOKEN` 传给前端；Compose 只将它注入后端内部服务（包括行情服务和一次性的 `security-bootstrap`），不会注入 frontend 或暴露给浏览器。
 - `APP_ENV=production` 时，后端拒绝已知默认数据库密码、已知默认或少于 32 字节的 JWT secret，并拒绝显式的 `REFRESH_COOKIE_SECURE=false`。行情服务要求配置内部 token。
 
 ## 用户密码与邀请
@@ -32,6 +32,7 @@
 
 - `/internal/sync/daily` 和 `/internal/sync/securities` 必须提供 `X-Internal-Token`，或使用 Bearer 形式提供相同 token。
 - token 比较使用常量时间比较函数；缺少 token、错误 token 和未配置 token 分别映射为稳定错误。
+- Compose 的 `security-bootstrap` 只在行情服务健康后运行一次，使用同一个 `INTERNAL_API_TOKEN` 同步证券主数据；它是内部一次性任务，不对外发布端口，也不把 token 传给 frontend。
 - Compose 不发布行情服务 `8001`，Nginx 也不代理 `/internal`，降低外部直接访问面。
 - 当前行情读取接口不要求内部 token，安全性依赖于 Docker 网络边界；若将 `8001` 暴露到其他网络，应在入口层增加认证和访问控制。
 

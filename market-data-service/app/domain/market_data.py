@@ -117,7 +117,14 @@ def infer_market(symbol: str) -> Market:
     code, explicit_market = _parse_symbol(symbol)
     if explicit_market is not None:
         return explicit_market
-    if code.startswith(("4", "8", "9")):
+    # ``900xxx`` remains a Shanghai B-share family while ``92xxxx`` is the
+    # current Beijing exchange family.  Check these prefixes before the broad
+    # legacy prefixes so a bare symbol keeps one deterministic meaning.
+    if code.startswith("900"):
+        return Market.SH
+    if code.startswith("92"):
+        return Market.BJ
+    if code.startswith(("4", "8")):
         return Market.BJ
     if code.startswith(("0", "1", "2", "3")):
         return Market.SZ
