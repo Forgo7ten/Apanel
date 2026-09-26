@@ -10,14 +10,33 @@ import {
   useReactTable,
   type VisibilityState,
 } from "@tanstack/react-table";
-import { useEffect, useMemo } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
 
-import type { IndicatorState, WatchTableColumn, WatchTableDetails, WatchTableStock } from "@/api/types";
-import { IndicatorCell } from "@/components/indicators/IndicatorCell";
-import { stateToneFromLevel, StateTag } from "@/components/ui/StateTag";
-import { useWatchStore } from "@/stores/watch-store";
-
+import type {
+  Identifier,
+  IndicatorState,
+  IndicatorViewMode,
+  UpdateColumnInput,
+  WatchTableColumn,
+  WatchTableDetails,
+  WatchTableStock,
+  WatchTableSummary,
+} from "@/api/types";
+import {
+  deleteWatchTableColumn,
+  removeStockFromWatchTable,
+  reorderWatchTableColumns,
+  updateWatchTableColumn,
+} from "@/api/watch";
 import { getColumnTitle, getIndicatorValue } from "@/components/indicators/indicator-utils";
+import { IndicatorCell } from "@/components/indicators/IndicatorCell";
+import { isApiError } from "@/lib/api-errors";
+import { toColumnOrderPayload } from "@/lib/watch-contract.mjs";
+import { useWatchStore } from "@/stores/watch-store";
+import { stateToneFromLevel, StateTag } from "@/components/ui/StateTag";
+
+import { AddColumnDialog } from "./AddColumnDialog";
 import { ColumnManager, type ColumnManagerItem } from "./ColumnManager";
 
 function columnId(column: WatchTableColumn, index: number): string {
@@ -54,9 +73,7 @@ function SortableHeader({ header }: { header: Header<WatchTableStock, unknown> }
   const canSort = header.column.getCanSort();
   const label = flexRender(header.column.columnDef.header, header.getContext());
 
-  if (!canSort) {
-    return <>{label}</>;
-  }
+  if (!canSort) return <>{label}</>;
 
   return (
     <button
@@ -72,16 +89,12 @@ function SortableHeader({ header }: { header: Header<WatchTableStock, unknown> }
 }
 
 function StateList({ states }: { states: IndicatorState[] }) {
-  if (states.length === 0) {
-    return <span className="text-xs text-muted">—</span>;
-  }
+  if (states.length === 0) return <span className="text-xs text-muted">—</span>;
 
   return (
     <div className="flex max-w-[260px] flex-wrap gap-1">
       {states.slice(0, 3).map((state) => (
-        <StateTag key={state.state_id} tone={stateToneFromLevel(state.level ?? state.severity)}>
-          {state.title}
-        </StateTag>
+        <StateTag key={state.state_id} tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>
       ))}
       {states.length > 3 ? <span className="self-center text-[11px] text-muted">+{states.length - 3}</span> : null}
     </div>
@@ -101,10 +114,8 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
         if (typeof valueA === "number" && typeof valueB === "number") return valueA - valueB;
         return String(valueA).localeCompare(String(valueB), "zh-CN", { numeric: true });
       },
-      cell: ({ row }) => (
-        <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />
-      ),
-      meta: { label: getColumnTitle(column), movable: true },
+      cell: ({ row }) => <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />,
+      meta: { label: getColumnTitle(column), movable: true, width: column.width },
     } satisfies ColumnDef<WatchTableStock, unknown>;
   });
 
@@ -123,7 +134,7 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
           </div>
         );
       },
-      meta: { label: "股票", movable: false },
+      meta: { label: "股票", movable: false, toggleable: false },
     },
     {
       id: "price",
@@ -131,7 +142,7 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
       header: "当前价",
       sortingFn: (rowA, rowB) => compareRows(rowA.original, rowB.original, "price"),
       cell: ({ row }) => <IndicatorCell mode="DELTA" value={row.original.price} />,
-      meta: { label: "当前价", movable: false },
+      meta: { label: "当前价", movable: false, toggleable: false },
     },
     ...dynamicColumns,
     {
@@ -139,15 +150,49 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
       accessorFn: (stock) => stock.states?.map((state) => state.title).join(" ") ?? "",
       header: "状态",
       cell: ({ row }) => <StateList states={row.original.states ?? []} />,
-      meta: { label: "状态", movable: false },
+      meta: { label: "状态", movable: false, toggleable: false },
     },
   ];
 }
 
+function buildActionColumn({
+  onRemove,
+  pendingSecurityId,
+}: {
+  onRemove?: (securityId: Identifier) => void;
+  pendingSecurityId?: Identifier;
+}): ColumnDef<WatchTableStock, unknown> {
+  return {
+    id: "actions",
+    header: "操作",
+    enableSorting: false,
+    cell: ({ row }) => {
+      const securityId = row.original.security_id;
+      if (securityId === undefined || securityId === null || !onRemove) return <span className="text-xs text-muted">—</span>;
+      const pending = pendingSecurityId !== undefined && String(pendingSecurityId) === String(securityId);
+      return (
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => onRemove(securityId)}
+          className="rounded px-2 py-1 text-xs text-muted transition hover:bg-negative/10 hover:text-negative disabled:cursor-not-allowed disabled:opacity-50"
+          aria-label={`删除${row.original.name ?? row.original.symbol}`}
+        >
+          {pending ? "删除中…" : "移除"}
+        </button>
+      );
+    },
+    meta: { label: "操作", movable: false, toggleable: false },
+  } satisfies ColumnDef<WatchTableStock, unknown>;
+}
+
 function toVisibility(columns: WatchTableColumn[]): VisibilityState {
-  return Object.fromEntries(
-    columns.map((column, index) => [columnId(column, index), column.hidden !== true && column.visible !== false]),
-  );
+  return Object.fromEntries(columns.map((column, index) => [columnId(column, index), column.hidden !== true && column.visible !== false]));
+}
+
+function columnWidthStyle(columns: WatchTableColumn[], id: string): React.CSSProperties | undefined {
+  const source = columns.find((column, index) => columnId(column, index) === id);
+  return source?.width ? { width: `${source.width}px`, minWidth: `${source.width}px` } : undefined;
 }
 
 function reorderDynamicColumns(columnOrder: string[], id: string, direction: "up" | "down", dynamicIds: string[]): string[] {
@@ -159,18 +204,113 @@ function reorderDynamicColumns(columnOrder: string[], id: string, direction: "up
   const nextIndex = direction === "up" ? index - 1 : index + 1;
   if (index < 0 || nextIndex < 0 || nextIndex >= nextDynamic.length) return columnOrder;
   [nextDynamic[index], nextDynamic[nextIndex]] = [nextDynamic[nextIndex], nextDynamic[index]];
-  return ["security", "price", ...nextDynamic, "states"];
+  return ["security", "price", ...nextDynamic, "states", "actions"];
 }
 
-export function WatchTable({ table }: { table: WatchTableDetails }) {
+function persistentColumnId(value: string): Identifier | null {
+  if (/^\d+$/.test(value)) return Number(value);
+  return null;
+}
+
+function mutationErrorMessage(error: unknown): string | null {
+  if (!error) return null;
+  if (isApiError(error)) {
+    if (error.status === 404) return "当前资源不存在或无权限，请刷新监控表后重试。";
+    if (error.status === 409) return "该操作与当前监控表状态冲突，请刷新后重试。";
+    return error.message;
+  }
+  return error instanceof Error ? error.message : "操作失败，请稍后重试。";
+}
+
+export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; onAddStock?: () => void }) {
+  const queryClient = useQueryClient();
+  const [addColumnOpen, setAddColumnOpen] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const tableId = table.id;
+
+  const removeStockMutation = useMutation({
+    mutationFn: ({ securityId }: { securityId: Identifier }) => removeStockFromWatchTable(tableId, securityId),
+    onMutate: () => setActionError(null),
+    onSuccess: async (_result, variables) => {
+      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => {
+        if (!current) return current;
+        const stocks = current.stocks.filter((stock) => String(stock.security_id) !== String(variables.securityId));
+        return { ...current, stocks, stock_count: stocks.length };
+      });
+      queryClient.setQueryData<WatchTableSummary[]>(["watch-tables"], (current) => current?.map((summary) => (
+        String(summary.id) === String(tableId) ? { ...summary, stock_count: Math.max(0, summary.stock_count - 1) } : summary
+      )));
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
+        queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
+      ]);
+    },
+    onError: (error) => setActionError(mutationErrorMessage(error)),
+  });
+
+  const updateColumnMutation = useMutation({
+    mutationFn: ({ columnId, input }: { columnId: Identifier; input: UpdateColumnInput }) => updateWatchTableColumn(columnId, input),
+    onMutate: () => setActionError(null),
+    onSuccess: async (updated) => {
+      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => current ? {
+        ...current,
+        columns: current.columns.map((column) => String(column.id) === String(updated.id) ? updated : column),
+      } : current);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
+        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+      ]);
+    },
+    onError: (error) => setActionError(mutationErrorMessage(error)),
+  });
+
+  const reorderColumnsMutation = useMutation({
+    mutationFn: (columnIds: Identifier[]) => reorderWatchTableColumns(tableId, columnIds),
+    onMutate: () => setActionError(null),
+    onSuccess: async (updatedColumns) => {
+      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => current ? { ...current, columns: updatedColumns } : current);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
+        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+      ]);
+    },
+    onError: (error) => setActionError(mutationErrorMessage(error)),
+  });
+
+  const deleteColumnMutation = useMutation({
+    mutationFn: (columnId: Identifier) => deleteWatchTableColumn(columnId),
+    onMutate: () => setActionError(null),
+    onSuccess: async (_result, columnId) => {
+      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => current ? {
+        ...current,
+        columns: current.columns.filter((column) => String(column.id) !== String(columnId)),
+      } : current);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
+        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+      ]);
+    },
+    onError: (error) => setActionError(mutationErrorMessage(error)),
+  });
+
   const columns = useMemo(
     () => [...(table.columns ?? [])].sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER)),
     [table.columns],
   );
-  const columnDefs = useMemo(() => buildColumnDefs(columns), [columns]);
+  const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
+  const removeStock = removeStockMutation.mutate;
+  const baseColumnDefs = useMemo(() => buildColumnDefs(columns), [columns]);
+  const columnDefs = useMemo(
+    () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId })],
+    [baseColumnDefs, pendingSecurityId, removeStock],
+  );
   const allColumnIds = useMemo(() => columnDefs.map((column) => String(column.id)), [columnDefs]);
   const dynamicColumnIds = useMemo(() => columns.map(columnId), [columns]);
   const initialVisibility = useMemo(() => toVisibility(columns), [columns]);
+  const serverView = useMemo(() => ({
+    order: ["security", "price", ...dynamicColumnIds, "states", "actions"],
+    visibility: { security: true, price: true, ...initialVisibility, states: true, actions: true },
+  }), [dynamicColumnIds, initialVisibility]);
   const {
     columnOrder,
     columnVisibility,
@@ -181,19 +321,9 @@ export function WatchTable({ table }: { table: WatchTableDetails }) {
   } = useWatchStore();
 
   useEffect(() => {
-    const currentOrder = columnOrder.filter((id) => allColumnIds.includes(id));
-    const missing = allColumnIds.filter((id) => !currentOrder.includes(id));
-    const nextOrder = [...currentOrder, ...missing];
-    if (nextOrder.join("|") !== columnOrder.join("|")) {
-      setColumnOrder(nextOrder);
-    }
-  }, [allColumnIds, columnOrder, setColumnOrder]);
-
-  useEffect(() => {
-    if (Object.keys(columnVisibility).length === 0) {
-      setColumnVisibility(initialVisibility);
-    }
-  }, [columnVisibility, initialVisibility, setColumnVisibility]);
+    setColumnOrder(serverView.order);
+    setColumnVisibility(serverView.visibility);
+  }, [serverView, setColumnOrder, setColumnVisibility]);
 
   // TanStack Table owns a mutable instance by design; React Compiler cannot safely memoize it.
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -221,16 +351,46 @@ export function WatchTable({ table }: { table: WatchTableDetails }) {
     getSortedRowModel: getSortedRowModel(),
   });
 
-  const managerItems: ColumnManagerItem[] = tableInstance.getAllLeafColumns().map((column) => ({
-    id: column.id,
-    label: String(column.columnDef.meta && "label" in column.columnDef.meta ? column.columnDef.meta.label : column.id),
-    visible: column.getIsVisible(),
-    movable: column.id !== "security" && column.id !== "price" && column.id !== "states",
-  }));
+  function updateColumn(id: string, input: UpdateColumnInput) {
+    const columnIdValue = persistentColumnId(id);
+    if (columnIdValue === null) {
+      setActionError("该列缺少后端 ID，无法保存修改。");
+      return;
+    }
+    updateColumnMutation.mutate({ columnId: columnIdValue, input });
+  }
 
   function handleMove(id: string, direction: "up" | "down") {
-    setColumnOrder(reorderDynamicColumns(columnOrder.length > 0 ? columnOrder : allColumnIds, id, direction, dynamicColumnIds));
+    const nextOrder = reorderDynamicColumns(columnOrder.length > 0 ? columnOrder : allColumnIds, id, direction, dynamicColumnIds);
+    const nextIds = toColumnOrderPayload(nextOrder).column_ids;
+    if (nextIds.length !== dynamicColumnIds.length || nextIds.length === 0) {
+      setActionError("当前指标列还没有可持久化的顺序。");
+      return;
+    }
+    reorderColumnsMutation.mutate(nextIds);
   }
+
+  const pendingColumnId = updateColumnMutation.isPending
+    ? updateColumnMutation.variables?.columnId
+    : deleteColumnMutation.isPending
+      ? deleteColumnMutation.variables
+      : null;
+  const anyColumnMutationPending = updateColumnMutation.isPending || deleteColumnMutation.isPending || reorderColumnsMutation.isPending;
+  const managerItems: ColumnManagerItem[] = tableInstance.getAllLeafColumns().map((column) => {
+    const source = columns.find((candidate, index) => columnId(candidate, index) === column.id);
+    const fixed = ["security", "price", "states", "actions"].includes(column.id);
+    return {
+      id: column.id,
+      label: String(column.columnDef.meta && "label" in column.columnDef.meta ? column.columnDef.meta.label : column.id),
+      visible: column.getIsVisible(),
+      movable: !fixed,
+      toggleable: !fixed,
+      width: source?.width,
+      viewMode: source?.view_mode,
+      deletable: !fixed,
+      pending: anyColumnMutationPending && (reorderColumnsMutation.isPending || (pendingColumnId !== undefined && pendingColumnId !== null && String(pendingColumnId) === column.id)),
+    };
+  });
 
   return (
     <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel">
@@ -239,19 +399,37 @@ export function WatchTable({ table }: { table: WatchTableDetails }) {
           <p className="text-sm font-semibold text-primary">{table.name}</p>
           <p className="mt-1 text-xs text-muted">{table.stocks.length} 支股票 · 指标由后端提供</p>
         </div>
-        <ColumnManager
-          items={managerItems}
-          onToggle={(id, visible) => tableInstance.getColumn(id)?.toggleVisibility(visible)}
-          onMove={handleMove}
-        />
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {columns.length === 0 ? <span className="text-[11px] text-muted">暂无指标列</span> : null}
+          <button type="button" onClick={() => { setActionError(null); setAddColumnOpen(true); }} className="inline-flex h-8 items-center gap-1.5 rounded-panel bg-brand px-2.5 text-xs font-medium text-white transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
+            <span className="text-base leading-none">+</span>
+            添加指标列
+          </button>
+          <ColumnManager
+            items={managerItems}
+            onToggle={(id, visible) => updateColumn(id, { visible })}
+            onMove={handleMove}
+            onWidthChange={(id, width) => updateColumn(id, { width })}
+            onViewModeChange={(id, viewMode) => viewMode && updateColumn(id, { view_mode: viewMode as IndicatorViewMode })}
+            onDelete={(id) => {
+              const columnIdValue = persistentColumnId(id);
+              if (columnIdValue === null) {
+                setActionError("该列缺少后端 ID，无法删除。");
+                return;
+              }
+              deleteColumnMutation.mutate(columnIdValue);
+            }}
+          />
+        </div>
       </div>
+      {actionError ? <p className="border-b border-negative/30 bg-negative/10 px-4 py-2 text-xs text-negative" role="alert">{actionError}</p> : null}
       <div className="overflow-x-auto">
         <table className="w-full min-w-[860px] border-collapse text-left" aria-label={`${table.name}股票监控表`}>
           <thead className="h-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary">
             {tableInstance.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>
                 {headerGroup.headers.map((header) => (
-                  <th key={header.id} className="whitespace-nowrap px-4 font-medium first:pl-5 last:pr-5">
+                  <th key={header.id} style={columnWidthStyle(columns, header.column.id)} className="whitespace-nowrap px-4 font-medium first:pl-5 last:pr-5">
                     {header.isPlaceholder ? null : <SortableHeader header={header} />}
                   </th>
                 ))}
@@ -259,10 +437,21 @@ export function WatchTable({ table }: { table: WatchTableDetails }) {
             ))}
           </thead>
           <tbody className="divide-y divide-line/80">
+            {tableInstance.getRowModel().rows.length === 0 ? (
+              <tr>
+                <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)}>
+                  <div className="flex min-h-44 flex-col items-center justify-center px-6 py-10 text-center">
+                    <p className="text-sm font-medium text-primary">还没有监控股票</p>
+                    <p className="mt-1.5 text-xs text-muted">添加第一只股票后，后端行情和指标会出现在这里。</p>
+                    {onAddStock ? <button type="button" onClick={onAddStock} className="mt-4 rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white hover:bg-brand/90">添加股票</button> : null}
+                  </div>
+                </td>
+              </tr>
+            ) : null}
             {tableInstance.getRowModel().rows.map((row) => (
               <tr key={row.id} className="align-middle transition-colors hover:bg-card/40">
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} className="px-4 py-3.5 first:pl-5 last:pr-5">
+                  <td key={cell.id} style={columnWidthStyle(columns, cell.column.id)} className="px-4 py-3.5 first:pl-5 last:pr-5">
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}
@@ -271,6 +460,7 @@ export function WatchTable({ table }: { table: WatchTableDetails }) {
           </tbody>
         </table>
       </div>
+      {addColumnOpen ? <AddColumnDialog tableId={tableId} onClose={() => setAddColumnOpen(false)} /> : null}
     </div>
   );
 }

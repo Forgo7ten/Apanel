@@ -108,9 +108,11 @@ export type CreateColumnInput = {
 export type UpdateColumnInput = Partial<{
   visible: boolean;
   hidden: boolean;
+  position: number;
   order: number;
   width: number;
   view_mode: IndicatorViewMode;
+  parameters: Record<string, string | number | boolean>;
 }>;
 
 export type AlertConditionType = "STATE" | "VALUE";

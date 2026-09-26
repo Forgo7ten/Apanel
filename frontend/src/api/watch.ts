@@ -62,6 +62,13 @@ export function updateWatchTableColumn(columnId: Identifier, input: UpdateColumn
   });
 }
 
+export function reorderWatchTableColumns(tableId: Identifier, columnIds: Identifier[]): Promise<WatchTableColumn[]> {
+  return apiFetch<WatchTableColumn[]>(`/watch-tables/${encodeURIComponent(tableId)}/columns/reorder`, {
+    method: "PUT",
+    body: JSON.stringify({ column_ids: columnIds }),
+  });
+}
+
 export function deleteWatchTableColumn(columnId: Identifier): Promise<void> {
   return apiFetch<void>(`/columns/${encodeURIComponent(columnId)}`, { method: "DELETE" });
 }
