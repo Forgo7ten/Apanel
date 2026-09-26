@@ -31,6 +31,7 @@ export type ScalarIndicatorColumnValue = IndicatorColumnValueMetadata & {
   previous_value: IndicatorScalarValue;
   delta: IndicatorScalarValue;
   direction: IndicatorDirection;
+  parameter_key: string;
 };
 
 export type CompositeIndicatorColumnValue = IndicatorColumnValueMetadata & {
@@ -40,6 +41,7 @@ export type CompositeIndicatorColumnValue = IndicatorColumnValueMetadata & {
   previous_value?: IndicatorScalarValue;
   delta?: IndicatorScalarValue;
   direction?: IndicatorDirection;
+  parameter_key: string;
 };
 
 export type StatusIndicatorColumnValue = IndicatorColumnValueMetadata & {
@@ -47,6 +49,7 @@ export type StatusIndicatorColumnValue = IndicatorColumnValueMetadata & {
   value?: IndicatorScalarValue;
   status?: string | number | null;
   state?: string | number | null;
+  parameter_key: string;
 };
 
 export type IndicatorColumnValue =
@@ -96,10 +99,16 @@ export type PriceSnapshot = {
 
 export type IndicatorState = {
   state_id: string;
+  state_code?: string;
   title: string;
+  indicator_type?: string;
+  status?: string;
   level?: "INFO" | "POSITIVE" | "WARNING" | "NEGATIVE" | "CRITICAL" | string;
   severity?: "INFO" | "POSITIVE" | "WARNING" | "NEGATIVE" | "CRITICAL" | string;
   active?: boolean;
+  transition?: boolean;
+  trade_date?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export type WatchTableStock = {
@@ -139,9 +148,35 @@ export type DailyBar = {
 
 export type IndicatorSnapshot = Record<string, unknown>;
 
-export type IndicatorHistoryPoint = Record<string, unknown>;
+export type IndicatorHistoryPoint = {
+  trade_date: string;
+  indicator_type: string;
+  parameter_key: string;
+  parameters: IndicatorParameters;
+  values: Record<string, number>;
+  previous_values?: Record<string, number> | null;
+  delta?: Record<string, number> | null;
+};
 
-export type StateHistoryPoint = Record<string, unknown>;
+export type IndicatorHistoryResponse = {
+  items: IndicatorHistoryPoint[];
+};
+
+export type StateHistoryPoint = IndicatorState & {
+  trade_date: string;
+};
+
+export type StateHistoryResponse = {
+  items: StateHistoryPoint[];
+};
+
+export type HistoryQuery = {
+  start?: string;
+  end?: string;
+  /** History currently has one coherent PRD sequence; do not request none. */
+  adjust?: "qfq";
+  parameter_key?: string;
+};
 
 export type CreateWatchTableInput = {
   name: string;

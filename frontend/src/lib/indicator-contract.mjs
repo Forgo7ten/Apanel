@@ -19,7 +19,7 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function sortFields(entries) {
+export function orderIndicatorFields(entries) {
   return [...entries].sort(([left], [right]) => {
     const leftIndex = FIELD_ORDER.indexOf(String(left).toLowerCase());
     const rightIndex = FIELD_ORDER.indexOf(String(right).toLowerCase());
@@ -65,7 +65,7 @@ export function getColumnValue(stock, column) {
  */
 export function getColumnFields(value) {
   if (!isRecord(value)) return [];
-  if (isRecord(value.fields)) return sortFields(Object.entries(value.fields));
+  if (isRecord(value.fields)) return orderIndicatorFields(Object.entries(value.fields));
 
   const reserved = new Set([
     "column_id",
@@ -88,7 +88,7 @@ export function getColumnFields(value) {
     "title",
     "label",
   ]);
-  return sortFields(Object.entries(value).filter(([key]) => !reserved.has(key)));
+  return orderIndicatorFields(Object.entries(value).filter(([key]) => !reserved.has(key)));
 }
 
 /**

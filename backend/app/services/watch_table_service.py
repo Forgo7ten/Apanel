@@ -15,6 +15,7 @@ from app.indicators.parameters import (
     canonicalize_parameters,
     normalize_indicator_type,
     normalize_json_parameters,
+    parameter_key,
     select_snapshot_variant,
 )
 from app.models import TableColumn, WatchTable, WatchTableSymbol
@@ -675,6 +676,7 @@ def _column_value_from_variant(
         variant.values,
         variant.previous_values,
         variant.delta,
+        variant_key=variant.key,
     )
 
 
@@ -691,7 +693,15 @@ def _column_value_from_mapping(
     }
     if not numeric_values:
         return _unavailable_column_value(column, indicator_type, parameters, "VALUE_NOT_FOUND")
-    return _column_value_from_values(column, indicator_type, parameters, numeric_values, None, None)
+    return _column_value_from_values(
+        column,
+        indicator_type,
+        parameters,
+        numeric_values,
+        None,
+        None,
+        variant_key=_column_parameter_key(indicator_type, parameters),
+    )
 
 
 def _column_value_from_values(
@@ -701,6 +711,8 @@ def _column_value_from_values(
     values: Mapping[str, Any],
     previous_values: Mapping[str, Any] | None,
     delta: Mapping[str, Any] | None,
+    *,
+    variant_key: str | None = None,
 ) -> dict[str, Any]:
     mode = column.view_mode.upper()
     normalized_values = {str(key): float(value) for key, value in values.items()}
@@ -720,6 +732,7 @@ def _column_value_from_values(
         "indicator_type": indicator_type,
         "parameters": _json_numbers(dict(parameters)),
         "available": True,
+        "parameter_key": variant_key or _column_parameter_key(indicator_type, parameters),
     }
     if mode == "COMPOSITE":
         result["fields"] = {
@@ -798,6 +811,7 @@ def _unavailable_column_value(
         "parameters": _json_numbers(dict(parameters)),
         "available": False,
         "error_code": error_code,
+        "parameter_key": _column_parameter_key(indicator_type, parameters),
         "value": None,
         "previous_value": None,
         "delta": None,
@@ -806,6 +820,10 @@ def _unavailable_column_value(
     if column.view_mode.upper() == "COMPOSITE":
         result["fields"] = {}
     return result
+
+
+def _column_parameter_key(indicator_type: str, parameters: Mapping[str, Any]) -> str:
+    return parameter_key(indicator_type, _calculation_parameters(parameters))
 
 
 def _mapping_key(values: dict[str, Any], expected: str) -> str | None:

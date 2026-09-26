@@ -155,3 +155,39 @@ def test_custom_default_steps_keep_alert_and_notification_boundaries_injected() 
         notification_runner=runner,
     )
     assert tuple(step.name for step in steps) == EOD_STEP_ORDER
+
+
+@pytest.mark.asyncio
+async def test_eod_pipeline_rejects_none_before_any_persistence_step() -> None:
+    calls: list[str] = []
+
+    async def handler(_context: PipelineContext, name: str) -> None:
+        calls.append(name)
+
+    steps = tuple(
+        PipelineStep(name, lambda context, name=name: handler(context, name))
+        for name in EOD_STEP_ORDER
+    )
+
+    with pytest.raises(PipelineConfigurationError, match="qfq"):
+        await execute_eod_pipeline(
+            trade_date=date(2026, 9, 24),
+            symbols=["600519"],
+            adjustment="none",
+            lock=SimpleNamespace(
+                acquire=lambda: _true_async(),
+                release=lambda: _noop_async(),
+            ),
+            steps=steps,
+            settings=Settings(),
+        )
+
+    assert calls == []
+
+
+async def _true_async() -> bool:
+    return True
+
+
+async def _noop_async() -> None:
+    return None

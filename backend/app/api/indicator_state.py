@@ -25,7 +25,7 @@ router = APIRouter()
 @router.get("/securities/{symbol}/indicators")
 async def get_indicators(
     symbol: str,
-    adjustment: str | None = Query(default=None, alias="adjust"),  # noqa: B008
+    adjustment: str | None = Query(default="qfq", alias="adjust"),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[dict[str, Any]]:
     """Return the latest indicator values grouped by indicator type."""
@@ -42,7 +42,8 @@ async def get_indicator_history(
     symbol: str,
     start: date | None = Query(default=None),  # noqa: B008
     end: date | None = Query(default=None),  # noqa: B008
-    adjustment: str | None = Query(default=None, alias="adjust"),  # noqa: B008
+    adjustment: str | None = Query(default="qfq", alias="adjust"),  # noqa: B008
+    parameter_key: str | None = Query(default=None),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[IndicatorHistoryData]:
     data = await IndicatorService(session).history_data(
@@ -50,6 +51,7 @@ async def get_indicator_history(
         start=start,
         end=end,
         adjustment=adjustment,
+        parameter_key=parameter_key,
     )
     return SuccessResponse(data=data)
 
@@ -60,7 +62,7 @@ async def get_indicator_history(
 )
 async def get_current_states(
     symbol: str,
-    adjustment: str | None = Query(default=None, alias="adjust"),  # noqa: B008
+    adjustment: str | None = Query(default="qfq", alias="adjust"),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[list[StateData]]:
     states = await StateService(session).current(symbol, adjustment=adjustment)
@@ -75,7 +77,7 @@ async def get_state_history(
     symbol: str,
     start: date | None = Query(default=None),  # noqa: B008
     end: date | None = Query(default=None),  # noqa: B008
-    adjustment: str | None = Query(default=None, alias="adjust"),  # noqa: B008
+    adjustment: str | None = Query(default="qfq", alias="adjust"),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[StateHistoryData]:
     states = await StateService(session).history(

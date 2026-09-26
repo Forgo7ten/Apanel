@@ -33,6 +33,8 @@ DEFAULT_MACD_PARAMETERS = _parameter_contract.DEFAULT_MACD_PARAMETERS
 DEFAULT_MA_PERIODS = _parameter_contract.DEFAULT_MA_PERIODS
 DEFAULT_PROJECTED_MA_PERIOD = _parameter_contract.DEFAULT_PROJECTED_MA_PERIOD
 DEFAULT_RSI_PERIOD = _parameter_contract.DEFAULT_RSI_PERIOD
+DEFAULT_INDICATOR_ADJUSTMENT = "qfq"
+DEFAULT_HISTORY_ADJUSTMENT = DEFAULT_INDICATOR_ADJUSTMENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +50,9 @@ class CalculatedIndicator:
         return parameter_key(self.indicator_type, self.parameters)
 
 
-DEFAULT_ADJUSTMENT: str | None = None
+# Backward-compatible name for callers that imported the old default; indicator
+# persistence no longer has an unadjusted default.
+DEFAULT_ADJUSTMENT = DEFAULT_INDICATOR_ADJUSTMENT
 
 
 class IndicatorService:
@@ -69,13 +73,13 @@ class IndicatorService:
         self,
         symbol: str,
         *,
-        adjustment: str | None = DEFAULT_ADJUSTMENT,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
         requests: Iterable[
             IndicatorRequest | tuple[str, Mapping[str, Any]] | Mapping[str, Any]
         ]
         | None = None,
     ) -> list[IndicatorSnapshotModel]:
-        _validate_adjustment(adjustment)
+        _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
         persisted = await self.repository.list_snapshots(security.id)
         effective_requests = merge_indicator_requests(requests)
@@ -136,8 +140,9 @@ class IndicatorService:
         self,
         symbol: str,
         *,
-        adjustment: str | None = DEFAULT_ADJUSTMENT,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
     ) -> list[IndicatorSnapshotModel]:
+        _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
         persisted = await self.repository.latest_snapshots(security.id)
         try:
@@ -152,7 +157,7 @@ class IndicatorService:
         self,
         symbol: str,
         *,
-        adjustment: str | None = DEFAULT_ADJUSTMENT,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
     ) -> dict[str, Any]:
         """Return the public latest-indicator projection.
 
@@ -172,29 +177,22 @@ class IndicatorService:
         *,
         start: date | None = None,
         end: date | None = None,
-        adjustment: str | None = DEFAULT_ADJUSTMENT,
+        adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
     ) -> list[IndicatorSnapshotModel]:
         _validate_range(start, end)
+        _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
         persisted = await self.repository.list_snapshots(
             security.id,
             start=start,
             end=end,
         )
-        try:
-            await self.calculate(symbol, adjustment=adjustment)
-        except ApiError as error:
-            if error.code != "INDICATOR_DATA_NOT_FOUND" or not persisted:
-                raise
-            return persisted
-        snapshots = await self.repository.list_snapshots(
-            security.id,
-            start=start,
-            end=end,
-        )
-        if not snapshots:
+        if not persisted:
             raise ApiError("INDICATOR_DATA_NOT_FOUND", "No indicator data is available.", 404)
-        return snapshots
+        # History is an observation endpoint.  It deliberately does not call
+        # calculate(): a browser GET must not create rows, commit a session,
+        # or silently choose a different adjustment series.
+        return persisted
 
     async def history_data(
         self,
@@ -202,7 +200,8 @@ class IndicatorService:
         *,
         start: date | None = None,
         end: date | None = None,
-        adjustment: str | None = DEFAULT_ADJUSTMENT,
+        adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
+        parameter_key: str | None = None,
     ) -> IndicatorHistoryData:
         """Return the public history projection for one security."""
 
@@ -213,7 +212,12 @@ class IndicatorService:
             adjustment=adjustment,
         )
         return IndicatorHistoryData(
-            items=[serialize_indicator_snapshot(item) for item in snapshots]
+            items=[
+                serialize_indicator_snapshot(snapshot, variant)
+                for snapshot in snapshots
+                for variant in history_snapshot_variants(snapshot)
+                if parameter_key is None or variant.key == parameter_key
+            ]
         )
 
     async def _get_security(self, symbol: str):
@@ -345,16 +349,20 @@ def serialize_current_indicators(
     return data
 
 
-def serialize_indicator_snapshot(snapshot: IndicatorSnapshotModel) -> IndicatorSnapshotData:
+def serialize_indicator_snapshot(
+    snapshot: IndicatorSnapshotModel,
+    variant=None,
+) -> IndicatorSnapshotData:
     """Serialize one persisted snapshot for the history API."""
 
-    variant = _default_variant(snapshot)
+    variant = variant or _default_variant(snapshot)
     if variant is None:
         variant = snapshot_variants(snapshot)[0]
 
     return IndicatorSnapshotData(
         trade_date=snapshot.trade_date,
         indicator_type=snapshot.indicator_type,
+        parameter_key=variant.key,
         parameters=dict(variant.parameters),
         values=_float_values(dict(variant.values)),
         previous_values=(
@@ -366,6 +374,32 @@ def serialize_indicator_snapshot(snapshot: IndicatorSnapshotModel) -> IndicatorS
             _float_values(dict(variant.delta)) if variant.delta is not None else None
         ),
     )
+
+
+def history_snapshot_variants(snapshot: IndicatorSnapshotModel):
+    """Expand persisted variants into stable history series.
+
+    Most v2 variants map one-to-one to a series.  MA is intentionally stored
+    as one efficient bundle, so project its individual periods before exposing
+    history; otherwise an MA5 column could only distinguish itself by
+    inspecting the values map and would be easy to mix with MA20.
+    """
+
+    variants = snapshot_variants(snapshot)
+    for variant in variants:
+        if variant.indicator_type == "MA":
+            periods = variant.parameters.get("periods")
+            if isinstance(periods, list) and len(periods) > 1:
+                for period in periods:
+                    projected = select_snapshot_variant(
+                        snapshot,
+                        "MA",
+                        {"period": period},
+                    )
+                    if projected is not None:
+                        yield projected
+                continue
+        yield variant
 
 
 def _default_variant(snapshot: IndicatorSnapshotModel):
@@ -390,9 +424,24 @@ def _validate_range(start: date | None, end: date | None) -> None:
         raise ApiError("INVALID_DATE_RANGE", "Start date must not be after end date.", 400)
 
 
-def _validate_adjustment(adjustment: str | None) -> None:
-    if adjustment is not None and adjustment not in {"qfq", "none"}:
-        raise ApiError("INVALID_ADJUSTMENT", "Adjustment must be qfq or none.", 400)
+def _validate_indicator_adjustment(adjustment: str | None) -> None:
+    if adjustment != DEFAULT_INDICATOR_ADJUSTMENT:
+        raise ApiError(
+            "UNSUPPORTED_INDICATOR_ADJUSTMENT",
+            "Indicator and state persistence only supports qfq adjustment.",
+            400,
+        )
+
+
+def _validate_history_adjustment(adjustment: str | None) -> None:
+    """History exposes only the PRD's single qfq observation sequence."""
+
+    if adjustment != DEFAULT_HISTORY_ADJUSTMENT:
+        raise ApiError(
+            "UNSUPPORTED_HISTORY_ADJUSTMENT",
+            "Indicator history only supports the default qfq adjustment series.",
+            400,
+        )
 
 
 def _select_one_adjustment_per_day(
@@ -423,6 +472,8 @@ def _select_one_adjustment_per_day(
 
 __all__ = [
     "DEFAULT_ADJUSTMENT",
+    "DEFAULT_INDICATOR_ADJUSTMENT",
+    "DEFAULT_HISTORY_ADJUSTMENT",
     "IndicatorService",
     "normalize_symbol",
     "serialize_current_indicators",

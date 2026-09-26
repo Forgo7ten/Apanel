@@ -11,7 +11,7 @@ import {
   type VisibilityState,
 } from "@tanstack/react-table";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   Identifier,
@@ -32,9 +32,15 @@ import {
 import { getColumnTitle, getIndicatorValue } from "@/components/indicators/indicator-utils";
 import { IndicatorCell } from "@/components/indicators/IndicatorCell";
 import { isApiError } from "@/lib/api-errors";
+import { isDetailActivationKey } from "@/lib/detail-contract.mjs";
 import { toColumnOrderPayload } from "@/lib/watch-contract.mjs";
 import { useWatchStore } from "@/stores/watch-store";
 import { stateToneFromLevel, StateTag } from "@/components/ui/StateTag";
+import {
+  IndicatorDetailsDrawer,
+  type DetailNotificationHandler,
+  type DetailSelection,
+} from "@/components/indicators/IndicatorDetailsDrawer";
 
 import { AddColumnDialog } from "./AddColumnDialog";
 import { ColumnManager, type ColumnManagerItem } from "./ColumnManager";
@@ -88,20 +94,37 @@ function SortableHeader({ header }: { header: Header<WatchTableStock, unknown> }
   );
 }
 
-function StateList({ states }: { states: IndicatorState[] }) {
+function StateList({ states, onOpen }: { states: IndicatorState[]; onOpen?: (state: IndicatorState, trigger: HTMLButtonElement) => void }) {
   if (states.length === 0) return <span className="text-xs text-muted">—</span>;
 
   return (
     <div className="flex max-w-[260px] flex-wrap gap-1">
       {states.slice(0, 3).map((state) => (
-        <StateTag key={state.state_id} tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>
+        <button
+          key={state.state_id}
+          type="button"
+          onClick={(event) => onOpen?.(state, event.currentTarget)}
+          onKeyDown={(event) => {
+            if (!isDetailActivationKey(event.key)) return;
+            event.preventDefault();
+            onOpen?.(state, event.currentTarget);
+          }}
+          className="rounded-full focus:outline-none focus:ring-2 focus:ring-brand/40"
+          aria-label={`查看状态${state.title}详情`}
+        >
+          <StateTag tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>
+        </button>
       ))}
       {states.length > 3 ? <span className="self-center text-[11px] text-muted">+{states.length - 3}</span> : null}
     </div>
   );
 }
 
-function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock, unknown>[] {
+function buildColumnDefs(
+  columns: WatchTableColumn[],
+  onOpenIndicator: (stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => void,
+  onOpenState: (stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => void,
+): ColumnDef<WatchTableStock, unknown>[] {
   const dynamicColumns = columns.map((column, index) => {
     const id = columnId(column, index);
     return {
@@ -114,7 +137,21 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
         if (typeof valueA === "number" && typeof valueB === "number") return valueA - valueB;
         return String(valueA).localeCompare(String(valueB), "zh-CN", { numeric: true });
       },
-      cell: ({ row }) => <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />,
+      cell: ({ row }) => (
+        <button
+          type="button"
+          onClick={(event) => onOpenIndicator(row.original, column, event.currentTarget)}
+          onKeyDown={(event) => {
+            if (!isDetailActivationKey(event.key)) return;
+            event.preventDefault();
+            onOpenIndicator(row.original, column, event.currentTarget);
+          }}
+          className="rounded-panel text-left focus:outline-none focus:ring-2 focus:ring-brand/40"
+          aria-label={`查看${getColumnTitle(column)}详情`}
+        >
+          <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />
+        </button>
+      ),
       meta: { label: getColumnTitle(column), movable: true, width: column.width },
     } satisfies ColumnDef<WatchTableStock, unknown>;
   });
@@ -149,7 +186,7 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
       id: "states",
       accessorFn: (stock) => stock.states?.map((state) => state.title).join(" ") ?? "",
       header: "状态",
-      cell: ({ row }) => <StateList states={row.original.states ?? []} />,
+      cell: ({ row }) => <StateList states={row.original.states ?? []} onOpen={(state, trigger) => onOpenState(row.original, state, trigger)} />,
       meta: { label: "状态", movable: false, toggleable: false },
     },
   ];
@@ -222,11 +259,31 @@ function mutationErrorMessage(error: unknown): string | null {
   return error instanceof Error ? error.message : "操作失败，请稍后重试。";
 }
 
-export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; onAddStock?: () => void }) {
+export function WatchTable({
+  table,
+  onAddStock,
+  onCreateNotification,
+}: {
+  table: WatchTableDetails;
+  onAddStock?: () => void;
+  onCreateNotification?: DetailNotificationHandler;
+}) {
   const queryClient = useQueryClient();
   const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
+  const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const tableId = table.id;
+
+  const openIndicatorDetail = useCallback((stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => {
+    detailTriggerRef.current = trigger;
+    setDetailSelection({ kind: "indicator", stock, column });
+  }, []);
+  const openStateDetail = useCallback((stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => {
+    detailTriggerRef.current = trigger;
+    setDetailSelection({ kind: "state", stock, state });
+  }, []);
+  const closeDetail = useCallback(() => setDetailSelection(null), []);
 
   const removeStockMutation = useMutation({
     mutationFn: ({ securityId }: { securityId: Identifier }) => removeStockFromWatchTable(tableId, securityId),
@@ -299,7 +356,10 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
   );
   const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
   const removeStock = removeStockMutation.mutate;
-  const baseColumnDefs = useMemo(() => buildColumnDefs(columns), [columns]);
+  const baseColumnDefs = useMemo(
+    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail),
+    [columns, openIndicatorDetail, openStateDetail],
+  );
   const columnDefs = useMemo(
     () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId })],
     [baseColumnDefs, pendingSecurityId, removeStock],
@@ -461,6 +521,12 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
         </table>
       </div>
       {addColumnOpen ? <AddColumnDialog tableId={tableId} onClose={() => setAddColumnOpen(false)} /> : null}
+      <IndicatorDetailsDrawer
+        selection={detailSelection}
+        onClose={closeDetail}
+        restoreFocusRef={detailTriggerRef}
+        onCreateNotification={onCreateNotification}
+      />
     </div>
   );
 }

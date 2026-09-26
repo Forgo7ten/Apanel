@@ -13,6 +13,10 @@ class IndicatorSnapshotData(BaseModel):
 
     trade_date: date
     indicator_type: str
+    # Stable identity of the canonical parameter variant.  History consumers
+    # must never infer identity from indicator_type alone because one security
+    # can contain RSI6/RSI14 or multiple BOLL configurations on the same day.
+    parameter_key: str
     parameters: dict[str, Any]
     values: dict[str, float]
     previous_values: dict[str, float] | None = None

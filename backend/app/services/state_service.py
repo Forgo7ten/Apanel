@@ -18,7 +18,15 @@ from app.models import (
     IndicatorState,
 )
 from app.repositories.indicator_state import IndicatorStateRepository
-from app.services.indicator_service import IndicatorService, _validate_range, normalize_symbol
+from app.services.indicator_service import (
+    DEFAULT_HISTORY_ADJUSTMENT,
+    DEFAULT_INDICATOR_ADJUSTMENT,
+    IndicatorService,
+    _validate_history_adjustment,
+    _validate_indicator_adjustment,
+    _validate_range,
+    normalize_symbol,
+)
 from app.states import DEFAULT_REGISTRY, IndicatorSnapshot, StateEngine, StateRegistry, StateStatus
 
 
@@ -40,8 +48,9 @@ class StateService:
         self,
         symbol: str,
         *,
-        adjustment: str | None = None,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
     ) -> list[IndicatorState]:
+        _validate_indicator_adjustment(adjustment)
         await self.indicator_service.calculate(symbol, adjustment=adjustment)
         security = await self._get_security(symbol)
         snapshots = await self.repository.list_snapshots(security.id)
@@ -140,8 +149,9 @@ class StateService:
         self,
         symbol: str,
         *,
-        adjustment: str | None = None,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
     ) -> list[IndicatorState]:
+        _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
         persisted_date = await self.repository.latest_state_date(security.id)
         persisted = (
@@ -176,29 +186,21 @@ class StateService:
         *,
         start: date | None = None,
         end: date | None = None,
-        adjustment: str | None = None,
+        adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
     ) -> list[IndicatorState]:
         _validate_range(start, end)
+        _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
         persisted = await self.repository.list_states(
             security.id,
             start=start,
             end=end,
         )
-        try:
-            await self.calculate(symbol, adjustment=adjustment)
-        except ApiError as error:
-            if error.code != "INDICATOR_DATA_NOT_FOUND" or not persisted:
-                raise
-            return persisted
-        states = await self.repository.list_states(
-            security.id,
-            start=start,
-            end=end,
-        )
-        if not states:
+        if not persisted:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
-        return states
+        # A history GET is read-only.  State recognition belongs to the EOD
+        # pipeline (or an explicit calculate call), never to this endpoint.
+        return persisted
 
     async def _get_security(self, symbol: str):
         security = await self.repository.get_security(normalize_symbol(symbol))
