@@ -36,6 +36,13 @@ from app.providers.notification import (
 )
 from app.schemas.alerts import AlertRuleCreateRequest
 from app.services.alert_service import AlertService
+from app.services.notification_service import (
+    NOTIFICATION_PENDING_RECOVERY_MARGIN,
+    NOTIFICATION_PENDING_RECOVERY_WINDOW,
+    NOTIFICATION_PROVIDER_TIMEOUT,
+    NotificationService,
+    validate_pending_recovery_window,
+)
 from app.services.settings_service import UserSettingsService
 
 
@@ -60,6 +67,14 @@ class BlockingProvider(FakeProvider):
         self.calls += 1
         self.started.set()
         await self.release.wait()
+
+
+def test_pending_recovery_window_exceeds_provider_timeout_budget() -> None:
+    minimum = NOTIFICATION_PROVIDER_TIMEOUT + NOTIFICATION_PENDING_RECOVERY_MARGIN
+
+    assert NOTIFICATION_PENDING_RECOVERY_WINDOW > minimum
+    with pytest.raises(ValueError):
+        validate_pending_recovery_window(minimum)
 
 
 @pytest_asyncio.fixture
@@ -552,9 +567,7 @@ async def test_concurrent_retries_do_not_post_twice(alert_context) -> None:
             channel="FEISHU",
             title="RSI >= 70",
             content=retry_message().to_dict(),
-            status="FAILED",
-            error_code="FEISHU_ERROR",
-            error_message="Notification provider failed.",
+            status="PENDING",
             created_at=datetime.now(UTC) - timedelta(minutes=10),
         )
         session.add(notification)
@@ -581,6 +594,203 @@ async def test_concurrent_retries_do_not_post_twice(alert_context) -> None:
 
     assert first_result.status == second_result.status == "SENT"
     assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_delivery_serializes_stale_retry_before_provider_call(alert_context) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    provider = BlockingProvider()
+    created_at = datetime.now(UTC) - timedelta(minutes=10)
+
+    async with session_factory() as delivery_session, session_factory() as retry_session:
+        delivery = asyncio.create_task(
+            NotificationService(delivery_session, provider=provider).deliver(
+                user_id=user.id,
+                alert_rule_id=None,
+                security_id=security.id,
+                title="RSI >= 70",
+                message=retry_message(),
+                created_at=created_at,
+            )
+        )
+        await provider.started.wait()
+        async with session_factory() as observer:
+            persisted = (await observer.execute(select(Notification))).scalar_one()
+            notification_id = persisted.id
+
+        retry = asyncio.create_task(
+            AlertService(retry_session, notification_provider=provider).retry_notification(
+                user.id, notification_id
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert provider.calls == 1
+            assert not retry.done()
+        finally:
+            provider.release.set()
+            delivered, retried = await asyncio.gather(delivery, retry)
+
+    assert delivered.status == retried.status == "SENT"
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_commit_failure_relocks_and_persists_without_reposting(
+    alert_context, monkeypatch
+) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    async with session_factory() as session:
+        notification = Notification(
+            user_id=user.id,
+            security_id=security.id,
+            channel="FEISHU",
+            title="RSI >= 70",
+            content=retry_message().to_dict(),
+            status="PENDING",
+            created_at=datetime.now(UTC) - timedelta(minutes=10),
+        )
+        session.add(notification)
+        await session.commit()
+        provider = FakeProvider()
+        original_commit = session.commit
+        commit_calls = 0
+
+        async def fail_once() -> None:
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 1:
+                raise RuntimeError("commit failed after provider response")
+            await original_commit()
+
+        async def forbidden_get(*_args, **_kwargs):
+            raise AssertionError("terminal recovery must re-lock with SELECT FOR UPDATE")
+
+        monkeypatch.setattr(session, "commit", fail_once)
+        monkeypatch.setattr(session, "get", forbidden_get)
+
+        retried = await AlertService(session, notification_provider=provider).retry_notification(
+            user.id, notification.id
+        )
+
+    assert retried.status == "SENT"
+    assert provider.calls == 1
+    assert commit_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_commit_recovery_preserves_concurrent_terminal_winner(
+    alert_context, monkeypatch
+) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    async with session_factory() as session:
+        notification = Notification(
+            user_id=user.id,
+            security_id=security.id,
+            channel="FEISHU",
+            title="RSI >= 70",
+            content=retry_message().to_dict(),
+            status="PENDING",
+            created_at=datetime.now(UTC) - timedelta(minutes=10),
+        )
+        session.add(notification)
+        await session.commit()
+        notification_id = notification.id
+
+    provider = FakeProvider()
+    rollback_done = asyncio.Event()
+    winner_done = asyncio.Event()
+    async with session_factory() as retry_session, session_factory() as winner_session:
+        original_commit = retry_session.commit
+        original_rollback = retry_session.rollback
+        commit_calls = 0
+
+        async def fail_terminal_commit() -> None:
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 1:
+                raise RuntimeError("ambiguous terminal commit")
+            await original_commit()
+
+        async def rollback_then_wait() -> None:
+            await original_rollback()
+            rollback_done.set()
+            await winner_done.wait()
+
+        monkeypatch.setattr(retry_session, "commit", fail_terminal_commit)
+        monkeypatch.setattr(retry_session, "rollback", rollback_then_wait)
+        retry = asyncio.create_task(
+            AlertService(retry_session, notification_provider=provider).retry_notification(
+                user.id, notification_id
+            )
+        )
+        await rollback_done.wait()
+
+        winner = (
+            await winner_session.execute(
+                select(Notification).where(Notification.id == notification_id)
+            )
+        ).scalar_one()
+        winner.status = "FAILED"
+        winner.error_code = "CONCURRENT_WINNER"
+        winner.error_message = "Notification provider failed."
+        winner.content = {
+            **winner.content,
+            "error": {
+                "code": "CONCURRENT_WINNER",
+                "message": "Notification provider failed.",
+            },
+        }
+        await winner_session.commit()
+        winner_done.set()
+        retried = await retry
+
+    assert retried.status == "FAILED"
+    assert retried.error_code == "CONCURRENT_WINNER"
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_commit_recovery_returns_safe_error_when_persistence_stays_down(
+    alert_context, monkeypatch
+) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    provider = FakeProvider()
+    async with session_factory() as session:
+        original_commit = session.commit
+        commit_calls = 0
+
+        async def fail_terminal_commits() -> None:
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 1:
+                await original_commit()
+                return
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(session, "commit", fail_terminal_commits)
+        with pytest.raises(ApiError) as raised:
+            await NotificationService(session, provider=provider).deliver(
+                user_id=user.id,
+                alert_rule_id=None,
+                security_id=security.id,
+                title="RSI >= 70",
+                message=retry_message(),
+            )
+
+    assert raised.value.code == "NOTIFICATION_PERSISTENCE_FAILED"
+    assert raised.value.status_code == 503
+    assert raised.value.message == "Notification delivery outcome could not be saved."
+    assert provider.calls == 1
+    assert commit_calls > 1
 
 
 @pytest.mark.asyncio

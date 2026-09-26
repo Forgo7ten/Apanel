@@ -2,6 +2,7 @@
 
 from .base import NotificationProvider
 from .feishu import (
+    FEISHU_WEBHOOK_TIMEOUT_SECONDS,
     FeishuNotificationProvider,
     FeishuProvider,
     FeishuWebhookError,
@@ -16,6 +17,7 @@ from .registry import (
 )
 
 __all__ = [
+    "FEISHU_WEBHOOK_TIMEOUT_SECONDS",
     "FeishuNotificationProvider",
     "FeishuProvider",
     "FeishuWebhookError",

@@ -19,6 +19,7 @@ from .message import NotificationMessage
 
 logger = logging.getLogger(__name__)
 _MISSING_RESPONSE_CODE = object()
+FEISHU_WEBHOOK_TIMEOUT_SECONDS = 5.0
 
 
 class NotificationProviderError(RuntimeError):
@@ -106,7 +107,7 @@ class FeishuWebhookProvider(NotificationProvider):
         *,
         client: Any | None = None,
         http_client: Any | None = None,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = FEISHU_WEBHOOK_TIMEOUT_SECONDS,
         timeout: float | None = None,
         logger_: logging.Logger | None = None,
     ) -> None:
@@ -244,6 +245,7 @@ FeishuNotificationProvider = FeishuWebhookProvider
 
 
 __all__ = [
+    "FEISHU_WEBHOOK_TIMEOUT_SECONDS",
     "FeishuNotificationProvider",
     "FeishuProvider",
     "FeishuWebhookError",

@@ -141,8 +141,16 @@ http://localhost:8080/api/v1
 - `FAILED`：重新投递；成功后变为 `SENT`，失败后保留 `FAILED` 和安全错误字段。
 - 过期的 `PENDING`：按遗留/中断投递恢复。服务端使用行锁和并发保护，避免同一通知
   并发产生重复 POST。
-- 近期 `PENDING`：返回 `409 NOTIFICATION_RETRY_CONFLICT`，调用方应稍后再试。
+- 首次投递在写入 `PENDING` 后也会重新取得同一通知行锁，并持锁完成 provider 请求；因此
+  首次投递与遗留恢复请求之间同样不会并发 POST。
+- 近期 `PENDING`：返回 `409 NOTIFICATION_RETRY_CONFLICT`，调用方应稍后再试。恢复窗口为
+  5 分钟，严格大于 Feishu 5 秒 provider 超时及数据库收敛余量。
 - 其他不可重试状态：返回 `409 NOTIFICATION_NOT_RETRYABLE`。
+
+若终态提交遇到不确定的数据库失败，服务端会有限次重新加锁并使用缓存结果恢复；仍无法持久化时
+返回 `503 NOTIFICATION_PERSISTENCE_FAILED`，记录保持可诊断的 `PENDING`/原终态。Feishu webhook
+未提供幂等键，因此系统不能宣称绝对 exactly-once：进程在 provider 已接受请求、数据库终态尚未
+确认的极端崩溃窗口中，后续人工恢复仍可能再次投递。
 
 Feishu HTTP 响应必须是 JSON object，并明确包含数值 `code` 或 `StatusCode`，且严格等于
 `0`；缺字段、非法 JSON、非 object、非零业务码都会记录为失败。provider 请求超时固定为

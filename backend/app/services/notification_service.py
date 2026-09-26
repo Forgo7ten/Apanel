@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import selectinload
 
 from app.core.errors import ApiError
 from app.models import Notification, NotificationChannel, NotificationStatus, UserSetting
 from app.providers.notification import (
     DEFAULT_PROVIDER_REGISTRY,
+    FEISHU_WEBHOOK_TIMEOUT_SECONDS,
     NotificationMessage,
     NotificationProvider,
     NotificationProviderError,
@@ -33,14 +35,35 @@ class ProviderFactory(Protocol):
 # A PENDING row older than this window is treated as an abandoned/legacy
 # attempt.  Recent PENDING rows remain owned by the original delivery path;
 # retrying them would risk a second provider POST.
+NOTIFICATION_PROVIDER_TIMEOUT = timedelta(seconds=FEISHU_WEBHOOK_TIMEOUT_SECONDS)
+NOTIFICATION_PENDING_RECOVERY_MARGIN = timedelta(seconds=5)
 NOTIFICATION_PENDING_RECOVERY_WINDOW = timedelta(minutes=5)
-_RETRY_LOCKS: dict[int, asyncio.Lock] = {}
+NOTIFICATION_COMMIT_RECOVERY_ATTEMPTS = 2
+NOTIFICATION_PERSISTENCE_ERROR_CODE = "NOTIFICATION_PERSISTENCE_FAILED"
+NOTIFICATION_PERSISTENCE_ERROR_MESSAGE = "Notification delivery outcome could not be saved."
 _RETRY_LOCKS_GUARD = threading.Lock()
+_RETRY_LOCKS_BY_LOOP: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[int, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
 
 
 def _retry_lock(notification_id: int) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
     with _RETRY_LOCKS_GUARD:
-        return _RETRY_LOCKS.setdefault(notification_id, asyncio.Lock())
+        locks = _RETRY_LOCKS_BY_LOOP.setdefault(loop, {})
+        return locks.setdefault(notification_id, asyncio.Lock())
+
+
+def validate_pending_recovery_window(value: timedelta) -> timedelta:
+    """Require recovery to wait beyond provider timeout and DB settling time."""
+
+    minimum = NOTIFICATION_PROVIDER_TIMEOUT + NOTIFICATION_PENDING_RECOVERY_MARGIN
+    if not isinstance(value, timedelta) or value <= minimum:
+        raise ValueError("pending recovery window must exceed provider timeout and DB margin")
+    return value
+
+
+validate_pending_recovery_window(NOTIFICATION_PENDING_RECOVERY_WINDOW)
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -57,6 +80,7 @@ def is_notification_retryable(
 ) -> bool:
     """Return whether an authenticated caller may retry this row."""
 
+    validate_pending_recovery_window(recovery_window)
     if notification.status == NotificationStatus.FAILED:
         return True
     if notification.status != NotificationStatus.PENDING:
@@ -88,7 +112,7 @@ class NotificationService:
         self.provider = provider
         self.provider_factory = provider_factory
         self.provider_registry = provider_registry or DEFAULT_PROVIDER_REGISTRY
-        self.pending_recovery_window = pending_recovery_window
+        self.pending_recovery_window = validate_pending_recovery_window(pending_recovery_window)
         self.clock = clock or (lambda: datetime.now(UTC))
 
     async def deliver(
@@ -125,7 +149,7 @@ class NotificationService:
         self.session.add(notification)
         await self.session.commit()
 
-        return await self._deliver_existing(notification, message, provider=provider)
+        return await self._deliver_new(notification.id, message, provider=provider)
 
     async def retry(
         self,
@@ -143,17 +167,10 @@ class NotificationService:
         cannot issue duplicate POSTs for a successful attempt.
         """
         async with _retry_lock(notification_id):
-            notification = (
-                await self.session.execute(
-                    select(Notification)
-                    .options(joinedload(Notification.security))
-                    .where(
-                        Notification.id == notification_id,
-                        Notification.user_id == user_id,
-                    )
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            notification = await self._locked_notification(
+                notification_id,
+                user_id=user_id,
+            )
             if notification is None:
                 raise ApiError("NOTIFICATION_NOT_FOUND", "Notification was not found.", 404)
             if notification.status == NotificationStatus.SENT:
@@ -199,6 +216,45 @@ class NotificationService:
             # result.  Committing PENDING here would reopen the duplicate-POST
             # race that this recovery path is meant to close.
             return await self._deliver_existing(notification, message, provider=provider)
+
+    async def _deliver_new(
+        self,
+        notification_id: int,
+        message: NotificationMessage,
+        *,
+        provider: NotificationProvider | None,
+    ) -> Notification:
+        """Deliver a newly committed row through the same lock as recovery."""
+
+        async with _retry_lock(notification_id):
+            notification = await self._locked_notification(notification_id)
+            if notification is None:
+                raise RuntimeError("notification disappeared before delivery")
+            # A stale retry may have acquired the row first after the initial
+            # PENDING commit.  Its terminal result wins; never POST twice.
+            if notification.status != NotificationStatus.PENDING:
+                return notification
+            return await self._deliver_existing(notification, message, provider=provider)
+
+    async def _locked_notification(
+        self,
+        notification_id: int,
+        *,
+        user_id: int | None = None,
+    ) -> Notification | None:
+        """Load one notification while holding its database row lock."""
+
+        conditions = [Notification.id == notification_id]
+        if user_id is not None:
+            conditions.append(Notification.user_id == user_id)
+        return (
+            await self.session.execute(
+                select(Notification)
+                .options(selectinload(Notification.security))
+                .where(*conditions)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
 
     async def _deliver_existing(
         self,
@@ -258,8 +314,9 @@ class NotificationService:
         return await self._commit_delivery(notification)
 
     async def _commit_delivery(self, notification: Notification) -> Notification:
-        """Commit a terminal outcome, recovering from a failed lookup txn."""
+        """Commit a terminal outcome without overwriting a concurrent winner."""
 
+        notification_id = notification.id
         outcome = {
             "status": notification.status,
             "error_code": notification.error_code,
@@ -270,18 +327,52 @@ class NotificationService:
         try:
             await self.session.commit()
         except Exception:
-            # A destination query can leave SQLAlchemy's transaction in a
-            # failed state.  Roll it back, reload the already committed row,
-            # and persist the terminal FAILED/SENT outcome again.
-            await self.session.rollback()
-            persisted = await self.session.get(Notification, notification.id)
-            if persisted is None:
-                raise
-            for field, value in outcome.items():
-                setattr(persisted, field, value)
-            await self.session.commit()
-            return persisted
+            # A commit exception is ambiguous: the provider result may have
+            # been committed before the client observed the exception.  Drop
+            # the failed transaction, then re-lock and inspect the durable
+            # row before applying the cached outcome.
+            await self._rollback_quietly()
+            for _ in range(NOTIFICATION_COMMIT_RECOVERY_ATTEMPTS):
+                try:
+                    persisted = await self._locked_notification(notification_id)
+                    if persisted is None:
+                        raise RuntimeError("notification disappeared during outcome recovery")
+                    if persisted.status in {
+                        NotificationStatus.SENT,
+                        NotificationStatus.FAILED,
+                    }:
+                        return persisted
+                    if persisted.status != NotificationStatus.PENDING:
+                        raise RuntimeError("notification has an invalid delivery status")
+                    result = await self.session.execute(
+                        update(Notification)
+                        .where(
+                            Notification.id == notification_id,
+                            Notification.status == NotificationStatus.PENDING,
+                        )
+                        .values(**outcome)
+                    )
+                    if result.rowcount != 1:
+                        await self._rollback_quietly()
+                        continue
+                    await self.session.commit()
+                    for field, value in outcome.items():
+                        setattr(persisted, field, value)
+                    return persisted
+                except Exception:
+                    await self._rollback_quietly()
+            raise ApiError(
+                NOTIFICATION_PERSISTENCE_ERROR_CODE,
+                NOTIFICATION_PERSISTENCE_ERROR_MESSAGE,
+                503,
+            ) from None
         return notification
+
+    async def _rollback_quietly(self) -> None:
+        try:
+            await self.session.rollback()
+        except Exception:
+            pass
 
     async def summarize_deliveries(
         self,
@@ -382,9 +473,15 @@ def _safe_delivery_error(error: Exception, _webhook: str | None) -> tuple[str, s
 
 
 __all__ = [
+    "NOTIFICATION_COMMIT_RECOVERY_ATTEMPTS",
     "NOTIFICATION_PENDING_RECOVERY_WINDOW",
+    "NOTIFICATION_PENDING_RECOVERY_MARGIN",
+    "NOTIFICATION_PERSISTENCE_ERROR_CODE",
+    "NOTIFICATION_PERSISTENCE_ERROR_MESSAGE",
+    "NOTIFICATION_PROVIDER_TIMEOUT",
     "NotificationService",
     "ProviderFactory",
     "is_notification_retryable",
     "summarize_deliveries",
+    "validate_pending_recovery_window",
 ]
