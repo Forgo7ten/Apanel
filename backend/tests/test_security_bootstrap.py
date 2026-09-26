@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from app.cli import main
-from app.tasks.market_data import HttpMarketDataClient, MarketDataClientError
+from app.tasks.market_data import (
+    HttpMarketDataClient,
+    MarketDataClientError,
+    PermanentMarketDataClientError,
+    RetryableMarketDataClientError,
+)
 
 
 class FakeResponse:
@@ -25,6 +31,25 @@ class RecordingHttpClient:
     async def post(self, url: str, **kwargs: object) -> FakeResponse:
         self.calls.append({"url": url, **kwargs})
         return self.response
+
+
+class SequencedHttpClient:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self.responses = responses
+        self.calls = 0
+
+    async def post(self, url: str, **kwargs: object) -> FakeResponse:
+        del url, kwargs
+        self.calls += 1
+        return self.responses.pop(0)
+
+
+class RaisingHttpClient:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def post(self, url: str, **kwargs: object) -> FakeResponse:
+        raise self.error
 
 
 class ScriptedMarketDataClient:
@@ -105,7 +130,411 @@ async def test_sync_securities_rejects_unsuccessful_envelope() -> None:
     )
     client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
 
-    with pytest.raises(MarketDataClientError, match="synchronization failed"):
+    with pytest.raises(PermanentMarketDataClientError, match="synchronization failed"):
+        await client.sync_securities()
+
+
+@pytest.mark.parametrize("error_code", ["PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE"])
+@pytest.mark.asyncio
+async def test_sync_securities_classifies_transient_error_envelope_as_retryable(
+    error_code: str,
+) -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": None,
+                "error": {
+                    "code": error_code,
+                    "message": "provider token=https://secret.invalid/detail",
+                },
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(RetryableMarketDataClientError) as raised:
+        await client.sync_securities()
+
+    assert str(raised.value) == "market data request temporarily unavailable"
+    assert "secret.invalid" not in str(raised.value)
+
+
+@pytest.mark.parametrize("error_code", ["PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE"])
+@pytest.mark.asyncio
+async def test_sync_securities_classifies_transient_item_error_as_retryable(
+    error_code: str,
+) -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": {
+                    "operation": "security",
+                    "total": 1,
+                    "succeeded": 0,
+                    "failed": 1,
+                    "ok": False,
+                    "items": [
+                        {
+                            "symbol": "*",
+                            "status": "failed",
+                            "fetched": 0,
+                            "persisted": 0,
+                            "error": {
+                                "code": error_code,
+                                "message": "provider token=https://secret.invalid/detail",
+                            },
+                        }
+                    ],
+                },
+                "error": {
+                    "code": "PARTIAL_SYNC_FAILURE",
+                    "message": "provider response body should not be trusted",
+                },
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(RetryableMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.asyncio
+async def test_sync_securities_keeps_mixed_item_errors_permanent() -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": {
+                    "items": [
+                        {"error": {"code": "PROVIDER_TIMEOUT", "message": "ignored"}},
+                        {"error": {"code": "INVALID_MARKET_DATA", "message": "ignored"}},
+                    ]
+                },
+                "error": {"code": "PARTIAL_SYNC_FAILURE", "message": "ignored"},
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(PermanentMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.asyncio
+async def test_sync_securities_keeps_permanent_top_level_error_permanent() -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": {
+                    "items": [
+                        {"error": {"code": "PROVIDER_TIMEOUT", "message": "ignored"}},
+                    ]
+                },
+                "error": {
+                    "code": "INVALID_INTERNAL_TOKEN",
+                    "message": "token=secret",
+                },
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(PermanentMarketDataClientError) as raised:
+        await client.sync_securities()
+
+    assert str(raised.value) == "market data synchronization failed"
+    assert "secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize("top_level_code", ["PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE"])
+@pytest.mark.asyncio
+async def test_sync_securities_keeps_transient_top_level_and_items_retryable(
+    top_level_code: str,
+) -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": {
+                    "items": [
+                        {"error": {"code": "PROVIDER_TIMEOUT", "message": "ignored"}},
+                        {"error": {"code": "PROVIDER_UNAVAILABLE", "message": "ignored"}},
+                    ]
+                },
+                "error": {"code": top_level_code, "message": "ignored"},
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(RetryableMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.asyncio
+async def test_sync_securities_keeps_transient_top_level_with_permanent_item_permanent() -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": {
+                    "items": [
+                        {"error": {"code": "INVALID_MARKET_DATA", "message": "ignored"}},
+                    ]
+                },
+                "error": {"code": "PROVIDER_UNAVAILABLE", "message": "ignored"},
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(PermanentMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.parametrize("include_top_level_error", [False, True])
+@pytest.mark.asyncio
+async def test_sync_securities_retries_transient_items_without_top_level_error(
+    include_top_level_error: bool,
+) -> None:
+    body: dict[str, object] = {
+        "success": False,
+        "data": {
+            "items": [
+                {"error": {"code": "PROVIDER_TIMEOUT", "message": "ignored"}},
+                {"error": {"code": "PROVIDER_UNAVAILABLE", "message": "ignored"}},
+            ]
+        },
+    }
+    if include_top_level_error:
+        body["error"] = None
+    transport = RecordingHttpClient(FakeResponse(body))
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(RetryableMarketDataClientError):
+        await client.sync_securities()
+
+
+def test_bootstrap_securities_does_not_sleep_for_permanent_top_level_error_with_transient_item(
+    capsys,
+) -> None:
+    transport = SequencedHttpClient(
+        [
+            FakeResponse(
+                {
+                    "success": False,
+                    "data": {
+                        "items": [
+                            {
+                                "error": {
+                                    "code": "PROVIDER_TIMEOUT",
+                                    "message": "provider detail token=secret",
+                                }
+                            }
+                        ]
+                    },
+                    "error": {
+                        "code": "INVALID_INTERNAL_TOKEN",
+                        "message": "token=secret",
+                    },
+                }
+            )
+        ]
+    )
+    delays: list[float] = []
+
+    def factory(base_url: str, **kwargs: object) -> HttpMarketDataClient:
+        return HttpMarketDataClient(base_url, client=transport, **kwargs)
+
+    async def record_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    exit_code = main(
+        [
+            "bootstrap-securities",
+            "--retry-until-success",
+            "--retry-interval-seconds",
+            "0.25",
+        ],
+        settings=cli_settings(),
+        market_data_client_factory=factory,
+        sleep=record_sleep,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert transport.calls == 1
+    assert delays == []
+    assert "secret" not in captured.out + captured.err
+
+
+def test_bootstrap_securities_retries_transient_http_envelope(capsys) -> None:
+    transport = SequencedHttpClient(
+        [
+            FakeResponse(
+                {
+                    "success": False,
+                    "data": None,
+                    "error": {
+                        "code": "PROVIDER_UNAVAILABLE",
+                        "message": "token=https://secret.invalid/provider",
+                    },
+                }
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "data": {"operation": "security", "succeeded": 2, "failed": 0},
+                    "error": None,
+                }
+            ),
+        ]
+    )
+    delays: list[float] = []
+
+    def factory(base_url: str, **kwargs: object) -> HttpMarketDataClient:
+        return HttpMarketDataClient(base_url, client=transport, **kwargs)
+
+    async def record_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    exit_code = main(
+        [
+            "bootstrap-securities",
+            "--retry-until-success",
+            "--retry-interval-seconds",
+            "0.25",
+        ],
+        settings=cli_settings(),
+        market_data_client_factory=factory,
+        sleep=record_sleep,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert transport.calls == 2
+    assert delays == [0.25]
+    assert "secret.invalid" not in captured.out + captured.err
+
+
+def test_bootstrap_securities_single_attempt_keeps_transient_http_failure_nonzero(capsys) -> None:
+    transport = SequencedHttpClient(
+        [
+            FakeResponse(
+                {
+                    "success": False,
+                    "data": None,
+                    "error": {
+                        "code": "PROVIDER_TIMEOUT",
+                        "message": "response detail token=secret",
+                    },
+                }
+            )
+        ]
+    )
+    delays: list[float] = []
+
+    def factory(base_url: str, **kwargs: object) -> HttpMarketDataClient:
+        return HttpMarketDataClient(base_url, client=transport, **kwargs)
+
+    async def record_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    exit_code = main(
+        ["bootstrap-securities"],
+        settings=cli_settings(),
+        market_data_client_factory=factory,
+        sleep=record_sleep,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert transport.calls == 1
+    assert delays == []
+    assert "secret" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "PARTIAL_SYNC_FAILURE",
+        "INVALID_INTERNAL_TOKEN",
+        "INVALID_REQUEST",
+        "UNKNOWN_PROVIDER_CODE",
+    ],
+)
+@pytest.mark.asyncio
+async def test_sync_securities_keeps_non_allowlisted_error_codes_permanent(
+    error_code: str,
+) -> None:
+    transport = RecordingHttpClient(
+        FakeResponse(
+            {
+                "success": False,
+                "data": None,
+                "error": {
+                    "code": error_code,
+                    "message": "provider temporarily unavailable token=secret",
+                },
+            }
+        )
+    )
+    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+
+    with pytest.raises(PermanentMarketDataClientError) as raised:
+        await client.sync_securities()
+
+    assert str(raised.value) == "market data synchronization failed"
+    assert "secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 599])
+@pytest.mark.asyncio
+async def test_sync_securities_classifies_transient_http_statuses(status_code: int) -> None:
+    client = HttpMarketDataClient(
+        "http://market-data-service:8001",
+        client=RecordingHttpClient(FakeResponse({}, status_code=status_code)),
+    )
+
+    with pytest.raises(RetryableMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+@pytest.mark.asyncio
+async def test_sync_securities_classifies_permanent_http_statuses(status_code: int) -> None:
+    client = HttpMarketDataClient(
+        "http://market-data-service:8001",
+        client=RecordingHttpClient(FakeResponse({}, status_code=status_code)),
+    )
+
+    with pytest.raises(PermanentMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.asyncio
+async def test_sync_securities_classifies_network_failures_as_retryable() -> None:
+    client = HttpMarketDataClient(
+        "http://market-data-service:8001",
+        client=RaisingHttpClient(ConnectionError("token=do-not-print")),
+    )
+
+    with pytest.raises(RetryableMarketDataClientError):
+        await client.sync_securities()
+
+
+@pytest.mark.asyncio
+async def test_sync_securities_does_not_wrap_unexpected_transport_errors() -> None:
+    client = HttpMarketDataClient(
+        "http://market-data-service:8001",
+        client=RaisingHttpClient(RuntimeError("programming bug")),
+    )
+
+    with pytest.raises(RuntimeError, match="programming bug"):
         await client.sync_securities()
 
 
@@ -225,7 +654,7 @@ def test_bootstrap_securities_rejects_false_summary_status(capsys) -> None:
 def test_bootstrap_securities_retries_until_success(capsys) -> None:
     client = ScriptedMarketDataClient(
         [
-            MarketDataClientError("market data request timed out"),
+            RetryableMarketDataClientError("provider-token=do-not-print"),
             {"succeeded": 0, "failed": 0},
             {"succeeded": 2, "failed": 0},
         ]
@@ -253,6 +682,77 @@ def test_bootstrap_securities_retries_until_success(capsys) -> None:
     assert delays == [0.25, 0.25]
     assert client.closed is True
     assert captured.err.lower().count("attempt") == 2
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        PermanentMarketDataClientError("provider-token=do-not-print"),
+        {"succeeded": "2", "failed": 0},
+        {"succeeded": 1, "failed": 1},
+    ],
+)
+def test_bootstrap_securities_does_not_retry_permanent_failures(outcome, capsys) -> None:
+    client = ScriptedMarketDataClient([outcome])
+    delays: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    exit_code = main(
+        [
+            "bootstrap-securities",
+            "--retry-until-success",
+            "--retry-interval-seconds",
+            "0.25",
+        ],
+        settings=cli_settings(),
+        market_data_client_factory=ClientFactory(client),
+        sleep=record_sleep,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert client.sync_calls == 1
+    assert delays == []
+    assert client.closed is True
+    assert "do-not-print" not in captured.out + captured.err
+
+
+def test_bootstrap_securities_does_not_retry_unexpected_exceptions(capsys) -> None:
+    client = ScriptedMarketDataClient([RuntimeError("programming bug")])
+    delays: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    exit_code = main(
+        ["bootstrap-securities", "--retry-until-success"],
+        settings=cli_settings(),
+        market_data_client_factory=ClientFactory(client),
+        sleep=record_sleep,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert client.sync_calls == 1
+    assert delays == []
+    assert client.closed is True
+    assert "programming bug" not in captured.out + captured.err
+
+
+def test_bootstrap_securities_propagates_cancellation_after_close() -> None:
+    client = ScriptedMarketDataClient([asyncio.CancelledError()])
+
+    with pytest.raises(asyncio.CancelledError):
+        main(
+            ["bootstrap-securities", "--retry-until-success"],
+            settings=cli_settings(),
+            market_data_client_factory=ClientFactory(client),
+        )
+
+    assert client.sync_calls == 1
+    assert client.closed is True
 
 
 @pytest.mark.parametrize(

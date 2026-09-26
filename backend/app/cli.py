@@ -9,6 +9,8 @@ import inspect
 import math
 import sys
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -76,36 +78,63 @@ async def _bootstrap_admin(args: argparse.Namespace) -> int:
     return 0
 
 
-_SAFE_MARKET_DATA_ERRORS = frozenset(
-    {
-        "market data request timed out",
-        "market data request failed",
-        "market data service returned an error",
-        "market data synchronization failed",
-        "market data response was invalid",
-    }
-)
+class BootstrapAttemptStatus(Enum):
+    """Classify one security synchronization attempt for retry policy."""
+
+    SUCCESS = "success"
+    RETRYABLE_FAILURE = "retryable_failure"
+    PERMANENT_FAILURE = "permanent_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapAttemptResult:
+    """Safe, structured result of one security synchronization attempt."""
+
+    status: BootstrapAttemptStatus
+    message: str = ""
+    count: int = 0
+
+
+def _failure_result(message: str, *, retryable: bool) -> BootstrapAttemptResult:
+    return BootstrapAttemptResult(
+        status=(
+            BootstrapAttemptStatus.RETRYABLE_FAILURE
+            if retryable
+            else BootstrapAttemptStatus.PERMANENT_FAILURE
+        ),
+        message=message,
+    )
 
 
 def _safe_market_data_error(error: MarketDataClientError) -> str:
-    detail = str(error)
-    if detail in _SAFE_MARKET_DATA_ERRORS:
-        return detail
-    return "market data synchronization request failed"
+    if error.retryable:
+        return "market data request temporarily unavailable"
+    return "market data synchronization failed"
 
 
-def _bootstrap_result(data: object) -> tuple[bool, str, int]:
+def _bootstrap_result(data: object) -> BootstrapAttemptResult:
     if not isinstance(data, Mapping):
-        return False, "market data service returned an invalid synchronization summary", 0
+        return _failure_result(
+            "market data service returned an invalid synchronization summary",
+            retryable=False,
+        )
     if "success" in data:
         if data.get("success") is not True:
-            return False, "market data service reported synchronization failed", 0
+            return _failure_result(
+                "market data service reported synchronization failed",
+                retryable=False,
+            )
         data = data.get("data")
         if not isinstance(data, Mapping):
-            return False, "market data service returned an invalid synchronization summary", 0
-    status = data.get("ok")
-    if status is not None and status is not True:
-        return False, "market data service reported synchronization failed", 0
+            return _failure_result(
+                "market data service returned an invalid synchronization summary",
+                retryable=False,
+            )
+    if "ok" in data and data.get("ok") is not True:
+        return _failure_result(
+            "market data service reported synchronization failed",
+            retryable=False,
+        )
     succeeded = data.get("succeeded")
     failed = data.get("failed")
     if (
@@ -116,12 +145,33 @@ def _bootstrap_result(data: object) -> tuple[bool, str, int]:
         or succeeded < 0
         or failed < 0
     ):
-        return False, "market data service returned an invalid synchronization summary", 0
+        return _failure_result(
+            "market data service returned an invalid synchronization summary",
+            retryable=False,
+        )
+    if "total" in data:
+        total = data.get("total")
+        if (
+            not isinstance(total, int)
+            or isinstance(total, bool)
+            or total < 0
+            or total != succeeded + failed
+        ):
+            return _failure_result(
+                "market data service returned an invalid synchronization summary",
+                retryable=False,
+            )
     if failed:
-        return False, f"security synchronization incomplete: {failed} failed", succeeded
+        return _failure_result(
+            f"security synchronization incomplete: {failed} failed",
+            retryable=False,
+        )
     if succeeded == 0:
-        return False, "security synchronization returned no securities", 0
-    return True, "", succeeded
+        return _failure_result("security synchronization returned no securities", retryable=True)
+    return BootstrapAttemptResult(
+        status=BootstrapAttemptStatus.SUCCESS,
+        count=succeeded,
+    )
 
 
 async def _close_market_data_client(client: Any) -> None:
@@ -163,22 +213,37 @@ async def run_security_bootstrap(
             attempt += 1
             try:
                 data = await client.sync_securities()
-                succeeded, failure, count = _bootstrap_result(data)
+                result = _bootstrap_result(data)
+            except asyncio.CancelledError:
+                raise
             except MarketDataClientError as exc:
-                succeeded, failure, count = False, _safe_market_data_error(exc), 0
+                result = _failure_result(
+                    _safe_market_data_error(exc),
+                    retryable=exc.retryable,
+                )
             except Exception:
-                succeeded, failure, count = False, "market data client failed", 0
+                result = _failure_result("market data client failed", retryable=False)
 
-            if succeeded:
-                print(f"Security bootstrap completed: {count} securities synchronized.")
+            if result.status is BootstrapAttemptStatus.SUCCESS:
+                print(
+                    f"Security bootstrap completed: {result.count} securities synchronized."
+                )
                 exit_code = 0
                 break
 
-            print(f"Security bootstrap attempt {attempt} failed: {failure}.", file=sys.stderr)
-            if not args.retry_until_success:
+            print(
+                f"Security bootstrap attempt {attempt} failed: {result.message}.",
+                file=sys.stderr,
+            )
+            if (
+                not args.retry_until_success
+                or result.status is not BootstrapAttemptStatus.RETRYABLE_FAILURE
+            ):
                 break
             try:
                 await sleep(args.retry_interval_seconds)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 print(
                     "Security bootstrap failed: retry delay could not be completed.",
@@ -189,6 +254,8 @@ async def run_security_bootstrap(
         if client is not None:
             try:
                 await _close_market_data_client(client)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 print(
                     "Security bootstrap failed while closing the market data client.",

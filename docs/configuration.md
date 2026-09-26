@@ -60,7 +60,7 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | --- | --- | --- |
 | `MARKET_DATA_PROVIDER` | `tdx` | provider 注册表名称；当前只注册 `tdx` |
 | `PROVIDER_TIMEOUT_SECONDS` | `5` | provider 适配器操作超时 |
-| `INTERNAL_API_TOKEN` | Compose 必填；生产环境必填 | 保护两个同步写入接口的共享 token |
+| `INTERNAL_API_TOKEN` | Compose 必填；生产环境必填 | 保护两个同步写入接口的共享 token；Compose 注入行情服务、后端任务和 `security-bootstrap`，不注入 frontend |
 | `TDX_SERVERS` | `119.147.212.81:7709,101.227.73.20:7709` | 逗号分隔或 JSON 数组的 TDX host:port 列表 |
 | `TDX_SERVER_LIST` | `TDX_SERVERS` 的别名 | TDX 服务器列表别名 |
 | `TDX_CONNECT_TIMEOUT_SECONDS` | `5` | 单个 TDX 连接超时 |
@@ -72,6 +72,15 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 Compose 当前只把 `MARKET_DATA_PROVIDER`、`PROVIDER_TIMEOUT_SECONDS` 和 `INTERNAL_API_TOKEN` 显式传入行情服务；TDX 细化变量在直接运行服务时生效。若需要在 Compose 中覆盖 TDX 细化参数，应在 Compose 服务环境中显式添加它们。
 
 行情服务还识别 `INTERNAL_SYNC_TOKEN` 和 `MARKET_DATA_INTERNAL_TOKEN` 作为 `INTERNAL_API_TOKEN` 的别名。生产环境若缺少内部 token，服务启动校验会失败。
+
+## 证券主数据 bootstrap
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` | `30` | Compose 中 `security-bootstrap` 在可重试失败之间等待的秒数；必须为正数 |
+| `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` | `10` | Compose 中 `security-bootstrap` 每次行情服务请求的超时秒数；必须为正数 |
+
+Compose 会创建一个 `security-bootstrap` 一次性任务。它等待 `market-data-service` 健康后，使用 `INTERNAL_API_TOKEN` 执行 `bootstrap-securities --retry-until-success`；网络/超时、HTTP `408`/`429`/`5xx`、HTTP 200 错误 envelope 中稳定的 `PROVIDER_TIMEOUT`/`PROVIDER_UNAVAILABLE`（包括同步摘要 item 的 `error.code`）和空同步结果会按间隔持续重试，协议错误、其他 `4xx`、业务/鉴权/验证失败、非 provider 的部分失败和意外错误会立即以非零退出。该任务设置 `restart: "no"`，不阻塞 backend 启动；需要手工重跑时执行 `docker compose run --rm security-bootstrap`。上述两个变量只影响该一次性任务，不会传给 frontend。
 
 ## 前端
 
