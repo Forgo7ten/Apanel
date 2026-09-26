@@ -2,9 +2,10 @@ import type { IndicatorState } from "@/api/types";
 
 import { StateTag, stateToneFromLevel } from "@/components/ui/StateTag";
 
-import { formatMetricValue, getDirection, isRecord } from "./indicator-utils";
+import { getColumnFields } from "@/lib/indicator-contract.mjs";
 
-const fieldOrder = ["upper", "middle", "lower", "ma5", "ma10", "diff", "dea", "histogram", "k", "d", "j"];
+import { formatMetricValue, getDirection, getFieldValue } from "./indicator-utils";
+
 const fieldLabels: Record<string, string> = {
   upper: "Upper",
   middle: "Middle",
@@ -23,22 +24,8 @@ function getFieldLabel(key: string): string {
   return fieldLabels[key.toLowerCase()] ?? key;
 }
 
-function getFields(value: unknown): Array<[string, unknown]> {
-  if (!isRecord(value)) {
-    return [];
-  }
-
-  const keys = Object.keys(value).filter((key) => !["state", "status", "states", "title", "label"].includes(key));
-  keys.sort((left, right) => {
-    const leftIndex = fieldOrder.indexOf(left.toLowerCase());
-    const rightIndex = fieldOrder.indexOf(right.toLowerCase());
-    return (leftIndex < 0 ? fieldOrder.length : leftIndex) - (rightIndex < 0 ? fieldOrder.length : rightIndex);
-  });
-  return keys.map((key) => [key, value[key]]);
-}
-
 export function CompositeCell({ value, states = [] }: { value: unknown; states?: IndicatorState[] }) {
-  const fields = getFields(value);
+  const fields = getColumnFields(value);
   const displayStates = states.slice(0, 2);
 
   if (fields.length === 0) {
@@ -48,18 +35,29 @@ export function CompositeCell({ value, states = [] }: { value: unknown; states?:
   return (
     <div className="min-w-[150px] space-y-1 py-1">
       <div className="space-y-0.5">
-        {fields.slice(0, 4).map(([key, fieldValue]) => {
+        {fields.map(([key, fieldValue]) => {
           const direction = getDirection(fieldValue);
+          const currentValue = getFieldValue(fieldValue, "value");
+          const previousValue = getFieldValue(fieldValue, "previous_value");
+          const delta = getFieldValue(fieldValue, "delta");
           return (
-            <div key={key} className="flex items-center justify-between gap-3 text-xs">
-              <span className="text-muted">{getFieldLabel(key)}</span>
-              <span className="tabular-nums text-secondary">
-                {formatMetricValue(fieldValue)}
-                {direction && direction !== "FLAT" ? (
-                  <span className={direction === "UP" ? "ml-1 text-positive" : "ml-1 text-negative"} aria-label={direction === "UP" ? "上升" : "下降"}>
-                    {direction === "UP" ? "↑" : "↓"}
-                  </span>
-                ) : null}
+            <div key={key} className="flex items-start justify-between gap-3 text-xs">
+              <span className="pt-0.5 text-muted">{getFieldLabel(key)}</span>
+              <span className="text-right tabular-nums text-secondary">
+                <span className="block">
+                  {formatMetricValue(currentValue)}
+                  {direction ? (
+                    <span
+                      className={direction === "UP" ? "ml-1 text-positive" : direction === "DOWN" ? "ml-1 text-negative" : "ml-1 text-muted"}
+                      aria-label={direction === "UP" ? "上升" : direction === "DOWN" ? "下降" : "持平"}
+                    >
+                      {direction === "UP" ? "↑" : direction === "DOWN" ? "↓" : "→"}
+                    </span>
+                  ) : null}
+                </span>
+                <span className="block text-[10px] text-muted">
+                  前 {formatMetricValue(previousValue)} · Δ {formatMetricValue(delta)}
+                </span>
               </span>
             </div>
           );

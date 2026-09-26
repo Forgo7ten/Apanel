@@ -8,6 +8,7 @@ import type { Identifier, IndicatorViewMode } from "@/api/types";
 import { isApiError } from "@/lib/api-errors";
 import {
   getDefaultIndicatorParameters,
+  getIndicatorFieldOptions,
   toCreateColumnPayload,
   WATCH_INDICATOR_OPTIONS,
 } from "@/lib/watch-contract.mjs";
@@ -84,15 +85,21 @@ export function AddColumnDialog({
   const [indicatorType, setIndicatorType] = useState("MA");
   const [viewMode, setViewMode] = useState<IndicatorViewMode>("COMPOSITE");
   const [parameters, setParameters] = useState(() => toFormParameters("MA"));
+  const [field, setField] = useState("");
   const fields = useMemo(() => getParameterFields(indicatorType), [indicatorType]);
+  const fieldOptions = useMemo(() => getIndicatorFieldOptions(indicatorType), [indicatorType]);
+  const requiresField = (viewMode === "NUMBER" || viewMode === "DELTA") && fieldOptions.length > 0;
+  const fieldError = requiresField && field.length === 0 ? "NUMBER/DELTA 模式需要选择明确字段。" : null;
   const createMutation = useMutation({
     mutationFn: () => {
+      if (fieldError) throw new Error(fieldError);
+      const numericParameters = toNumericParameters(parameters);
       const payload = toCreateColumnPayload({
         indicatorType,
         viewMode,
-        parameters: toNumericParameters(parameters),
+        parameters: { ...numericParameters, ...(field ? { field } : {}) },
       });
-      if (Object.values(payload.parameters).some((value) => !Number.isFinite(value as number) || Number(value) <= 0)) {
+      if (Object.values(numericParameters).some((value) => !Number.isFinite(value) || value <= 0)) {
         throw new Error("指标参数必须是正数。 ");
       }
       return createWatchTableColumn(tableId, payload);
@@ -134,6 +141,7 @@ export function AddColumnDialog({
               onChange={(event) => {
                 setIndicatorType(event.target.value);
                 setParameters(toFormParameters(event.target.value));
+                setField("");
               }}
               className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
             >
@@ -144,7 +152,11 @@ export function AddColumnDialog({
             展示模式
             <select
               value={viewMode}
-              onChange={(event) => setViewMode(event.target.value as IndicatorViewMode)}
+              onChange={(event) => {
+                const nextMode = event.target.value as IndicatorViewMode;
+                setViewMode(nextMode);
+                if (nextMode === "COMPOSITE") setField("");
+              }}
               className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
             >
               {VIEW_MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
@@ -174,11 +186,27 @@ export function AddColumnDialog({
           <p className="mt-4 rounded-panel border border-line/80 bg-card/40 px-3 py-2 text-xs text-muted">该指标不需要额外参数。</p>
         )}
 
+        {fieldOptions.length > 0 && viewMode !== "COMPOSITE" ? (
+          <label className="mt-4 block text-xs font-medium text-secondary">
+            字段
+            <select
+              value={field}
+              onChange={(event) => setField(event.target.value)}
+              className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
+              aria-label="指标字段"
+            >
+              <option value="">请选择字段</option>
+              {fieldOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+        ) : null}
+
+        {fieldError ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{fieldError}</p> : null}
         {errorMessage ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{errorMessage}</p> : null}
 
         <div className="mt-5 flex justify-end gap-2">
           <button type="button" onClick={onClose} disabled={createMutation.isPending} className="rounded-panel border border-line bg-card px-3 py-2 text-xs font-medium text-secondary hover:text-primary disabled:opacity-40">取消</button>
-          <button type="button" onClick={() => createMutation.mutate()} disabled={createMutation.isPending} className="rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50">
+          <button type="button" onClick={() => createMutation.mutate()} disabled={createMutation.isPending || Boolean(fieldError)} className="rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50">
             {createMutation.isPending ? "保存中…" : "添加指标列"}
           </button>
         </div>

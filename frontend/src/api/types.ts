@@ -2,6 +2,58 @@ export type Identifier = number | string;
 
 export type IndicatorViewMode = "NUMBER" | "DELTA" | "STATUS" | "COMPOSITE";
 
+export type IndicatorParameterValue = string | number | boolean | null | string[] | number[];
+
+export type IndicatorParameters = Record<string, IndicatorParameterValue>;
+
+export type IndicatorScalarValue = number | string | null;
+
+export type IndicatorDirection = "UP" | "DOWN" | "FLAT" | string;
+
+export type IndicatorFieldValue = {
+  value: IndicatorScalarValue;
+  previous_value: IndicatorScalarValue;
+  delta: IndicatorScalarValue;
+  direction: IndicatorDirection;
+};
+
+type IndicatorColumnValueMetadata = {
+  column_id: Identifier;
+  indicator_type: string;
+  parameters: IndicatorParameters;
+  available: boolean;
+  error_code?: string;
+};
+
+export type ScalarIndicatorColumnValue = IndicatorColumnValueMetadata & {
+  view_mode: "NUMBER" | "DELTA";
+  value: IndicatorScalarValue;
+  previous_value: IndicatorScalarValue;
+  delta: IndicatorScalarValue;
+  direction: IndicatorDirection;
+};
+
+export type CompositeIndicatorColumnValue = IndicatorColumnValueMetadata & {
+  view_mode: "COMPOSITE";
+  fields: Record<string, IndicatorFieldValue>;
+  value?: IndicatorScalarValue;
+  previous_value?: IndicatorScalarValue;
+  delta?: IndicatorScalarValue;
+  direction?: IndicatorDirection;
+};
+
+export type StatusIndicatorColumnValue = IndicatorColumnValueMetadata & {
+  view_mode: "STATUS";
+  value?: IndicatorScalarValue;
+  status?: string | number | null;
+  state?: string | number | null;
+};
+
+export type IndicatorColumnValue =
+  | ScalarIndicatorColumnValue
+  | CompositeIndicatorColumnValue
+  | StatusIndicatorColumnValue;
+
 export type Security = {
   id?: Identifier;
   security_id?: Identifier;
@@ -26,7 +78,7 @@ export type WatchTableColumn = {
   title?: string;
   label?: string;
   view_mode: IndicatorViewMode;
-  parameters?: Record<string, string | number | boolean>;
+  parameters?: IndicatorParameters;
   hidden?: boolean;
   visible?: boolean;
   order?: number;
@@ -60,6 +112,7 @@ export type WatchTableStock = {
   indicators?: Record<string, unknown>;
   indicator_values?: Record<string, unknown>;
   values?: Record<string, unknown>;
+  column_values?: Record<string, IndicatorColumnValue>;
   states?: IndicatorState[];
 };
 
@@ -101,7 +154,7 @@ export type AddStockInput = {
 export type CreateColumnInput = {
   column_type: "INDICATOR" | string;
   indicator_type: string;
-  parameters?: Record<string, string | number | boolean>;
+  parameters?: IndicatorParameters;
   view_mode: IndicatorViewMode;
 };
 
@@ -112,7 +165,7 @@ export type UpdateColumnInput = Partial<{
   order: number;
   width: number;
   view_mode: IndicatorViewMode;
-  parameters: Record<string, string | number | boolean>;
+  parameters: IndicatorParameters;
 }>;
 
 export type AlertConditionType = "STATE" | "VALUE";
@@ -167,8 +220,6 @@ export type NotificationRecord = {
 };
 
 export type AdjustmentType = "qfq" | "none";
-
-export type IndicatorParameterValue = string | number | boolean;
 
 export type IndicatorSettings = {
   defaults?: string[];

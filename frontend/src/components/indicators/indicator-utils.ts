@@ -1,4 +1,8 @@
 import type { IndicatorState, WatchTableColumn, WatchTableStock } from "@/api/types";
+import {
+  getColumnFieldValue,
+  getColumnValue,
+} from "@/lib/indicator-contract.mjs";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -14,6 +18,12 @@ export function getDisplayNumber(value: unknown): number | string | null {
   }
 
   return null;
+}
+
+export function getPreviousValue(value: unknown): number | string | null {
+  if (!isRecord(value)) return null;
+  const previous = getColumnFieldValue(value, "previous_value");
+  return typeof previous === "number" || typeof previous === "string" ? previous : null;
 }
 
 export function formatMetricValue(value: unknown): string {
@@ -61,22 +71,11 @@ export function getDirection(value: unknown): "UP" | "DOWN" | "FLAT" | null {
 }
 
 export function getIndicatorValue(stock: WatchTableStock, column: WatchTableColumn): unknown {
-  const keys = [column.key, column.indicator_type, column.type, column.id === undefined ? undefined : String(column.id)].filter(
-    (key): key is string => typeof key === "string" && key.length > 0,
-  );
-  const sources = [stock.indicators, stock.indicator_values, stock.values];
+  return getColumnValue(stock, column);
+}
 
-  for (const source of sources) {
-    if (!source) continue;
-
-    for (const key of keys) {
-      if (source[key] !== undefined) {
-        return source[key];
-      }
-    }
-  }
-
-  return undefined;
+export function getFieldValue(value: unknown, key: "value" | "previous_value" | "delta" | "direction"): unknown {
+  return getColumnFieldValue(value, key);
 }
 
 export function getColumnTitle(column: WatchTableColumn): string {

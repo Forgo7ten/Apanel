@@ -59,6 +59,24 @@ const DEFAULT_INDICATOR_PARAMETERS = {
   DIVIDEND_YIELD: {},
 };
 
+const INDICATOR_FIELD_OPTIONS = {
+  BOLL: [
+    { value: "upper", label: "Upper 上轨" },
+    { value: "middle", label: "Middle 中轨" },
+    { value: "lower", label: "Lower 下轨" },
+  ],
+  KDJ: [
+    { value: "k", label: "K" },
+    { value: "d", label: "D" },
+    { value: "j", label: "J" },
+  ],
+  MACD: [
+    { value: "diff", label: "DIFF" },
+    { value: "dea", label: "DEA" },
+    { value: "histogram", label: "Histogram 柱" },
+  ],
+};
+
 function normalizeIndicatorType(value) {
   const normalized = typeof value === "string" ? value.trim().toUpperCase().replace(/[- ]/g, "_") : "";
   if (normalized === "SMA") return "MA";
@@ -78,6 +96,16 @@ export function getDefaultIndicatorParameters(indicatorType) {
 }
 
 /**
+ * Return the explicit scalar fields available when a composite indicator is
+ * rendered as NUMBER or DELTA.  The values are the backend's canonical
+ * parameter/field vocabulary, not display-only aliases.
+ */
+export function getIndicatorFieldOptions(indicatorType) {
+  const type = normalizeIndicatorType(indicatorType);
+  return (INDICATOR_FIELD_OPTIONS[type] ?? []).map((option) => ({ ...option }));
+}
+
+/**
  * Build the exact add-column request accepted by the watch-table API.
  */
 export function toCreateColumnPayload({ indicatorType, viewMode = "COMPOSITE", parameters }) {
@@ -91,11 +119,18 @@ export function toCreateColumnPayload({ indicatorType, viewMode = "COMPOSITE", p
     delete nextParameters.stddev;
   }
 
+  const normalizedViewMode = typeof viewMode === "string" ? viewMode.toUpperCase() : "COMPOSITE";
+  if (normalizedViewMode === "COMPOSITE") {
+    delete nextParameters.field;
+  } else if (typeof nextParameters.field === "string") {
+    nextParameters.field = nextParameters.field.trim().toLowerCase();
+  }
+
   return {
     column_type: "INDICATOR",
     indicator_type: normalizedType,
     parameters: nextParameters,
-    view_mode: typeof viewMode === "string" ? viewMode.toUpperCase() : "COMPOSITE",
+    view_mode: normalizedViewMode,
   };
 }
 

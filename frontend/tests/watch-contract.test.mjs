@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   getDefaultIndicatorParameters,
+  getIndicatorFieldOptions,
   getSecurityIdentifier,
   toAddStockPayload,
   toCreateColumnPayload,
@@ -49,6 +50,34 @@ test("column payload preserves selected mode and strict indicator parameters", (
       view_mode: "NUMBER",
     },
   );
+  assert.deepEqual(
+    toCreateColumnPayload({
+      indicatorType: "BOLL",
+      viewMode: "NUMBER",
+      parameters: { period: 20, multiplier: 2, field: "upper" },
+    }),
+    {
+      column_type: "INDICATOR",
+      indicator_type: "BOLL",
+      parameters: { period: 20, multiplier: 2, field: "upper" },
+      view_mode: "NUMBER",
+    },
+  );
+  assert.deepEqual(
+    toCreateColumnPayload({
+      indicatorType: "MACD",
+      viewMode: "COMPOSITE",
+      parameters: { fast_period: 12, slow_period: 26, signal_period: 9, field: "diff" },
+    }).parameters,
+    { fast_period: 12, slow_period: 26, signal_period: 9 },
+  );
+});
+
+test("composite indicator field options use the canonical backend vocabulary", () => {
+  assert.deepEqual(getIndicatorFieldOptions("BOLL").map((option) => option.value), ["upper", "middle", "lower"]);
+  assert.deepEqual(getIndicatorFieldOptions("KDJ").map((option) => option.value), ["k", "d", "j"]);
+  assert.deepEqual(getIndicatorFieldOptions("MACD").map((option) => option.value), ["diff", "dea", "histogram"]);
+  assert.deepEqual(getIndicatorFieldOptions("MA"), []);
 });
 
 test("column order payload only contains persisted dynamic column ids", () => {
