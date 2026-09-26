@@ -14,6 +14,7 @@ from app.domain.market_data import (
     SecurityType,
     UnknownAdjustmentError,
     UnknownMarketError,
+    infer_market,
     normalize_adjustment,
     normalize_symbol,
 )
@@ -49,6 +50,12 @@ def test_symbol_and_enum_inputs_are_rejected_without_silent_fallback() -> None:
 
     with pytest.raises(UnknownAdjustmentError):
         normalize_adjustment("hfq")
+
+
+def test_bare_bj_and_sh_b_share_prefixes_are_not_ambiguous() -> None:
+    assert infer_market("830001") is Market.BJ
+    assert infer_market("920001") is Market.BJ
+    assert infer_market("900001") is Market.SH
 
 
 def test_daily_bar_rejects_invalid_ohlc_and_negative_volume() -> None:

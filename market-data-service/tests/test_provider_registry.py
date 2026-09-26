@@ -63,12 +63,14 @@ def test_settings_exposes_provider_and_timeout_selection() -> None:
         provider_timeout_seconds=1.5,
         tdx_servers="first.test:7709,second.test:7709",
         tdx_retry_attempts=2,
+        tdx_symbol_timeout_seconds=42,
     )
 
     assert settings.market_data_provider == "tdx"
     assert settings.provider_timeout_seconds == 1.5
     assert settings.tdx_servers == ("first.test:7709", "second.test:7709")
     assert settings.tdx_retry_attempts == 2
+    assert settings.tdx_symbol_timeout_seconds == 42
 
 
 def test_default_tdx_registry_builds_configured_real_client_without_connecting() -> None:
@@ -84,6 +86,7 @@ def test_default_tdx_registry_builds_configured_real_client_without_connecting()
     assert isinstance(provider._client, PytdxClient)
     assert provider._client.servers[0].host == "first.test"
     assert provider._client.servers[0].port == 7709
+    assert provider._symbol_timeout_seconds == 60
 
 
 def test_close_provider_runs_blocking_client_cleanup_off_loop() -> None:

@@ -45,7 +45,8 @@ docker compose run --rm security-bootstrap
 ```
 
 可在 `.env` 中通过 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 和
-`SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 调整请求超时与重试间隔。
+`SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 调整请求超时与重试间隔；默认
+bootstrap 请求超时为 90 秒，高于行情服务证券列表的 60 秒超时。
 
 ## 检查健康状态
 

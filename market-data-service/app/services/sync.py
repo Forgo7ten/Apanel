@@ -85,7 +85,7 @@ class SyncSummary:
 
 
 class SecuritySyncService:
-    """Synchronize security metadata with batch-first failure isolation."""
+    """Synchronize security metadata as one validated, atomic batch."""
 
     def __init__(self, *, provider: MarketDataProvider, repository: SecurityRepository) -> None:
         self._provider = provider
@@ -95,64 +95,51 @@ class SecuritySyncService:
         try:
             raw_records = tuple(await self._provider.get_symbols())
         except Exception as exc:
-            return SyncSummary(
-                operation="security",
-                items=(
-                    SyncItemResult(
-                        symbol="*",
-                        status="failed",
-                        error=_sync_error(exc),
-                    ),
-                ),
-            )
+            return _security_failure(_sync_error(exc))
+
+        # An empty provider result is deliberately represented by an empty
+        # summary.  The bootstrap command treats that stable shape as a
+        # retryable "no securities" condition, while no repository write is
+        # attempted here.
+        if not raw_records:
+            return SyncSummary(operation="security", items=())
 
         records: list[Security] = []
-        results: dict[str, SyncItemResult] = {}
-        for raw_record in raw_records:
-            try:
+        seen: set[str] = set()
+        try:
+            for raw_record in raw_records:
                 record = _require_security(raw_record)
-                if record.symbol in results:
-                    continue
+                if record.symbol in seen:
+                    raise InvalidMarketDataError(
+                        f"provider returned a duplicate security symbol: {record.symbol}"
+                    )
+                seen.add(record.symbol)
                 records.append(record)
-                results[record.symbol] = SyncItemResult(
+        except Exception as exc:
+            return _security_failure(_sync_error(exc))
+
+        try:
+            # The repository owns one transaction for this complete batch.  Do
+            # not retry by symbol: that would turn a source-wide failure into
+            # partial database state and make bootstrap success ambiguous.
+            await self._repository.upsert_many(tuple(records))
+        except Exception as exc:
+            return _security_failure(
+                SyncError(code="PERSISTENCE_ERROR", message=_safe_message(exc))
+            )
+
+        return SyncSummary(
+            operation="security",
+            items=tuple(
+                SyncItemResult(
                     symbol=record.symbol,
                     status="success",
                     fetched=1,
+                    persisted=1,
                 )
-            except Exception as exc:
-                symbol = _best_effort_symbol(raw_record)
-                results.setdefault(
-                    symbol,
-                    SyncItemResult(
-                        symbol=symbol,
-                        status="failed",
-                        error=_sync_error(exc),
-                    ),
-                )
-
-        if records:
-            persisted = await _persist_with_isolation(
-                records,
-                self._repository.upsert_many,
-            )
-            for symbol, error in persisted.items():
-                previous = results[symbol]
-                results[symbol] = (
-                    SyncItemResult(
-                        symbol=symbol,
-                        status="success",
-                        fetched=previous.fetched,
-                        persisted=1,
-                    )
-                    if error is None
-                    else SyncItemResult(
-                        symbol=symbol,
-                        status="failed",
-                        fetched=previous.fetched,
-                        error=error,
-                    )
-                )
-        return SyncSummary(operation="security", items=tuple(results.values()))
+                for record in records
+            ),
+        )
 
 
 class DailyBarSyncService:
@@ -456,6 +443,21 @@ def _best_effort_symbol(value: object) -> str:
         if isinstance(candidate, str):
             return candidate
     return "<invalid>"
+
+
+def _security_failure(error: SyncError) -> SyncSummary:
+    """Return one provider-wide failure without claiming any symbol persisted."""
+
+    return SyncSummary(
+        operation="security",
+        items=(
+            SyncItemResult(
+                symbol="*",
+                status="failed",
+                error=error,
+            ),
+        ),
+    )
 
 
 def _sync_error(exc: Exception) -> SyncError:

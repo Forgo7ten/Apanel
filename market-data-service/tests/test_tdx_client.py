@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.domain.market_data import Adjustment, Market
+from app.domain.market_data import Adjustment
 from app.providers.errors import (
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -20,6 +20,8 @@ class FakeLowLevelClient:
         self.close_calls = 0
         self.quote_calls: list[list[tuple[int, str]]] = []
         self.bar_calls: list[tuple[int, int, str, int, int]] = []
+        self.security_count_calls: list[int] = []
+        self.security_list_calls: list[tuple[int, int]] = []
 
     def connect(self, host: str, port: int, *, time_out: float):
         self.connect_calls.append((host, port, time_out))
@@ -31,14 +33,18 @@ class FakeLowLevelClient:
         self.close_calls += 1
 
     def get_security_count(self, market: int) -> int:
-        return {0: 2, 1: 1, 2: 1}[market]
+        self.security_count_calls.append(market)
+        return {0: 3, 1: 1}[market]
 
     def get_security_list(self, market: int, start: int):
+        self.security_list_calls.append((market, start))
         pages = {
-            (0, 0): [{"code": "000001", "name": "平安银行"}],
-            (0, 1): [{"code": "159915", "name": "创业板ETF"}],
+            (0, 0): [
+                {"code": "000001", "name": "平安银行"},
+                {"code": "830001", "name": "北证样本"},
+            ],
+            (0, 2): [{"code": "159915", "name": "创业板ETF"}],
             (1, 0): [{"code": "600519", "name": "贵州茅台"}],
-            (2, 0): [{"code": "830001", "name": "北证样本"}],
         }
         return pages.get((market, start), [])
 
@@ -139,7 +145,7 @@ def test_client_reports_timeout_after_all_retry_rounds() -> None:
     assert all(item.close_calls == 1 for item in clients)
 
 
-def test_client_maps_all_supported_markets_and_pages_symbols() -> None:
+def test_client_scans_only_standard_lists_and_preserves_raw_records() -> None:
     low_level = FakeLowLevelClient()
     client = PytdxClient(
         ("good.test:7709",),
@@ -149,12 +155,172 @@ def test_client_maps_all_supported_markets_and_pages_symbols() -> None:
 
     records = client.fetch_symbols()
 
-    assert [(record["code"], record["market"]) for record in records] == [
-        ("000001", Market.SZ),
-        ("159915", Market.SZ),
-        ("600519", Market.SH),
-        ("830001", Market.BJ),
+    assert [record["code"] for record in records] == [
+        "000001",
+        "830001",
+        "159915",
+        "600519",
     ]
+    assert all("market" not in record for record in records)
+    assert low_level.security_count_calls == [0, 1]
+    assert all(market in {0, 1} for market, _ in low_level.security_list_calls)
+
+
+def test_client_fails_closed_when_counted_list_ends_before_count() -> None:
+    class EarlyEmpty(FakeLowLevelClient):
+        def get_security_count(self, market: int) -> int:
+            self.security_count_calls.append(market)
+            return {0: 2, 1: 1}[market]
+
+        def get_security_list(self, market: int, start: int):
+            self.security_list_calls.append((market, start))
+            if market == 0 and start == 0:
+                return [{"code": "000001", "name": "平安银行"}]
+            if market == 1 and start == 0:
+                return [{"code": "600519", "name": "贵州茅台"}]
+            return []
+
+    low_level = EarlyEmpty()
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=lambda: low_level,
+    )
+
+    with pytest.raises(ProviderUnavailableError, match="symbols"):
+        client.fetch_symbols()
+
+
+def test_bj_single_security_queries_prefer_market_zero_and_bound_fallback_to_two() -> None:
+    class RoutingClient(FakeLowLevelClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.xdxr_calls: list[tuple[int, str]] = []
+
+        def get_security_quotes(self, symbols):
+            self.quote_calls.append(symbols)
+            if symbols[0][0] == 0:
+                return []
+            return [{"code": symbols[0][1], "price": 10, "last_close": 9}]
+
+        def get_security_bars(self, category, market, code, start, count):
+            self.bar_calls.append((category, market, code, start, count))
+            if market == 0:
+                return []
+            return [
+                {
+                    "code": code,
+                    "datetime": "2026-01-01 15:00:00",
+                    "open": 9,
+                    "high": 11,
+                    "low": 8,
+                    "close": 10,
+                    "vol": 10,
+                }
+            ]
+
+        def get_xdxr_info(self, market, code):
+            self.xdxr_calls.append((market, code))
+            if market == 0:
+                return []
+            return [{"year": 2026, "month": 1, "day": 1, "fenhong": "1"}]
+
+    low_level = RoutingClient()
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=lambda: low_level,
+    )
+
+    quote = client.fetch_quote("BJ.830001")
+    bars = client.fetch_daily_bars(
+        "BJ.830001", date(2026, 1, 1), date(2026, 1, 1), Adjustment.NONE
+    )
+    dividends = client.fetch_dividends("BJ.830001")
+
+    assert quote["symbol"] == "830001"
+    assert bars and bars[0]["symbol"] == "830001"
+    assert dividends[0]["cash_amount"] == "1"
+    assert [call[0][0] for call in low_level.quote_calls] == [0, 2]
+    assert [call[1] for call in low_level.bar_calls] == [0, 2]
+    assert [market for market, _ in low_level.xdxr_calls] == [0, 2]
+
+
+@pytest.mark.parametrize("action_response", [None, []])
+def test_bj_qfq_accepts_empty_corporate_actions_after_bounded_fallback(action_response) -> None:
+    class NoBjCorporateActions(FakeLowLevelClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.xdxr_calls: list[tuple[int, str]] = []
+
+        def get_xdxr_info(self, market, code):
+            self.xdxr_calls.append((market, code))
+            return action_response
+
+        def get_security_bars(self, category, market, code, start, count):
+            self.bar_calls.append((category, market, code, start, count))
+            return [
+                {
+                    "code": code,
+                    "datetime": "2026-01-01 15:00:00",
+                    "open": 9,
+                    "high": 11,
+                    "low": 8,
+                    "close": 10,
+                    "vol": 10,
+                }
+            ]
+
+    low_level = NoBjCorporateActions()
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=lambda: low_level,
+    )
+
+    records = client.fetch_daily_bars(
+        "BJ.830001", date(2026, 1, 1), date(2026, 1, 1), Adjustment.QFQ
+    )
+
+    assert records and records[0]["adjustment"] == "qfq"
+    assert [market for market, _ in low_level.xdxr_calls] == [0, 2]
+
+
+def test_attribute_error_inside_bj_method_does_not_trigger_market_fallback() -> None:
+    class BrokenQuoteClient(FakeLowLevelClient):
+        def get_security_quotes(self, symbols):
+            self.quote_calls.append(symbols)
+            raise AttributeError("bug inside get_security_quotes")
+
+    low_level = BrokenQuoteClient()
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=lambda: low_level,
+    )
+
+    with pytest.raises(ProviderUnavailableError, match="quote"):
+        client.fetch_quote("BJ.830001")
+
+    assert [call[0][0] for call in low_level.quote_calls] == [0]
+
+
+def test_missing_bj_quote_method_is_classified_before_querying() -> None:
+    class NoQuoteMethod:
+        def connect(self, host, port, *, time_out):
+            return self
+
+        def close(self):
+            return None
+
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=NoQuoteMethod,
+    )
+
+    with pytest.raises(ProviderUnsupportedError, match="get_security_quotes"):
+        client.fetch_quote("BJ.830001")
 
 
 def test_client_pages_filters_sorts_deduplicates_and_marks_raw_bars_none() -> None:
@@ -231,6 +397,29 @@ def test_qfq_is_available_by_default_when_tdx_exposes_corporate_actions() -> Non
     assert [record["close"] for record in none] == [10, 11]
     assert all(record["adjustment"] == "qfq" for record in qfq)
     assert all(record["adjustment"] == "none" for record in none)
+
+
+@pytest.mark.parametrize("action_response", [None, []])
+def test_qfq_accepts_a_security_without_corporate_actions(action_response) -> None:
+    class NoCorporateActions(FakeLowLevelClient):
+        def get_xdxr_info(self, market, code):
+            return action_response
+
+    low_level = NoCorporateActions()
+    client = PytdxClient(
+        ("good.test:7709",),
+        retry_attempts=0,
+        client_factory=lambda: low_level,
+    )
+
+    records = client.fetch_daily_bars(
+        "600519", date(2026, 1, 1), date(2026, 1, 2), Adjustment.QFQ
+    )
+    dividends = client.fetch_dividends("600519")
+
+    assert [record["close"] for record in records] == [10, 11]
+    assert all(record["adjustment"] == "qfq" for record in records)
+    assert not dividends
 
 
 def test_client_wraps_low_level_response_errors_and_closes_connection() -> None:

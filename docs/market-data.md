@@ -78,6 +78,7 @@ docker compose run --rm security-bootstrap
 
 重试间隔和 HTTP 超时可通过 `.env` 中的
 `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 与 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 调整。
+默认 bootstrap HTTP 超时为 90 秒，高于行情服务证券列表同步默认的 60 秒超时。
 内部 token 只注入 bootstrap 容器的环境变量，不会写入命令输出或日志。
 
 ### 日线

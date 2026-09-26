@@ -74,6 +74,7 @@ def _tdx_factory(
     *,
     client: Any = None,
     timeout_seconds: float = 5.0,
+    symbol_timeout_seconds: float = 60.0,
     servers: Any = None,
     connect_timeout_seconds: float | None = None,
     retry_attempts: int = 1,
@@ -93,7 +94,11 @@ def _tdx_factory(
         if servers is not None:
             client_kwargs["servers"] = servers
         client = PytdxClient(**client_kwargs)
-    return TDXProvider(client, timeout_seconds=timeout_seconds)
+    return TDXProvider(
+        client,
+        timeout_seconds=timeout_seconds,
+        symbol_timeout_seconds=symbol_timeout_seconds,
+    )
 
 
 DEFAULT_PROVIDER_REGISTRY = ProviderRegistry()
@@ -115,6 +120,7 @@ def create_provider(
         selected_settings = settings or get_settings()
         provider_name = selected_settings.market_data_provider
         kwargs.setdefault("timeout_seconds", selected_settings.provider_timeout_seconds)
+        kwargs.setdefault("symbol_timeout_seconds", selected_settings.tdx_symbol_timeout_seconds)
         if _provider_name(provider_name) == "tdx":
             kwargs.setdefault("servers", selected_settings.tdx_servers)
             kwargs.setdefault(
