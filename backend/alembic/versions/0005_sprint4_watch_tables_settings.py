@@ -6,7 +6,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "0005_sprint4_watch_tables_settings"
+revision: str = "0005_sprint4_watch_settings"
 down_revision: str | Sequence[str] | None = "0004_sprint3_indicator_state"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

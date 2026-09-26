@@ -8,6 +8,20 @@ from pathlib import Path
 from app.db.base import Base
 
 
+def test_all_alembic_revision_ids_fit_version_table_column() -> None:
+    versions_dir = Path(__file__).parents[1] / "alembic" / "versions"
+
+    for path in sorted(versions_dir.glob("*.py")):
+        spec = importlib.util.spec_from_file_location(f"apanel_{path.stem}", path)
+        assert spec is not None and spec.loader is not None
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+
+        assert len(migration.revision) <= 32, (
+            f"{path.name} revision exceeds alembic_version.version_num varchar(32)"
+        )
+
+
 def test_watch_migration_is_the_single_0005_head() -> None:
     path = (
         Path(__file__).parents[1]
@@ -20,7 +34,7 @@ def test_watch_migration_is_the_single_0005_head() -> None:
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
 
-    assert migration.revision == "0005_sprint4_watch_tables_settings"
+    assert migration.revision == "0005_sprint4_watch_settings"
     assert migration.down_revision == "0004_sprint3_indicator_state"
 
 
