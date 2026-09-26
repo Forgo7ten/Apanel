@@ -43,6 +43,21 @@ AKShare fallback 只负责证券主数据。报价、日线和现金分红始终
 不会注册为全局 `MARKET_DATA_PROVIDER` 替代物。配置见[配置参考](configuration.md)中的
 `SECURITY_MASTER_FALLBACK_PROVIDER`、`AKSHARE_SECURITY_TIMEOUT_SECONDS` 和最低数量设置。
 
+## 出站代理
+
+需要通过代理访问外部 provider 时，在根目录 `.env` 中设置专用于行情服务的变量：
+
+```dotenv
+MARKET_DATA_HTTP_PROXY=http://host.docker.internal:your-proxy-port
+MARKET_DATA_HTTPS_PROXY=http://host.docker.internal:your-proxy-port
+MARKET_DATA_ALL_PROXY=
+MARKET_DATA_NO_PROXY=
+```
+
+Compose 只会把它们映射为 `market-data-service` 的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`；PostgreSQL、Redis、backend、worker、scheduler 和前端不会收到这些代理变量。代理变量为空时不启用出站代理。`NO_PROXY` 会自动包含 `localhost`、`127.0.0.1` 以及 Compose 内部服务名 `postgres`、`redis`、`backend` 和 `market-data-service`，避免服务间请求绕行代理。
+
+Compose 为行情容器提供跨 Linux 的 `host.docker.internal`（`host-gateway`）解析。如果代理运行在宿主机，必须监听 Docker 可达的接口；仅监听宿主机 `127.0.0.1` 时，容器无法连接。代理 URL 中的用户名和密码属于敏感值，请仅保存在被 Git 忽略的 `.env` 中；行情服务不会将代理值写入应用日志。
+
 默认依赖为 `pytdx==1.72`。默认 TDX 节点是：
 
 ```text

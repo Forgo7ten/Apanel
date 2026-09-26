@@ -76,6 +76,21 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 
 Compose 会把上述 TDX 连接、failover、证券列表和日线分页变量显式传入行情服务。
 
+### 行情服务出站代理
+
+行情服务需要访问外部行情 provider 时，可以在根目录 `.env` 中为它单独配置代理：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MARKET_DATA_HTTP_PROXY` | 空 | 注入行情服务的 `HTTP_PROXY` |
+| `MARKET_DATA_HTTPS_PROXY` | 空 | 注入行情服务的 `HTTPS_PROXY` |
+| `MARKET_DATA_ALL_PROXY` | 空 | 注入行情服务的 `ALL_PROXY` |
+| `MARKET_DATA_NO_PROXY` | 空 | 额外的 `NO_PROXY` 主机；Compose 会始终追加 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-service` |
+
+这四个变量只会映射到 `market-data-service`，不会传给 PostgreSQL、Redis、backend 或其他容器。默认空值不会启用代理。若代理运行在 Docker 宿主机，Compose 会为行情服务添加跨 Linux 可用的 `host.docker.internal:host-gateway`；宿主代理必须监听 Docker 可达的接口（不能只监听宿主机的 `127.0.0.1`）。
+
+代理 URL 可能包含凭据。`.env` 不纳入版本库，应用日志不会打印这些值；不要把真实代理 URL、用户名或密码写入文档、命令行历史或共享的 `docker compose config` 输出。
+
 行情服务还识别 `INTERNAL_SYNC_TOKEN` 和 `MARKET_DATA_INTERNAL_TOKEN` 作为 `INTERNAL_API_TOKEN` 的别名。生产环境若缺少内部 token，服务启动校验会失败。
 
 ## 证券主数据 bootstrap

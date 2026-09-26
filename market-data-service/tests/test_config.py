@@ -91,3 +91,16 @@ def test_security_master_fallback_settings_are_configurable() -> None:
     assert settings.akshare_security_timeout_seconds == 17
     assert settings.akshare_min_stock_count == 12
     assert settings.akshare_min_etf_count == 3
+
+
+def test_proxy_environment_values_are_not_exposed_by_application_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_proxy = "http://proxy-user:proxy-password@proxy.internal:8123"
+    for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.setenv(variable, secret_proxy)
+
+    settings = Settings(_env_file=None)
+
+    assert secret_proxy not in repr(settings)
+    assert secret_proxy not in repr(settings.model_dump())

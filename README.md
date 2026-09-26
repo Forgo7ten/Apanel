@@ -53,6 +53,19 @@ docker compose up --build
 
 Compose 只把 Nginx 的 `${HTTP_PORT}` 发布到宿主机；后端和行情服务的 `8000`/`8001` 只在 Compose 网络中可见。
 
+### 为行情服务配置出站代理
+
+如果行情 provider 需要经由代理访问外网，只在 `.env` 中设置行情服务专用变量：
+
+```dotenv
+MARKET_DATA_HTTP_PROXY=http://host.docker.internal:your-proxy-port
+MARKET_DATA_HTTPS_PROXY=http://host.docker.internal:your-proxy-port
+MARKET_DATA_ALL_PROXY=
+MARKET_DATA_NO_PROXY=
+```
+
+这些变量只注入 `market-data-service`；默认留空时不会启用代理。Compose 会自动把 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-service` 加入 `NO_PROXY`，保证内部请求不经过外部代理。`host.docker.internal` 使用跨 Linux 的 `host-gateway` 映射；宿主代理必须监听 Docker 可达接口，不能只监听宿主机的 `127.0.0.1`。代理 URL 可能包含敏感凭据，请只保存在被 Git 忽略的 `.env` 中，应用日志不会打印这些值。
+
 ## 初始化管理员
 
 迁移完成且后端容器健康后，创建第一个管理员：

@@ -80,9 +80,15 @@ services:
       TDX_SYMBOL_MAX_PAGES: ${TDX_SYMBOL_MAX_PAGES:-100}
       TDX_BAR_PAGE_SIZE: ${TDX_BAR_PAGE_SIZE:-800}
       TDX_BAR_MAX_PAGES: ${TDX_BAR_MAX_PAGES:-64}
+      HTTP_PROXY: "${MARKET_DATA_HTTP_PROXY:-}"
+      HTTPS_PROXY: "${MARKET_DATA_HTTPS_PROXY:-}"
+      ALL_PROXY: "${MARKET_DATA_ALL_PROXY:-}"
+      NO_PROXY: "${MARKET_DATA_NO_PROXY:-localhost,127.0.0.1},postgres,redis,backend,market-data-service"
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
     expose:
       - "8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
