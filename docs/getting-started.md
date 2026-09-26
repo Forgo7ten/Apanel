@@ -25,7 +25,7 @@ docker compose up --build -d
 docker compose ps
 ```
 
-`migrate` 成功结束后，行情服务和后端才会继续启动。可以跟踪启动日志：
+`migrate` 成功结束后，行情数据中枢和后端才会继续启动。可以跟踪启动日志：
 
 ```bash
 docker compose logs -f backend
@@ -46,7 +46,7 @@ docker compose run --rm security-bootstrap
 
 可在 `.env` 中通过 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 和
 `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 调整请求超时与重试间隔；默认
-bootstrap 请求超时为 180 秒，覆盖行情服务 TDX 证券列表的 60 秒超时、AKShare
+bootstrap 请求超时为 180 秒，覆盖行情数据中枢 TDX 证券列表的 60 秒超时、AKShare
 完整批次的 90 秒超时和收尾开销。
 
 ## 检查健康状态
@@ -119,7 +119,7 @@ docker compose down -v
 
 ```bash
 docker compose logs migrate
-docker compose logs market-data-service
+docker compose logs market-data-hub
 docker compose logs backend
 ```
 

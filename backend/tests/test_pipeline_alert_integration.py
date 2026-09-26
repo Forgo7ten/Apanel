@@ -21,7 +21,7 @@ from app.tasks.contracts import PipelineConfigurationError, PipelineContext
 from app.tasks.pipeline import build_default_eod_steps
 
 
-class FakeMarketDataClient:
+class FakeMarketDataHubClientProtocol:
     async def sync_daily(self, **_kwargs):
         return {"ok": True}
 
@@ -103,7 +103,7 @@ async def pipeline_context(tmp_path) -> AsyncIterator[dict[str, object]]:
 def _default_steps(session_factory, provider):
     return build_default_eod_steps(
         session_factory=session_factory,
-        market_data_client=FakeMarketDataClient(),
+        market_data_client=FakeMarketDataHubClientProtocol(),
         notification_provider=provider,
     )
 

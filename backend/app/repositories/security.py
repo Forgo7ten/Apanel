@@ -33,7 +33,7 @@ from app.models import DailyBar, IndicatorSnapshot, IndicatorState, QuoteSnapsho
 _dividend_events_table = Base.metadata.tables.get("dividend_events")
 if _dividend_events_table is None:
     # The table is created by the market-data migration and owned by the
-    # market-data service.  The backend only needs this Core read projection;
+    # Market Data Hub.  The backend only needs this Core read projection;
     # deliberately do not add a second ORM model or a migration here.
     _dividend_events_table = Table(
         "dividend_events",
@@ -193,7 +193,7 @@ class SecurityRepository:
     ) -> list[DividendEventRecord]:
         """Return cash dividend events in chronological order.
 
-        ``dividend_events`` is maintained by the market-data service.  Using
+        ``dividend_events`` is maintained by the Market Data Hub.  Using
         a Core table projection keeps the backend read-only and avoids adding
         a competing ORM/Alembic definition for that shared table.
         """

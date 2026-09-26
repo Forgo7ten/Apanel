@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from celery import Task
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.clients.market_data_hub import MarketDataHubClient, MarketDataHubClientProtocol
 from app.core.config import Settings, get_settings
 from app.db.redis import close_redis_client, create_redis_client
 from app.db.session import create_engine, dispose_engine
@@ -21,7 +22,6 @@ from app.db.session import create_engine, dispose_engine
 from .celery_app import celery_app
 from .contracts import PipelineContext, PipelineError
 from .locks import RedisTaskLock
-from .market_data import HttpMarketDataClient, MarketDataClient
 from .pipeline import (
     EODPipeline,
     build_default_eod_steps,
@@ -97,7 +97,7 @@ async def execute_quote_refresh(
     redis_client: Any | None = None,
     lock: Any | None = None,
     session_factory: Any | None = None,
-    market_data_client: MarketDataClient | None = None,
+    market_data_client: MarketDataHubClientProtocol | None = None,
 ) -> dict[str, Any]:
     """Refresh quotes once under a non-blocking distributed lease."""
 
@@ -141,8 +141,8 @@ async def execute_quote_refresh(
         if not normalized_symbols:
             return {"status": "skipped", "reason": "no_symbols", "operation": "quote_refresh"}
         if client is None:
-            client = HttpMarketDataClient(
-                app_settings.market_data_service_url,
+            client = MarketDataHubClient(
+                app_settings.market_data_hub_url,
                 internal_api_token=app_settings.internal_api_token,
                 timeout_seconds=app_settings.market_data_request_timeout_seconds,
             )
@@ -178,7 +178,7 @@ async def execute_eod_pipeline(
     redis_client: Any | None = None,
     lock: Any | None = None,
     session_factory: Any | None = None,
-    market_data_client: MarketDataClient | None = None,
+    market_data_client: MarketDataHubClientProtocol | None = None,
     steps: tuple[Any, ...] | list[Any] | None = None,
     alert_runner: Any | None = None,
     notification_runner: Any | None = None,
@@ -241,8 +241,8 @@ async def execute_eod_pipeline(
             if session_factory is None:
                 engine, session_factory = _new_session_factory(app_settings)
             if client is None:
-                client = HttpMarketDataClient(
-                    app_settings.market_data_service_url,
+                client = MarketDataHubClient(
+                    app_settings.market_data_hub_url,
                     internal_api_token=app_settings.internal_api_token,
                     timeout_seconds=app_settings.market_data_request_timeout_seconds,
                 )

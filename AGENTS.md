@@ -162,21 +162,24 @@ All external dependencies must be abstracted.
 
 Never:
 
-    Backend → TDX directly
+    Backend → TDX / AKShare / external market source directly
 
-Use:
+Backend must use one internal boundary:
 
-    MarketDataProvider
+    Backend / Worker / Scheduler
 
     ↓
 
-    TDXProvider
+    Market Data Hub
 
-Future providers:
+All external market-data providers live inside `market-data-hub`. Provider contracts are capability-specific (security master, quote, daily bar, dividend) so a provider only implements the capabilities it owns.
 
--   AKShare
--   Tonghuashun
--   Other providers
+Current v1 providers:
+
+-   `eltdx` — primary TDX implementation for securities, quotes, daily bars and dividends
+-   `akshare` — security-master fallback only
+
+Future providers must be added to the Hub without adding external-provider abstractions to Backend.
 
 ------------------------------------------------------------------------
 
@@ -392,7 +395,7 @@ Expected services:
 
     backend
 
-    market-data-service
+    market-data-hub
 
     scheduler
 

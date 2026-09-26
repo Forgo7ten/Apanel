@@ -1,6 +1,6 @@
 # 开发指南
 
-仓库包含三个独立的应用目录：`backend`、`market-data-service` 和 `frontend`。两个 Python 项目都使用 `app` 作为包名，因此 Python 命令应在对应目录中运行，避免导入到另一套代码。
+仓库包含三个独立的应用目录：`backend`、`market-data-hub` 和 `frontend`。两个 Python 项目都使用 `app` 作为包名，因此 Python 命令应在对应目录中运行，避免导入到另一套代码。
 
 ## 后端
 
@@ -31,7 +31,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 行情服务同样需要 Python 3.12 或更高版本：
 
 ```bash
-cd market-data-service
+cd market-data-hub
 python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-dev.txt
@@ -88,7 +88,7 @@ docker compose exec backend alembic upgrade head
 ## 修改边界
 
 - HTTP controller 只做解析、依赖注入和响应映射；业务规则放在 service/domain 层。
-- 外部行情访问通过 `MarketDataProvider`，不要在 API controller 中直接调用 TDX client。
+- Backend 只调用 `MarketDataHubClient`；外部行情 Provider 只能存在于 `market-data-hub/app/providers/`，API controller 不直接调用 eltdx/AKShare。
 - 指标只接收标准化输入并返回 `IndicatorResult`；状态只接收 `IndicatorSnapshot`，不要在前端复制计算逻辑。
 - 用户身份来自后端当前会话和数据库角色，不接受前端提交的 `user_id` 作为权限依据。
 - 变更后优先运行受影响目录的 pytest 和 `ruff check .`，再运行前端相应脚本或 Compose 冒烟检查。
@@ -97,6 +97,6 @@ docker compose exec backend alembic upgrade head
 
 ```text
 backend/tests/                    认证、健康、指标和状态
-market-data-service/tests/        provider、domain、同步、持久化和 API
+market-data-hub/tests/        provider、domain、同步、持久化和 API
 frontend/tests/                   健康路由、认证逻辑和跨标签页协调
 ```
