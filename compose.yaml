@@ -276,7 +276,7 @@ services:
       - apanel
 
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.27.5-alpine
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-8080}:80"
@@ -288,7 +288,11 @@ services:
       frontend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1/health"]
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- http://127.0.0.1/api/health >/dev/null
+          && wget -qO- http://127.0.0.1/api/v1/health >/dev/null
       interval: 10s
       timeout: 5s
       retries: 5
