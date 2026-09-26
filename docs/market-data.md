@@ -60,6 +60,26 @@ HTTP 读取接口的 `adjust` 默认是 `qfq`，同步请求体的 `adjustment` 
 
 `POST /internal/sync/securities` 调用 provider 获取证券列表，先在 domain 层校验并去重，再通过 PostgreSQL upsert 写入 `securities`。同一批次中的坏记录会形成单项失败结果，其他记录继续处理。
 
+Compose 包含一个一次性 `security-bootstrap` 服务。执行 `docker compose up --build -d` 时，
+它会等待 `market-data-service` 健康后调用上述接口，并在 provider 暂时不可用时持续重试；
+后端、前端、worker 和 scheduler 不依赖该服务，因此行情 provider 故障不会阻塞 Web 启动。
+可用以下命令查看执行状态和日志：
+
+```bash
+docker compose ps security-bootstrap
+docker compose logs -f security-bootstrap
+```
+
+如果首次运行失败或需要手工补齐主数据，可在项目根目录重新执行：
+
+```bash
+docker compose run --rm security-bootstrap
+```
+
+重试间隔和 HTTP 超时可通过 `.env` 中的
+`SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 与 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 调整。
+内部 token 只注入 bootstrap 容器的环境变量，不会写入命令输出或日志。
+
 ### 日线
 
 `POST /internal/sync/daily` 对每个规范化后的证券执行：

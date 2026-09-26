@@ -96,6 +96,33 @@ services:
     networks:
       - apanel
 
+  security-bootstrap:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      APP_ENV: ${APP_ENV:?APP_ENV is required; copy .env.example to .env}
+      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
+    command:
+      [
+        "python",
+        "-m",
+        "app.cli",
+        "bootstrap-securities",
+        "--retry-until-success",
+        "--retry-interval-seconds",
+        "${SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS:-30}",
+        "--timeout-seconds",
+        "${SECURITY_BOOTSTRAP_TIMEOUT_SECONDS:-10}",
+      ]
+    depends_on:
+      market-data-service:
+        condition: service_healthy
+    networks:
+      - apanel
+
   backend:
     build:
       context: ./backend

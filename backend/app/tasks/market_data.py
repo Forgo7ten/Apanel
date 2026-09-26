@@ -16,6 +16,8 @@ class MarketDataClientError(RuntimeError):
 
 
 class MarketDataClient(Protocol):
+    async def sync_securities(self) -> Mapping[str, Any]: ...
+
     async def sync_daily(
         self,
         *,
@@ -56,6 +58,9 @@ class HttpMarketDataClient:
         self.timeout_seconds = float(timeout_seconds)
         self._client = client
         self._owns_client = client is None
+
+    async def sync_securities(self) -> Mapping[str, Any]:
+        return await self._post("/internal/sync/securities", {})
 
     async def sync_daily(
         self,
