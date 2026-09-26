@@ -227,8 +227,49 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
     assert stock["indicators"]["BOLL"]["upper"] == 110.0
     assert stock["indicators"]["BOLL"]["current_value"]["upper"] == 110.0
     assert stock["indicators"]["BOLL"]["delta"]["width"] == -0.01
+    assert stock["column_values"][str(ma_column.json()["data"]["id"])] == {
+        "column_id": ma_column.json()["data"]["id"],
+        "view_mode": "DELTA",
+        "indicator_type": "MA",
+        "parameters": {"period": 20},
+        "available": True,
+        "value": 120.0,
+        "previous_value": 117.0,
+        "delta": 3.0,
+        "direction": "UP",
+    }
+    boll_column_value = stock["column_values"][str(boll_column.json()["data"]["id"])]
+    assert boll_column_value["view_mode"] == "COMPOSITE"
+    assert boll_column_value["available"] is True
+    assert boll_column_value["fields"]["width"] == {
+        "value": 0.2,
+        "previous_value": 0.21,
+        "delta": -0.01,
+        "direction": "DOWN",
+    }
     assert stock["states"][0]["state_id"] == "BOLL_WIDTH_NARROWING"
     assert "RSI" not in stock["indicators"]
+
+
+async def test_composite_number_and_delta_columns_require_a_field_selector(tab1_context) -> None:
+    client, _, user_one, _ = tab1_context
+    app = client._transport.app  # type: ignore[attr-defined]
+    _as_user(app, user_one)
+
+    created = await client.post("/api/v1/watch-tables", json={"name": "复合选择器"})
+    table_id = created.json()["data"]["id"]
+    invalid = await client.post(
+        f"/api/v1/watch-tables/{table_id}/columns",
+        json={
+            "column_type": "INDICATOR",
+            "indicator_type": "BOLL",
+            "parameters": {"period": 20, "multiplier": 2},
+            "view_mode": "NUMBER",
+        },
+    )
+
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "INDICATOR_FIELD_REQUIRED"
 
 
 async def test_tab1_detail_isolated_and_bad_parameters_are_rejected(tab1_context) -> None:

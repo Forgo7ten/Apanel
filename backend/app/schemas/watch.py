@@ -145,6 +145,9 @@ class WatchTableStockData(BaseModel):
     indicators: dict[str, dict[str, Any]] = Field(default_factory=dict)
     indicator_values: dict[str, dict[str, Any]] = Field(default_factory=dict)
     values: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # New deterministic seam: dynamic columns are addressed by their own
+    # database id, so two columns of the same indicator type cannot collide.
+    column_values: dict[str, dict[str, Any]] = Field(default_factory=dict)
     states: list[CurrentStateData] = Field(default_factory=list)
 
 

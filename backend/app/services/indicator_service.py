@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -11,11 +12,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
 from app.indicators import IndicatorError, create_default_registry
+from app.indicators import parameters as _parameter_contract
+from app.indicators.parameters import (
+    IndicatorRequest,
+    canonicalize_parameters,
+    merge_indicator_requests,
+    parameter_key,
+    select_snapshot_variant,
+    snapshot_variants,
+)
 from app.indicators.types import Candle
 from app.models import DailyBar
 from app.models import IndicatorSnapshot as IndicatorSnapshotModel
 from app.repositories.indicator_state import IndicatorStateRepository
 from app.schemas.indicator_state import IndicatorHistoryData, IndicatorSnapshotData
+
+DEFAULT_BOLL_PARAMETERS = _parameter_contract.DEFAULT_BOLL_PARAMETERS
+DEFAULT_KDJ_PERIODS = _parameter_contract.DEFAULT_KDJ_PERIODS
+DEFAULT_MACD_PARAMETERS = _parameter_contract.DEFAULT_MACD_PARAMETERS
+DEFAULT_MA_PERIODS = _parameter_contract.DEFAULT_MA_PERIODS
+DEFAULT_PROJECTED_MA_PERIOD = _parameter_contract.DEFAULT_PROJECTED_MA_PERIOD
+DEFAULT_RSI_PERIOD = _parameter_contract.DEFAULT_RSI_PERIOD
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,14 +43,12 @@ class CalculatedIndicator:
     parameters: dict[str, Any]
     values: dict[str, float]
 
+    @property
+    def key(self) -> str:
+        return parameter_key(self.indicator_type, self.parameters)
+
 
 DEFAULT_ADJUSTMENT: str | None = None
-DEFAULT_MA_PERIODS = (5, 10)
-DEFAULT_PROJECTED_MA_PERIOD = 5
-DEFAULT_RSI_PERIOD = 14
-DEFAULT_KDJ_PERIODS = {"period": 9, "k_period": 3, "d_period": 3}
-DEFAULT_BOLL_PARAMETERS = {"period": 20, "multiplier": 2.0}
-DEFAULT_MACD_PARAMETERS = {"fast_period": 12, "slow_period": 26, "signal_period": 9}
 
 
 class IndicatorService:
@@ -55,9 +70,25 @@ class IndicatorService:
         symbol: str,
         *,
         adjustment: str | None = DEFAULT_ADJUSTMENT,
+        requests: Iterable[
+            IndicatorRequest | tuple[str, Mapping[str, Any]] | Mapping[str, Any]
+        ]
+        | None = None,
     ) -> list[IndicatorSnapshotModel]:
         _validate_adjustment(adjustment)
         security = await self._get_security(symbol)
+        persisted = await self.repository.list_snapshots(security.id)
+        effective_requests = merge_indicator_requests(requests)
+        if requests is None:
+            # State/alert/API retries must not erase user-requested variants
+            # already materialized by the EOD pipeline.  Defaults remain the
+            # minimum set when no persisted custom request exists.
+            existing_requests = [
+                IndicatorRequest(variant.indicator_type, variant.parameters)
+                for snapshot in persisted
+                for variant in snapshot_variants(snapshot)
+            ]
+            effective_requests = merge_indicator_requests(existing_requests)
         bars = await self.repository.get_daily_bars(
             security.id,
             adjustment=adjustment,
@@ -67,23 +98,36 @@ class IndicatorService:
             raise ApiError("INDICATOR_DATA_NOT_FOUND", "No daily bars are available.", 404)
 
         snapshots: list[IndicatorSnapshotModel] = []
-        previous_values: dict[str, dict[str, float]] = {}
+        previous_values: dict[tuple[str, str], dict[str, float]] = {}
         for index, bar in enumerate(bars):
-            calculated = self._calculate_for_bars(bars[: index + 1])
+            calculated = self._calculate_for_bars(bars[: index + 1], effective_requests)
+            by_type: dict[str, list[CalculatedIndicator]] = defaultdict(list)
             for item in calculated:
-                prior = previous_values.get(item.indicator_type)
-                delta = _delta(item.values, prior)
+                by_type[item.indicator_type].append(item)
+            for indicator_type, items in by_type.items():
+                parameters = {
+                    "_format": 2,
+                    "variants": {item.key: dict(item.parameters) for item in items},
+                }
+                values = {item.key: dict(item.values) for item in items}
+                prior_by_variant: dict[str, dict[str, float] | None] = {}
+                delta_by_variant: dict[str, dict[str, float] | None] = {}
+                for item in items:
+                    prior = previous_values.get((indicator_type, item.key))
+                    prior_by_variant[item.key] = prior
+                    delta_by_variant[item.key] = _delta(item.values, prior)
                 snapshot = await self.repository.upsert_snapshot(
                     security_id=security.id,
                     trade_date=bar.trade_date,
-                    indicator_type=item.indicator_type,
-                    parameters=item.parameters,
-                    values=item.values,
-                    previous_values=prior,
-                    delta=delta,
+                    indicator_type=indicator_type,
+                    parameters=parameters,
+                    values=values,
+                    previous_values=prior_by_variant,
+                    delta=delta_by_variant,
                 )
                 snapshots.append(snapshot)
-                previous_values[item.indicator_type] = item.values
+                for item in items:
+                    previous_values[(indicator_type, item.key)] = item.values
 
         await self.session.commit()
         return snapshots
@@ -179,7 +223,11 @@ class IndicatorService:
             raise ApiError("SECURITY_NOT_FOUND", "Security was not found.", 404)
         return security
 
-    def _calculate_for_bars(self, bars: Iterable[DailyBar]) -> tuple[CalculatedIndicator, ...]:
+    def _calculate_for_bars(
+        self,
+        bars: Iterable[DailyBar],
+        requests: Iterable[IndicatorRequest],
+    ) -> tuple[CalculatedIndicator, ...]:
         bars = tuple(bars)
         candles = tuple(
             Candle(
@@ -194,62 +242,48 @@ class IndicatorService:
         )
         calculated: list[CalculatedIndicator] = []
 
-        ma_values: dict[str, float] = {}
-        for period in DEFAULT_MA_PERIODS:
-            try:
-                result = self.registry.calculate("ma", candles, period=period)
-            except IndicatorError:
+        for request in requests:
+            indicator_type = request.indicator_type
+            parameters = canonicalize_parameters(
+                indicator_type,
+                request.parameters,
+                fill_defaults=True,
+            )
+            if indicator_type == "MA":
+                ma_values: dict[str, float] = {}
+                for period in parameters.get("periods", [parameters.get("period")]):
+                    if period is None:
+                        continue
+                    try:
+                        result = self.registry.calculate("ma", candles, period=period)
+                    except IndicatorError:
+                        continue
+                    ma_values[f"MA{period}"] = _float_values(result.to_dict())["value"]
+                if ma_values:
+                    calculated.append(
+                        CalculatedIndicator(
+                            indicator_type="MA",
+                            parameters=dict(parameters),
+                            values=ma_values,
+                        )
+                    )
                 continue
-            ma_values[f"MA{period}"] = _float_values(result.to_dict())["value"]
-        if ma_values:
-            calculated.append(
-                CalculatedIndicator(
-                    indicator_type="MA",
-                    parameters={"periods": list(DEFAULT_MA_PERIODS)},
-                    values=ma_values,
+
+            registry_name = {
+                "PROJECTED_MA": "projected_ma",
+                "RSI": "rsi",
+                "KDJ": "kdj",
+                "BOLL": "boll",
+                "MACD": "macd",
+            }.get(indicator_type, indicator_type.lower())
+            calculated.extend(
+                self._single_calculation(
+                    candles,
+                    registry_name,
+                    indicator_type=indicator_type,
+                    parameters=parameters,
                 )
             )
-
-        calculated.extend(
-            self._single_calculation(
-                candles,
-                "projected_ma",
-                indicator_type="PROJECTED_MA",
-                parameters={"period": DEFAULT_PROJECTED_MA_PERIOD},
-            )
-        )
-        calculated.extend(
-            self._single_calculation(
-                candles,
-                "rsi",
-                indicator_type="RSI",
-                parameters={"period": DEFAULT_RSI_PERIOD},
-            )
-        )
-        calculated.extend(
-            self._single_calculation(
-                candles,
-                "kdj",
-                indicator_type="KDJ",
-                parameters=DEFAULT_KDJ_PERIODS,
-            )
-        )
-        calculated.extend(
-            self._single_calculation(
-                candles,
-                "boll",
-                indicator_type="BOLL",
-                parameters=DEFAULT_BOLL_PARAMETERS,
-            )
-        )
-        calculated.extend(
-            self._single_calculation(
-                candles,
-                "macd",
-                indicator_type="MACD",
-                parameters=DEFAULT_MACD_PARAMETERS,
-            )
-        )
         return tuple(calculated)
 
     def _single_calculation(
@@ -297,13 +331,16 @@ def serialize_current_indicators(
 
     data: dict[str, Any] = {}
     for snapshot in snapshots:
-        values: dict[str, Any] = _float_values(dict(snapshot.values))
-        if snapshot.delta is None:
+        variant = _default_variant(snapshot)
+        if variant is None:
+            continue
+        values: dict[str, Any] = _float_values(dict(variant.values))
+        if variant.delta is None:
             values["delta"] = None
-        elif snapshot.indicator_type in {"RSI", "PROJECTED_MA"} and "value" in snapshot.delta:
-            values["delta"] = float(snapshot.delta["value"])
+        elif snapshot.indicator_type in {"RSI", "PROJECTED_MA"} and "value" in variant.delta:
+            values["delta"] = float(variant.delta["value"])
         else:
-            values["delta"] = _float_values(dict(snapshot.delta))
+            values["delta"] = _float_values(dict(variant.delta))
         data[snapshot.indicator_type] = values
     return data
 
@@ -311,20 +348,28 @@ def serialize_current_indicators(
 def serialize_indicator_snapshot(snapshot: IndicatorSnapshotModel) -> IndicatorSnapshotData:
     """Serialize one persisted snapshot for the history API."""
 
+    variant = _default_variant(snapshot)
+    if variant is None:
+        variant = snapshot_variants(snapshot)[0]
+
     return IndicatorSnapshotData(
         trade_date=snapshot.trade_date,
         indicator_type=snapshot.indicator_type,
-        parameters=dict(snapshot.parameters),
-        values=_float_values(dict(snapshot.values)),
+        parameters=dict(variant.parameters),
+        values=_float_values(dict(variant.values)),
         previous_values=(
-            _float_values(dict(snapshot.previous_values))
-            if snapshot.previous_values is not None
+            _float_values(dict(variant.previous_values))
+            if variant.previous_values is not None
             else None
         ),
         delta=(
-            _float_values(dict(snapshot.delta)) if snapshot.delta is not None else None
+            _float_values(dict(variant.delta)) if variant.delta is not None else None
         ),
     )
+
+
+def _default_variant(snapshot: IndicatorSnapshotModel):
+    return select_snapshot_variant(snapshot, snapshot.indicator_type, None)
 
 
 def _delta(

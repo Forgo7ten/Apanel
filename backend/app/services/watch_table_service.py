@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -11,6 +10,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
+from app.indicators.parameters import (
+    IndicatorVariant,
+    canonicalize_parameters,
+    normalize_indicator_type,
+    normalize_json_parameters,
+    select_snapshot_variant,
+)
 from app.models import TableColumn, WatchTable, WatchTableSymbol
 from app.repositories.security import SecurityRepository
 from app.repositories.watch_table import WatchTableRepository
@@ -25,45 +31,9 @@ from app.schemas.watch import (
     WatchTableSummaryData,
 )
 from app.services.dividend_service import DividendYieldResult, DividendYieldService
-from app.services.indicator_service import (
-    DEFAULT_BOLL_PARAMETERS,
-    DEFAULT_KDJ_PERIODS,
-    DEFAULT_MACD_PARAMETERS,
-    DEFAULT_PROJECTED_MA_PERIOD,
-    DEFAULT_RSI_PERIOD,
-)
 
 _COLUMN_TYPES = {"PRICE", "INDICATOR", "STATE"}
 _VIEW_MODES = {"NUMBER", "DELTA", "STATUS", "COMPOSITE"}
-_INDICATOR_ALIASES = {
-    "SMA": "MA",
-    "PMA": "PROJECTED_MA",
-    "PROJECTEDMA": "PROJECTED_MA",
-}
-_INDICATOR_DEFAULT_PARAMETERS: dict[str, dict[str, Any]] = {
-    "PROJECTED_MA": {"period": DEFAULT_PROJECTED_MA_PERIOD},
-    "RSI": {"period": DEFAULT_RSI_PERIOD},
-    "KDJ": dict(DEFAULT_KDJ_PERIODS),
-    "BOLL": dict(DEFAULT_BOLL_PARAMETERS),
-    "MACD": dict(DEFAULT_MACD_PARAMETERS),
-}
-_INDICATOR_PARAMETER_KEYS = {
-    "MA": {"period", "periods"},
-    "PROJECTED_MA": {"period"},
-    "RSI": {"period"},
-    "KDJ": {"period", "k_period", "d_period"},
-    "BOLL": {"period", "multiplier"},
-    "MACD": {"fast_period", "slow_period", "signal_period"},
-}
-_INTEGER_PARAMETER_KEYS = {
-    "period",
-    "periods",
-    "k_period",
-    "d_period",
-    "fast_period",
-    "slow_period",
-    "signal_period",
-}
 
 
 class WatchTableService:
@@ -120,7 +90,7 @@ class WatchTableService:
             quote = await self.security_repository.latest_quote(security.id)
             snapshots = await self.security_repository.latest_indicators(security.id)
             states = await self.security_repository.current_states(security.id)
-            indicators = await self._indicator_projections(
+            indicators, column_values = await self._indicator_projections(
                 table.columns,
                 snapshots,
                 security.id,
@@ -138,6 +108,7 @@ class WatchTableService:
                     indicators=indicators,
                     indicator_values=indicators,
                     values=indicators,
+                    column_values=column_values,
                     states=state_data,
                 )
             )
@@ -156,7 +127,7 @@ class WatchTableService:
         columns: Sequence[TableColumn],
         snapshots: Sequence[Any],
         security_id: int,
-    ) -> dict[str, dict[str, Any]]:
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         """Build values only for configured columns with matching snapshots.
 
         A security may have more than one persisted snapshot for a logical
@@ -177,6 +148,7 @@ class WatchTableService:
             counts[indicator_type] = counts.get(indicator_type, 0) + 1
 
         projected: dict[str, dict[str, Any]] = {}
+        column_values: dict[str, dict[str, Any]] = {}
         for column in indicator_columns:
             indicator_type = _normalize_indicator_type(column.indicator_type)
             parameters = _normalize_indicator_parameters(
@@ -184,13 +156,29 @@ class WatchTableService:
                 column.parameters,
                 fill_defaults=True,
             )
+            calculation_parameters = _calculation_parameters(parameters)
             if indicator_type == "DIVIDEND_YIELD":
                 value = await self._dividend_yield_projection(security_id)
+                column_value = _column_value_from_mapping(
+                    column,
+                    indicator_type,
+                    parameters,
+                    value,
+                )
             else:
-                snapshot = _matching_snapshot(snapshots, indicator_type, parameters)
-                if snapshot is None:
-                    continue
-                value = _snapshot_projection(snapshot, indicator_type, parameters)
+                variant = _matching_snapshot(snapshots, indicator_type, calculation_parameters)
+                column_value = _column_value_from_variant(
+                    column,
+                    indicator_type,
+                    parameters,
+                    variant,
+                )
+                value = (
+                    _snapshot_projection(variant, indicator_type, calculation_parameters)
+                    if variant is not None
+                    else None
+                )
+            column_values[str(column.id)] = column_value
             if value is None:
                 continue
 
@@ -203,7 +191,7 @@ class WatchTableService:
             else:
                 projected.setdefault(indicator_type, value)
                 projected[str(column.id)] = value
-        return projected
+        return projected, column_values
 
     async def _dividend_yield_projection(self, security_id: int) -> dict[str, Any]:
         """Project the explainable yield value for a dynamic watch column."""
@@ -336,7 +324,7 @@ class WatchTableService:
         next_parameters = column.parameters
         if request.parameters is not None:
             if column.indicator_type is None:
-                next_parameters = _normalize_json_parameter_value(request.parameters)
+                next_parameters = normalize_json_parameters(request.parameters)
             else:
                 next_parameters = _normalize_indicator_parameters(
                     _normalize_indicator_type(column.indicator_type),
@@ -354,6 +342,12 @@ class WatchTableService:
             column.visible = not request.hidden
         if request.width is not None:
             column.width = request.width
+        if column.indicator_type:
+            _validate_field_selector(
+                _normalize_indicator_type(column.indicator_type),
+                column.parameters,
+                column.view_mode.upper(),
+            )
         next_position = request.position if request.position is not None else request.order
         if next_position is not None:
             await self._move_column(column, next_position)
@@ -464,6 +458,7 @@ def _validate_column_request(
             request.parameters,
             fill_defaults=True,
         )
+        _validate_field_selector(indicator_type, parameters, view_mode)
     return column_type, indicator_type, parameters, view_mode
 
 
@@ -477,8 +472,7 @@ def _normalize_indicator_type(value: str | None) -> str:
 
     if value is None:
         return ""
-    normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
-    return _INDICATOR_ALIASES.get(normalized, normalized)
+    return normalize_indicator_type(value)
 
 
 def _normalize_indicator_parameters(
@@ -501,160 +495,101 @@ def _normalize_indicator_parameters(
             400,
         )
     normalized_type = _normalize_indicator_type(indicator_type)
-    raw: dict[str, Any] = {}
-    for key, value in parameters.items():
-        if not isinstance(key, str) or not key.strip():
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                "Indicator parameter names must be non-empty strings.",
-                400,
-            )
-        normalized_key = key.strip().lower()
-        # Accept the common BOLL spelling while keeping one persisted form.
-        if normalized_type == "BOLL" and normalized_key in {"std", "stddev", "std_dev"}:
-            normalized_key = "multiplier"
-        if normalized_key in raw and raw[normalized_key] != value:
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                "Indicator parameters contain duplicate names.",
-                400,
-            )
-        raw[normalized_key] = value
-
-    allowed = _INDICATOR_PARAMETER_KEYS.get(normalized_type)
-    if allowed is not None:
-        unexpected = set(raw) - allowed
-        if unexpected:
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                "Indicator parameters contain unsupported names.",
-                400,
-            )
-        if normalized_type == "MA":
-            normalized = _normalize_ma_parameters(raw)
-        else:
-            normalized = (
-                dict(_INDICATOR_DEFAULT_PARAMETERS[normalized_type]) if fill_defaults else {}
-            )
-            for key, value in raw.items():
-                normalized[key] = _normalize_parameter_value(key, value)
-            if normalized_type == "MACD" and normalized["fast_period"] >= normalized["slow_period"]:
-                raise ApiError(
-                    "INVALID_INDICATOR_PARAMETERS",
-                    "MACD fast_period must be less than slow_period.",
-                    400,
-                )
-        return normalized
-
-    # MA has a combined persistence shape and is handled separately from the
-    # one-parameter built-ins above.  Unknown indicator plugins retain their
-    # JSON shape but still reject non-finite numeric values.
-    if normalized_type == "MA":
-        return _normalize_ma_parameters(raw)
-    return {key: _normalize_json_parameter_value(value) for key, value in raw.items()}
-
-
-def _normalize_ma_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
-    if "period" in parameters and "periods" in parameters:
-        raise ApiError(
-            "INVALID_INDICATOR_PARAMETERS",
-            "MA accepts either period or periods, not both.",
-            400,
-        )
-    if "period" in parameters:
-        return {"period": _normalize_parameter_value("period", parameters["period"])}
-    if "periods" in parameters:
-        raw_periods = parameters["periods"]
-        if not isinstance(raw_periods, (list, tuple)) or not raw_periods:
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                "MA periods must be a non-empty list.",
-                400,
-            )
-        periods = sorted(
-            {_normalize_parameter_value("period", period) for period in raw_periods}
-        )
-        return {"periods": periods}
-    return {}
-
-
-def _normalize_parameter_value(key: str, value: Any) -> int | float:
-    if key in _INTEGER_PARAMETER_KEYS:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                f"Indicator parameter {key} must be a positive integer.",
-                400,
-            )
-        if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                f"Indicator parameter {key} must be a positive integer.",
-                400,
-            )
-        if value <= 0:
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                f"Indicator parameter {key} must be a positive integer.",
-                400,
-            )
-        return int(value)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ApiError(
-            "INVALID_INDICATOR_PARAMETERS",
-            f"Indicator parameter {key} must be numeric.",
-            400,
-        )
-    normalized = float(value)
-    if not math.isfinite(normalized) or normalized <= 0:
-        raise ApiError(
-            "INVALID_INDICATOR_PARAMETERS",
-            f"Indicator parameter {key} must be positive and finite.",
-            400,
-        )
+    field = next(
+        (
+            value
+            for key, value in parameters.items()
+            if isinstance(key, str) and key.strip().lower() == "field"
+        ),
+        None,
+    )
+    calculation_parameters = {
+        key: value
+        for key, value in parameters.items()
+        if not isinstance(key, str) or key.strip().lower() != "field"
+    }
+    normalized = canonicalize_parameters(
+        normalized_type,
+        calculation_parameters,
+        fill_defaults=fill_defaults,
+    )
+    if field is not None:
+        normalized["field"] = _normalize_field_selector(field)
     return normalized
 
 
-def _normalize_json_parameter_value(value: Any) -> Any:
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return value
-    if isinstance(value, (int, float)):
-        if not math.isfinite(float(value)):
-            raise ApiError(
-                "INVALID_INDICATOR_PARAMETERS",
-                "Indicator parameters must contain finite numbers.",
-                400,
-            )
-        return value
-    if isinstance(value, list):
-        return [_normalize_json_parameter_value(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _normalize_json_parameter_value(item) for key, item in value.items()}
-    raise ApiError(
-        "INVALID_INDICATOR_PARAMETERS",
-        "Indicator parameters contain an unsupported value.",
-        400,
-    )
+def _normalize_field_selector(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(
+            "INVALID_INDICATOR_FIELD",
+            "Indicator field must be a non-empty string.",
+            400,
+        )
+    return value.strip().lower()
+
+
+def _validate_field_selector(
+    indicator_type: str,
+    parameters: Mapping[str, Any],
+    view_mode: str,
+) -> None:
+    if view_mode not in {"NUMBER", "DELTA"}:
+        return
+    calculation_parameters = _calculation_parameters(parameters)
+    if not _is_composite_parameters(indicator_type, calculation_parameters):
+        return
+    field = parameters.get("field")
+    if field is None:
+        raise ApiError(
+            "INDICATOR_FIELD_REQUIRED",
+            "NUMBER and DELTA views for composite indicators require field.",
+            400,
+        )
+    ma_periods = parameters.get("periods", ())
+    if "period" in parameters:
+        ma_periods = (parameters["period"],)
+    allowed = {
+        "MA": {f"ma{period}" for period in ma_periods},
+        "KDJ": {"rsv", "k", "d", "j"},
+        "BOLL": {"upper", "middle", "lower", "width"},
+        "MACD": {"diff", "dea", "histogram"},
+    }.get(indicator_type)
+    if allowed and str(field).lower() not in allowed:
+        raise ApiError(
+            "INVALID_INDICATOR_FIELD",
+            f"Indicator field {field!r} is not available for {indicator_type}.",
+            400,
+        )
+
+
+def _is_composite_parameters(indicator_type: str, parameters: Mapping[str, Any]) -> bool:
+    if indicator_type in {"BOLL", "KDJ", "MACD"}:
+        return True
+    return indicator_type == "MA" and "period" not in parameters
+
+
+def _calculation_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in parameters.items()
+        if str(key).strip().lower() != "field"
+    }
 
 
 def _matching_snapshot(
     snapshots: Sequence[Any], indicator_type: str, parameters: dict[str, Any]
-) -> Any | None:
+) -> IndicatorVariant | None:
     for snapshot in snapshots:
         if _normalize_indicator_type(snapshot.indicator_type) != indicator_type:
             continue
         try:
-            snapshot_parameters = _normalize_indicator_parameters(
-                indicator_type,
-                snapshot.parameters or {},
-                fill_defaults=True,
-            )
+            variant = select_snapshot_variant(snapshot, indicator_type, parameters)
         except ApiError:
             # Persisted snapshots are shared data.  A malformed legacy row
             # must be treated as a miss, not as a reason to fail every table.
             continue
-        if _snapshot_parameters_match(indicator_type, parameters, snapshot_parameters):
-            return snapshot
+        if variant is not None:
+            return variant
     return None
 
 
@@ -684,12 +619,12 @@ def _snapshot_parameters_match(
 
 
 def _snapshot_projection(
-    snapshot: Any,
+    variant: IndicatorVariant,
     indicator_type: str,
     parameters: dict[str, Any],
 ) -> dict[str, Any] | None:
-    values = _json_numbers(snapshot.values)
-    delta = _json_numbers(snapshot.delta) if snapshot.delta is not None else None
+    values = _json_numbers(variant.values)
+    delta = _json_numbers(variant.delta) if variant.delta is not None else None
     if not isinstance(values, dict):
         return None
     current_values = dict(values)
@@ -723,6 +658,154 @@ def _snapshot_projection(
     if delta is not None:
         values["delta"] = delta
     return values
+
+
+def _column_value_from_variant(
+    column: TableColumn,
+    indicator_type: str,
+    parameters: Mapping[str, Any],
+    variant: IndicatorVariant | None,
+) -> dict[str, Any]:
+    if variant is None:
+        return _unavailable_column_value(column, indicator_type, parameters, "SNAPSHOT_NOT_FOUND")
+    return _column_value_from_values(
+        column,
+        indicator_type,
+        parameters,
+        variant.values,
+        variant.previous_values,
+        variant.delta,
+    )
+
+
+def _column_value_from_mapping(
+    column: TableColumn,
+    indicator_type: str,
+    parameters: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    numeric_values = {
+        str(key): float(value)
+        for key, value in values.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    if not numeric_values:
+        return _unavailable_column_value(column, indicator_type, parameters, "VALUE_NOT_FOUND")
+    return _column_value_from_values(column, indicator_type, parameters, numeric_values, None, None)
+
+
+def _column_value_from_values(
+    column: TableColumn,
+    indicator_type: str,
+    parameters: Mapping[str, Any],
+    values: Mapping[str, Any],
+    previous_values: Mapping[str, Any] | None,
+    delta: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    mode = column.view_mode.upper()
+    normalized_values = {str(key): float(value) for key, value in values.items()}
+    normalized_previous = (
+        {str(key): float(value) for key, value in previous_values.items()}
+        if isinstance(previous_values, Mapping)
+        else {}
+    )
+    normalized_delta = (
+        {str(key): float(value) for key, value in delta.items()}
+        if isinstance(delta, Mapping)
+        else {}
+    )
+    result: dict[str, Any] = {
+        "column_id": column.id,
+        "view_mode": mode,
+        "indicator_type": indicator_type,
+        "parameters": _json_numbers(dict(parameters)),
+        "available": True,
+    }
+    if mode == "COMPOSITE":
+        result["fields"] = {
+            key: _field_value(
+                normalized_values.get(key),
+                normalized_previous.get(key),
+                normalized_delta.get(key),
+            )
+            for key in normalized_values
+        }
+        return result
+
+    field = parameters.get("field")
+    if field is None:
+        if "value" in normalized_values:
+            field = "value"
+        elif len(normalized_values) == 1:
+            field = next(iter(normalized_values))
+    value_key = (
+        field
+        if isinstance(field, str) and field in normalized_values
+        else next(
+            (
+                key
+                for key in normalized_values
+                if isinstance(field, str) and key.casefold() == field.casefold()
+            ),
+            None,
+        )
+    )
+    if value_key is None:
+        return _unavailable_column_value(
+            column,
+            indicator_type,
+            parameters,
+            "INDICATOR_FIELD_NOT_FOUND",
+        )
+    scalar = _field_value(
+        normalized_values.get(value_key),
+        normalized_previous.get(value_key),
+        normalized_delta.get(value_key),
+    )
+    result.update(scalar)
+    return result
+
+
+def _field_value(
+    value: float | None,
+    previous_value: float | None,
+    delta: float | None,
+) -> dict[str, Any]:
+    return {
+        "value": value,
+        "previous_value": previous_value,
+        "delta": delta,
+        "direction": (
+            "UP"
+            if delta is not None and delta > 0
+            else "DOWN"
+            if delta is not None and delta < 0
+            else "FLAT"
+        ),
+    }
+
+
+def _unavailable_column_value(
+    column: TableColumn,
+    indicator_type: str,
+    parameters: Mapping[str, Any],
+    error_code: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "column_id": column.id,
+        "view_mode": column.view_mode.upper(),
+        "indicator_type": indicator_type,
+        "parameters": _json_numbers(dict(parameters)),
+        "available": False,
+        "error_code": error_code,
+        "value": None,
+        "previous_value": None,
+        "delta": None,
+        "direction": "FLAT",
+    }
+    if column.view_mode.upper() == "COMPOSITE":
+        result["fields"] = {}
+    return result
 
 
 def _mapping_key(values: dict[str, Any], expected: str) -> str | None:

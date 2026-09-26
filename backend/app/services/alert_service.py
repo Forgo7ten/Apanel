@@ -23,6 +23,7 @@ from app.alerts import (
     AlertRule as DomainAlertRule,
 )
 from app.core.errors import ApiError
+from app.indicators.parameters import normalize_indicator_type, select_snapshot_variant
 from app.models import (
     AlertInstance,
     AlertInstanceStatus,
@@ -58,6 +59,18 @@ class AlertEvaluationResult:
     status: str
     triggered: bool
     notification_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotObservation:
+    """Default-parameter view of one v1/v2 persisted snapshot."""
+
+    trade_date: date
+    indicator_type: str
+    parameters: dict[str, Any]
+    values: dict[str, float]
+    previous_values: dict[str, float] | None
+    delta: dict[str, float] | None
 
 
 class AlertService:
@@ -484,21 +497,29 @@ def _observation_for_rule(
     states: Sequence[IndicatorState],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     values: dict[str, Any] = {}
-    selected_snapshot: IndicatorSnapshot | None = None
-    by_type = {item.indicator_type.casefold(): item for item in snapshots}
+    selected_snapshot: _SnapshotObservation | None = None
+    rule_indicator = _normalize_rule_indicator(rule.indicator_type)
     for snapshot in snapshots:
+        try:
+            variant = select_snapshot_variant(snapshot, snapshot.indicator_type)
+        except ApiError:
+            continue
+        if variant is None:
+            continue
         numeric_values = {
             str(key): float(value)
-            for key, value in (snapshot.values or {}).items()
+            for key, value in (variant.values or {}).items()
             if _is_number(value)
         }
         values.update(numeric_values)
         if "value" in numeric_values:
-            values[snapshot.indicator_type] = numeric_values["value"]
+            values[normalize_indicator_type(snapshot.indicator_type)] = numeric_values["value"]
         elif len(numeric_values) == 1:
-            values[snapshot.indicator_type] = next(iter(numeric_values.values()))
-    if rule.indicator_type:
-        selected_snapshot = by_type.get(rule.indicator_type.casefold())
+            values[normalize_indicator_type(snapshot.indicator_type)] = next(
+                iter(numeric_values.values())
+            )
+        if rule_indicator == normalize_indicator_type(snapshot.indicator_type):
+            selected_snapshot = _snapshot_observation(snapshot, variant)
     active_states = {
         item.state_code: item.status == AlertInstanceStatus.ACTIVE.value for item in states
     }
@@ -512,6 +533,28 @@ def _observation_for_rule(
     }
     observation = {"values": values, "states": active_states}
     return observation, context
+
+
+def _normalize_rule_indicator(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return normalize_indicator_type(value)
+    except ApiError:
+        return value.strip().upper()
+
+
+def _snapshot_observation(snapshot: IndicatorSnapshot, variant: Any) -> _SnapshotObservation:
+    return _SnapshotObservation(
+        trade_date=snapshot.trade_date,
+        indicator_type=normalize_indicator_type(snapshot.indicator_type),
+        parameters=dict(variant.parameters),
+        values=dict(variant.values),
+        previous_values=(
+            dict(variant.previous_values) if variant.previous_values is not None else None
+        ),
+        delta=dict(variant.delta) if variant.delta is not None else None,
+    )
 
 
 def _context_date(snapshot: IndicatorSnapshot | None, state: IndicatorState | None) -> date:
