@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 
 import { createWatchTableColumn } from "@/api/watch";
 import type { Identifier, IndicatorViewMode } from "@/api/types";
@@ -12,6 +12,7 @@ import {
   toCreateColumnPayload,
   WATCH_INDICATOR_OPTIONS,
 } from "@/lib/watch-contract.mjs";
+import { trapDialogTab } from "../ui/dialog-focus";
 
 type ParameterField = {
   key: string;
@@ -76,12 +77,16 @@ function mutationErrorMessage(error: unknown): string | null {
 
 export function AddColumnDialog({
   tableId,
+  restoreFocusRef,
   onClose,
 }: {
   tableId: Identifier;
+  restoreFocusRef?: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
+  const indicatorSelectRef = useRef<HTMLSelectElement>(null);
+  const dialogRef = useRef<HTMLElement>(null);
   const [indicatorType, setIndicatorType] = useState("MA");
   const [viewMode, setViewMode] = useState<IndicatorViewMode>("COMPOSITE");
   const [parameters, setParameters] = useState(() => toFormParameters("MA"));
@@ -113,6 +118,31 @@ export function AddColumnDialog({
       onClose();
     },
   });
+  const pendingRef = useRef(false);
+  useEffect(() => {
+    pendingRef.current = createMutation.isPending;
+  }, [createMutation.isPending]);
+
+  useEffect(() => {
+    indicatorSelectRef.current?.focus();
+    const trigger = restoreFocusRef?.current;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (pendingRef.current) return;
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key === "Tab" && dialogRef.current && trapDialogTab(dialogRef.current, event.shiftKey)) {
+        event.preventDefault();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      trigger?.focus();
+    };
+  }, [onClose, restoreFocusRef]);
 
   const errorMessage = mutationErrorMessage(createMutation.error);
 
@@ -122,7 +152,7 @@ export function AddColumnDialog({
       role="presentation"
       onMouseDown={(event) => event.target === event.currentTarget && !createMutation.isPending && onClose()}
     >
-      <section className="w-full max-w-lg rounded-panel border border-line bg-panel p-5 shadow-panel" role="dialog" aria-modal="true" aria-labelledby="add-column-title">
+        <section ref={dialogRef} className="w-full max-w-lg rounded-panel border border-line bg-panel p-5 shadow-panel" role="dialog" aria-modal="true" aria-labelledby="add-column-title">
         <div className="flex items-start justify-between gap-4">
           <div>
             <p id="add-column-title" className="text-base font-semibold text-primary">添加指标列</p>
@@ -137,6 +167,7 @@ export function AddColumnDialog({
           <label className="block text-xs font-medium text-secondary">
             指标
             <select
+              ref={indicatorSelectRef}
               value={indicatorType}
               onChange={(event) => {
                 setIndicatorType(event.target.value);

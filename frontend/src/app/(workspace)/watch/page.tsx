@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Identifier } from "@/api/types";
 import { createWatchTable, deleteWatchTable, getWatchTable, getWatchTables } from "@/api/watch";
@@ -11,6 +11,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { LoadingState, QueryErrorState } from "@/components/ui/QueryState";
 import { StateTag } from "@/components/ui/StateTag";
 import { isApiError } from "@/lib/api-errors";
+import { isCurrentWatchDetail, watchDetailViewState } from "@/lib/watch-contract.mjs";
 import { useWatchStore } from "@/stores/watch-store";
 
 function sameId(left: Identifier | null, right: Identifier | null): boolean {
@@ -21,6 +22,8 @@ export default function WatchPage() {
   const queryClient = useQueryClient();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [createName, setCreateName] = useState("");
+  const addStockTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeAddStockDialog = useCallback(() => setAddDialogOpen(false), []);
   const { selectedTableId, setSelectedTableId, resetTableView } = useWatchStore();
   const tablesQuery = useQuery({ queryKey: ["watch-tables"], queryFn: getWatchTables });
   const tables = useMemo(() => tablesQuery.data ?? [], [tablesQuery.data]);
@@ -30,6 +33,16 @@ export default function WatchPage() {
     queryKey: ["watch-table", activeTableId],
     queryFn: () => getWatchTable(activeTableId as Identifier),
     enabled: activeTableId !== null,
+    placeholderData: (previous) => previous,
+  });
+  const currentDetail = detailsQuery.data && isCurrentWatchDetail(detailsQuery.data, activeTableId)
+    ? detailsQuery.data
+    : undefined;
+  const detailState = watchDetailViewState({
+    isPending: detailsQuery.isPending || (detailsQuery.isFetching && !currentDetail),
+    isFetching: detailsQuery.isFetching,
+    isError: detailsQuery.isError,
+    hasData: Boolean(currentDetail),
   });
   const createMutation = useMutation({
     mutationFn: () => {
@@ -72,6 +85,7 @@ export default function WatchPage() {
 
   function selectTable(id: Identifier) {
     if (sameId(id, selectedTableId)) return;
+    setAddDialogOpen(false);
     setSelectedTableId(id);
     resetTableView();
   }
@@ -100,7 +114,7 @@ export default function WatchPage() {
         <div className="flex flex-wrap items-center gap-2">
           {activeTableId !== null ? (
             <>
-              <button type="button" onClick={() => setAddDialogOpen(true)} className="inline-flex h-9 items-center justify-center gap-2 rounded-panel bg-brand px-3.5 text-sm font-medium text-white shadow-panel transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
+              <button type="button" onClick={(event) => { addStockTriggerRef.current = event.currentTarget; setAddDialogOpen(true); }} className="inline-flex h-9 items-center justify-center gap-2 rounded-panel bg-brand px-3.5 text-sm font-medium text-white shadow-panel transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
                 <span className="text-base leading-none">+</span>
                 添加股票
               </button>
@@ -168,14 +182,21 @@ export default function WatchPage() {
 
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_240px]">
             <div className="min-w-0">
-              {detailsQuery.isPending ? <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel"><LoadingState /></div> : null}
-              {detailsQuery.isError ? <div className="rounded-panel border border-line bg-panel shadow-panel"><QueryErrorState error={detailsQuery.error} onRetry={() => detailsQuery.refetch()} /></div> : null}
-              {detailsQuery.data ? <WatchTable table={detailsQuery.data} onAddStock={() => setAddDialogOpen(true)} /> : null}
+              {detailState === "loading" ? <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel"><LoadingState /></div> : null}
+              {detailState === "error" ? <div className="rounded-panel border border-line bg-panel shadow-panel"><QueryErrorState error={detailsQuery.error} onRetry={() => detailsQuery.refetch()} /></div> : null}
+              {detailState === "empty" ? <div className="rounded-panel border border-line bg-panel shadow-panel"><EmptyState title="暂无监控表详情" description="当前监控表暂时没有可展示的数据。" /></div> : null}
+              {currentDetail ? (
+                <>
+                  {detailState === "refreshing" ? <p className="mb-2 rounded-panel border border-line bg-card/50 px-3 py-2 text-xs text-muted" role="status" aria-live="polite">正在刷新监控数据…</p> : null}
+                  {detailState === "refresh-error" ? <div className="mb-2 flex items-center justify-between gap-3 rounded-panel border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning" role="alert"><span>刷新失败，当前仍显示上一次数据。</span><button type="button" onClick={() => detailsQuery.refetch()} className="shrink-0 rounded border border-warning/40 px-2 py-1 font-medium hover:bg-warning/10 focus:outline-none focus:ring-2 focus:ring-brand/40">重试</button></div> : null}
+                  <WatchTable key={String(currentDetail.id ?? activeTableId)} table={currentDetail} onAddStock={(trigger) => { addStockTriggerRef.current = trigger ?? null; setAddDialogOpen(true); }} />
+                </>
+              ) : null}
             </div>
             <aside className="h-fit rounded-panel border border-line bg-panel p-card shadow-panel">
               <div className="flex items-center justify-between">
                 <p className="text-sm font-semibold text-primary">工作台状态</p>
-                <StateTag tone={detailsQuery.isError ? "warning" : "positive"}>{detailsQuery.isError ? "待重试" : "已连接"}</StateTag>
+                <StateTag tone={detailState === "error" || detailState === "refresh-error" ? "warning" : "positive"}>{detailState === "error" || detailState === "refresh-error" ? "待重试" : detailState === "refreshing" ? "刷新中" : "已连接"}</StateTag>
               </div>
               <dl className="mt-5 divide-y divide-line/80">
                 <div className="flex items-center justify-between py-3 first:pt-0">
@@ -184,11 +205,11 @@ export default function WatchPage() {
                 </div>
                 <div className="flex items-center justify-between py-3">
                   <dt className="text-xs text-muted">监控股票</dt>
-                  <dd className="text-xs tabular-nums text-secondary">{detailsQuery.data?.stocks.length ?? selectedTable?.stock_count ?? 0}</dd>
+                  <dd className="text-xs tabular-nums text-secondary">{currentDetail?.stocks.length ?? selectedTable?.stock_count ?? 0}</dd>
                 </div>
                 <div className="flex items-center justify-between py-3 last:pb-0">
                   <dt className="text-xs text-muted">指标列</dt>
-                  <dd className="text-xs tabular-nums text-secondary">{detailsQuery.data?.columns.length ?? "—"}</dd>
+                  <dd className="text-xs tabular-nums text-secondary">{currentDetail?.columns.length ?? "—"}</dd>
                 </div>
               </dl>
               <div className="mt-5 rounded-panel border border-warning/20 bg-warning/5 p-3">
@@ -200,7 +221,7 @@ export default function WatchPage() {
         </>
       ) : null}
 
-      {addDialogOpen && activeTableId !== null ? <AddStockDialog tableId={activeTableId} onClose={() => setAddDialogOpen(false)} /> : null}
+      {addDialogOpen && activeTableId !== null ? <AddStockDialog tableId={activeTableId} restoreFocusRef={addStockTriggerRef} onClose={closeAddStockDialog} /> : null}
     </div>
   );
 }

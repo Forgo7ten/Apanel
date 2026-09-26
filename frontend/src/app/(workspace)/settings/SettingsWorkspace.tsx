@@ -117,11 +117,11 @@ export function SettingsWorkspace() {
             <section className="rounded-panel border border-line bg-panel shadow-panel">
               <div className="border-b border-line px-4 py-4">
                 <h2 className="text-sm font-semibold text-primary">数据口径</h2>
-                <p className="mt-1 text-xs leading-5 text-muted">所有指标使用同一复权方式，避免同一工作台内口径漂移。</p>
+                <p className="mt-1 text-xs leading-5 text-muted">指标与状态持久化固定使用前复权（qfq）；以下偏好仅影响行情读取，不会改变指标计算口径。</p>
               </div>
               <div className="px-4 py-4">
                 <fieldset disabled={saveMutation.isPending}>
-                  <legend className="text-xs font-medium text-secondary">复权方式</legend>
+                  <legend className="text-xs font-medium text-secondary">行情读取偏好</legend>
                   <div className="mt-3 grid gap-2 sm:grid-cols-2">
                     <label className={`flex cursor-pointer items-center gap-2 rounded-panel border px-3 py-2.5 text-xs transition ${form.adjustType === "qfq" ? "border-brand bg-brand/10 text-primary" : "border-line bg-card text-secondary hover:border-brand/50"}`}>
                       <input type="radio" name="adjust-type" value="qfq" checked={form.adjustType === "qfq"} onChange={() => updateForm({ adjustType: "qfq" })} className="accent-brand" />
@@ -129,7 +129,7 @@ export function SettingsWorkspace() {
                     </label>
                     <label className={`flex cursor-pointer items-center gap-2 rounded-panel border px-3 py-2.5 text-xs transition ${form.adjustType === "none" ? "border-brand bg-brand/10 text-primary" : "border-line bg-card text-secondary hover:border-brand/50"}`}>
                       <input type="radio" name="adjust-type" value="none" checked={form.adjustType === "none"} onChange={() => updateForm({ adjustType: "none" })} className="accent-brand" />
-                      不复权（none）
+                      不复权（none，仅原始行情）
                     </label>
                   </div>
                 </fieldset>

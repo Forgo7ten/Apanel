@@ -1,13 +1,14 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 
 import { searchSecurities } from "@/api/securities";
 import type { Identifier, Security } from "@/api/types";
 import { addStockToWatchTable } from "@/api/watch";
 import { isApiError } from "@/lib/api-errors";
 import { getSecurityIdentifier, toAddStockPayload } from "@/lib/watch-contract.mjs";
+import { trapDialogTab } from "../ui/dialog-focus";
 
 function securityId(security: Security): Identifier | null {
   return getSecurityIdentifier(security);
@@ -15,12 +16,16 @@ function securityId(security: Security): Identifier | null {
 
 export function AddStockDialog({
   tableId,
+  restoreFocusRef,
   onClose,
 }: {
   tableId: Identifier;
+  restoreFocusRef?: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLElement>(null);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Security | null>(null);
   const trimmedQuery = query.trim();
@@ -45,6 +50,31 @@ export function AddStockDialog({
       onClose();
     },
   });
+  const pendingRef = useRef(false);
+  useEffect(() => {
+    pendingRef.current = addMutation.isPending;
+  }, [addMutation.isPending]);
+
+  useEffect(() => {
+    searchInputRef.current?.focus();
+    const trigger = restoreFocusRef?.current;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (pendingRef.current) return;
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key === "Tab" && dialogRef.current && trapDialogTab(dialogRef.current, event.shiftKey)) {
+        event.preventDefault();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      trigger?.focus();
+    };
+  }, [onClose, restoreFocusRef]);
 
   const error = addMutation.error ?? searchQuery.error;
   const errorMessage = isApiError(error) && error.status === 404
@@ -54,8 +84,8 @@ export function AddStockDialog({
       : null;
 
   return (
-    <div className="fixed inset-0 z-40 grid place-items-center bg-black/60 px-4 py-6" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="w-full max-w-lg rounded-panel border border-line bg-panel p-5 shadow-panel" role="dialog" aria-modal="true" aria-labelledby="add-stock-title">
+    <div className="fixed inset-0 z-40 grid place-items-center bg-black/60 px-4 py-6" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !addMutation.isPending && onClose()}>
+      <section ref={dialogRef} className="w-full max-w-lg rounded-panel border border-line bg-panel p-5 shadow-panel" role="dialog" aria-modal="true" aria-labelledby="add-stock-title">
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="text-base font-semibold text-primary" id="add-stock-title">添加股票</p>
@@ -74,7 +104,7 @@ export function AddStockDialog({
             setQuery(event.target.value);
             setSelected(null);
           }}
-          autoFocus
+          ref={searchInputRef}
           placeholder="例如 600519 或 贵州茅台"
           className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none placeholder:text-muted focus:border-brand focus:ring-2 focus:ring-brand/30"
         />

@@ -88,7 +88,7 @@ async def multi_parameter_context(
                     close=close,
                     volume=100,
                     amount=10000,
-                    adjust_type="none",
+                    adjust_type="qfq",
                 )
             )
         await session.commit()
@@ -143,6 +143,63 @@ async def test_calculation_persists_one_v2_row_per_type_with_all_requested_varia
 
         assert second_count == row_count
         assert len(second) == len(first)
+
+
+async def test_history_expands_parameter_variants_without_mixing_values(
+    multi_parameter_context,
+) -> None:
+    requests = [
+        ("MA", {"period": 5}),
+        ("MA", {"period": 20}),
+        ("RSI", {"period": 6}),
+        ("RSI", {"period": 14}),
+        ("BOLL", {"period": 20, "multiplier": 2}),
+        ("BOLL", {"period": 20, "multiplier": 3}),
+    ]
+    async with multi_parameter_context() as session:
+        service = IndicatorService(session)
+        await service.calculate("600519", requests=requests)
+        history = await service.history_data(
+            "600519", start=date(2026, 2, 10), end=date(2026, 2, 14)
+        )
+
+        rows = [item for item in history.items if item.trade_date == date(2026, 2, 14)]
+        assert len([item for item in rows if item.indicator_type == "RSI"]) == 2
+        assert len([item for item in rows if item.indicator_type == "BOLL"]) == 2
+        assert {item.parameters["period"] for item in rows if item.indicator_type == "RSI"} == {
+            6,
+            14,
+        }
+        assert {
+            item.parameters["multiplier"] for item in rows if item.indicator_type == "BOLL"
+        } == {2.0, 3.0}
+        assert len([item for item in rows if item.indicator_type == "MA"]) >= 2
+        assert all(item.parameter_key.startswith("v1_") for item in rows)
+
+        selectors = (
+            ("MA", {"periods": [5]}),
+            ("MA", {"periods": [20]}),
+            ("RSI", {"period": 6}),
+            ("RSI", {"period": 14}),
+            ("BOLL", {"period": 20, "multiplier": 2.0}),
+            ("BOLL", {"period": 20, "multiplier": 3.0}),
+        )
+        for indicator_type, parameters in selectors:
+            source = next(
+                item
+                for item in rows
+                if item.indicator_type == indicator_type
+                and item.parameters == parameters
+            )
+            selected = await service.history_data(
+                "600519",
+                start=date(2026, 2, 14),
+                end=date(2026, 2, 14),
+                parameter_key=source.parameter_key,
+            )
+            assert selected.items
+            assert {item.parameter_key for item in selected.items} == {source.parameter_key}
+            assert all(item.parameters == parameters for item in selected.items)
 
 
 async def test_pipeline_collects_column_parameters_and_keeps_default_requests() -> None:
@@ -278,10 +335,10 @@ async def test_eod_pipeline_reuses_one_snapshot_row_and_keeps_column_demand(
         notification_runner=notification_runner,
     )
     first = await EODPipeline(steps).run(
-        PipelineContext(date(2026, 2, 14), "none", ("600519",))
+        PipelineContext(date(2026, 2, 14), "qfq", ("600519",))
     )
     second = await EODPipeline(steps).run(
-        PipelineContext(date(2026, 2, 14), "none", ("600519",))
+        PipelineContext(date(2026, 2, 14), "qfq", ("600519",))
     )
 
     assert first.completed_steps == second.completed_steps

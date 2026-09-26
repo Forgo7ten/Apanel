@@ -102,6 +102,22 @@ http://localhost:8080/api/v1
 
 需要 `Authorization: Bearer <access_token>`，返回当前数据库中的激活用户。每次请求都会重新读取用户状态和角色；禁用用户不会因为 JWT 尚未过期而继续访问。
 
+## 指标与状态历史 API
+
+以下后端接口的指标计算、状态识别和持久化统一使用前复权 `qfq`：
+
+- `GET /securities/{symbol}/indicators`
+- `GET /securities/{symbol}/indicators/history`
+- `GET /securities/{symbol}/states`
+- `GET /securities/{symbol}/states/history`
+
+省略 `adjust` 时默认使用 `qfq`；显式传入 `adjust=none` 会返回 `400`，并使用稳定错误码
+`UNSUPPORTED_INDICATOR_ADJUSTMENT`（当前值）或 `UNSUPPORTED_HISTORY_ADJUSTMENT`（历史值）。
+其中两个 `history` GET 只读取已经持久化的快照/状态，不会因为查看历史而重算或写入数据库；
+当前值接口按既有服务语义刷新并持久化 qfq 结果。EOD pipeline 同样只接受 `qfq`，因此行情服务
+仍可独立保存和读取 `none` 原始日线，但它不会进入指标或状态持久化计算，也不会覆盖已有的 qfq
+快照/状态。
+
 ## 告警通知 API
 
 ### `GET /notifications`

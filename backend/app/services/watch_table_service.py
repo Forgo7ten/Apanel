@@ -15,6 +15,7 @@ from app.indicators.parameters import (
     canonicalize_parameters,
     normalize_indicator_type,
     normalize_json_parameters,
+    parameter_key,
     select_snapshot_variant,
 )
 from app.models import TableColumn, WatchTable, WatchTableSymbol
@@ -84,19 +85,31 @@ class WatchTableService:
 
     async def detail(self, user_id: int, table_id: int) -> WatchTableDetailsData:
         table = await self._owned(table_id, user_id, with_details=True)
+        security_ids = [membership.security_id for membership in table.symbols]
+        quotes = await self.security_repository.latest_quotes_batch(security_ids)
+        snapshots_by_security = await self.security_repository.latest_indicators_batch(security_ids)
+        states_by_security = await self.security_repository.current_states_batch(security_ids)
+        dividend_results: Mapping[int, DividendYieldResult | ApiError] | None = None
+        if any(
+            column.column_type.upper() == "INDICATOR"
+            and _normalize_indicator_type(column.indicator_type) == "DIVIDEND_YIELD"
+            for column in table.columns
+        ):
+            dividend_results = await self.dividend_yield_service.calculate_for_securities(
+                security_ids,
+                quotes=quotes,
+            )
         stocks: list[WatchTableStockData] = []
         for membership in table.symbols:
             security = membership.security
-            quote = await self.security_repository.latest_quote(security.id)
-            snapshots = await self.security_repository.latest_indicators(security.id)
-            states = await self.security_repository.current_states(security.id)
             indicators, column_values = await self._indicator_projections(
                 table.columns,
-                snapshots,
+                snapshots_by_security.get(security.id, ()),
                 security.id,
+                dividend_results=dividend_results,
             )
-            price = _price_data(quote)
-            state_data = [_state_data(state) for state in states]
+            price = _price_data(quotes.get(security.id))
+            state_data = [_state_data(state) for state in states_by_security.get(security.id, ())]
             stocks.append(
                 WatchTableStockData(
                     security_id=security.id,
@@ -127,6 +140,8 @@ class WatchTableService:
         columns: Sequence[TableColumn],
         snapshots: Sequence[Any],
         security_id: int,
+        *,
+        dividend_results: Mapping[int, DividendYieldResult | ApiError] | None = None,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         """Build values only for configured columns with matching snapshots.
 
@@ -158,7 +173,10 @@ class WatchTableService:
             )
             calculation_parameters = _calculation_parameters(parameters)
             if indicator_type == "DIVIDEND_YIELD":
-                value = await self._dividend_yield_projection(security_id)
+                value = await self._dividend_yield_projection(
+                    security_id,
+                    dividend_results=dividend_results,
+                )
                 column_value = _column_value_from_mapping(
                     column,
                     indicator_type,
@@ -193,24 +211,31 @@ class WatchTableService:
                 projected[str(column.id)] = value
         return projected, column_values
 
-    async def _dividend_yield_projection(self, security_id: int) -> dict[str, Any]:
+    async def _dividend_yield_projection(
+        self,
+        security_id: int,
+        *,
+        dividend_results: Mapping[int, DividendYieldResult | ApiError] | None = None,
+    ) -> dict[str, Any]:
         """Project the explainable yield value for a dynamic watch column."""
 
-        try:
-            result = await self.dividend_yield_service.calculate_for_security(security_id)
-        except ApiError as error:
-            if error.code not in {"PRICE_NOT_FOUND", "INVALID_PRICE", "INVALID_DIVIDEND_DATA"}:
-                raise
-            return {
-                "value": None,
-                "yield": None,
-                "dividend_yield": None,
-                "dividend_total": None,
-                "price": None,
-                "as_of": None,
-                "price_source": None,
-                "error_code": error.code,
-            }
+        if dividend_results is None:
+            try:
+                result = await self.dividend_yield_service.calculate_for_security(security_id)
+            except ApiError as error:
+                return _dividend_yield_error(error)
+        else:
+            result = dividend_results.get(security_id)
+            if result is None:
+                return _dividend_yield_error(
+                    ApiError(
+                        "PRICE_NOT_FOUND",
+                        "No quote or daily close is available for this security.",
+                        404,
+                    )
+                )
+            if isinstance(result, ApiError):
+                return _dividend_yield_error(result)
         return _dividend_yield_data(result)
 
     async def add_stock(
@@ -430,6 +455,21 @@ class WatchTableService:
             created_at=table.created_at,
             updated_at=table.updated_at,
         )
+
+
+def _dividend_yield_error(error: ApiError) -> dict[str, Any]:
+    if error.code not in {"PRICE_NOT_FOUND", "INVALID_PRICE", "INVALID_DIVIDEND_DATA"}:
+        raise error
+    return {
+        "value": None,
+        "yield": None,
+        "dividend_yield": None,
+        "dividend_total": None,
+        "price": None,
+        "as_of": None,
+        "price_source": None,
+        "error_code": error.code,
+    }
 
 
 def _normalize_name(value: str) -> str:
@@ -675,6 +715,7 @@ def _column_value_from_variant(
         variant.values,
         variant.previous_values,
         variant.delta,
+        variant_key=variant.key,
     )
 
 
@@ -691,7 +732,15 @@ def _column_value_from_mapping(
     }
     if not numeric_values:
         return _unavailable_column_value(column, indicator_type, parameters, "VALUE_NOT_FOUND")
-    return _column_value_from_values(column, indicator_type, parameters, numeric_values, None, None)
+    return _column_value_from_values(
+        column,
+        indicator_type,
+        parameters,
+        numeric_values,
+        None,
+        None,
+        variant_key=_column_parameter_key(indicator_type, parameters),
+    )
 
 
 def _column_value_from_values(
@@ -701,6 +750,8 @@ def _column_value_from_values(
     values: Mapping[str, Any],
     previous_values: Mapping[str, Any] | None,
     delta: Mapping[str, Any] | None,
+    *,
+    variant_key: str | None = None,
 ) -> dict[str, Any]:
     mode = column.view_mode.upper()
     normalized_values = {str(key): float(value) for key, value in values.items()}
@@ -720,6 +771,7 @@ def _column_value_from_values(
         "indicator_type": indicator_type,
         "parameters": _json_numbers(dict(parameters)),
         "available": True,
+        "parameter_key": variant_key or _column_parameter_key(indicator_type, parameters),
     }
     if mode == "COMPOSITE":
         result["fields"] = {
@@ -798,6 +850,7 @@ def _unavailable_column_value(
         "parameters": _json_numbers(dict(parameters)),
         "available": False,
         "error_code": error_code,
+        "parameter_key": _column_parameter_key(indicator_type, parameters),
         "value": None,
         "previous_value": None,
         "delta": None,
@@ -806,6 +859,10 @@ def _unavailable_column_value(
     if column.view_mode.upper() == "COMPOSITE":
         result["fields"] = {}
     return result
+
+
+def _column_parameter_key(indicator_type: str, parameters: Mapping[str, Any]) -> str:
+    return parameter_key(indicator_type, _calculation_parameters(parameters))
 
 
 def _mapping_key(values: dict[str, Any], expected: str) -> str | None:

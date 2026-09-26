@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import Settings
+from app.core.errors import ApiError
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import create_app
@@ -56,7 +57,7 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
                     close=close,
                     volume=100,
                     amount=10000,
-                    adjust_type="none",
+                    adjust_type="qfq",
                 )
             )
         await session.commit()
@@ -135,6 +136,15 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
             )
             states = await client.get("/api/v1/securities/600519/states")
             state_history = await client.get("/api/v1/securities/600519/states/history")
+            rejected = {
+                path: await client.get(path, params={"adjust": "none"})
+                for path in (
+                    "/api/v1/securities/600519/indicators",
+                    "/api/v1/securities/600519/indicators/history",
+                    "/api/v1/securities/600519/states",
+                    "/api/v1/securities/600519/states/history",
+                )
+            }
     finally:
         app.dependency_overrides.clear()
 
@@ -145,6 +155,110 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
     assert states.status_code == 200
     assert state_history.status_code == 200
     assert state_history.json()["data"]["items"]
+    assert all(response.status_code == 400 for response in rejected.values())
+    assert (
+        rejected["/api/v1/securities/600519/indicators"].json()["error"]["code"]
+        == "UNSUPPORTED_INDICATOR_ADJUSTMENT"
+    )
+    assert (
+        rejected["/api/v1/securities/600519/states"].json()["error"]["code"]
+        == "UNSUPPORTED_INDICATOR_ADJUSTMENT"
+    )
+    assert (
+        rejected["/api/v1/securities/600519/indicators/history"].json()["error"]["code"]
+        == "UNSUPPORTED_HISTORY_ADJUSTMENT"
+    )
+    assert (
+        rejected["/api/v1/securities/600519/states/history"].json()["error"]["code"]
+        == "UNSUPPORTED_HISTORY_ADJUSTMENT"
+    )
+
+
+async def test_history_services_only_read_persisted_rows(indicator_context) -> None:
+    async with indicator_context() as session:
+        indicator_service = IndicatorService(session)
+        await indicator_service.calculate("600519")
+        state_service = StateService(session)
+        await state_service.calculate("600519")
+
+        async def unexpected_indicator_calculation(*_args, **_kwargs):
+            raise AssertionError("history must not calculate indicators")
+
+        async def unexpected_state_calculation(*_args, **_kwargs):
+            raise AssertionError("history must not calculate states")
+
+        indicator_service.calculate = unexpected_indicator_calculation
+        state_service.calculate = unexpected_state_calculation
+
+        indicator_rows = await indicator_service.history(
+            "600519", start=date(2026, 1, 10), end=date(2026, 1, 12)
+        )
+        state_rows = await state_service.history(
+            "600519", start=date(2026, 1, 10), end=date(2026, 1, 12)
+        )
+
+        assert indicator_rows
+        assert state_rows
+
+
+async def test_history_rejects_non_prd_adjustment(indicator_context) -> None:
+    async with indicator_context() as session:
+        service = IndicatorService(session)
+        await service.calculate("600519")
+        try:
+            await service.history("600519", adjustment="none")
+        except ApiError as error:
+            assert error.code == "UNSUPPORTED_HISTORY_ADJUSTMENT"
+            assert error.status_code == 400
+        else:
+            raise AssertionError("history must reject the non-PRD adjustment series")
+
+        state_service = StateService(session)
+        await state_service.calculate("600519")
+        try:
+            await state_service.history("600519", adjustment="none")
+        except ApiError as error:
+            assert error.code == "UNSUPPORTED_HISTORY_ADJUSTMENT"
+        else:
+            raise AssertionError("state history must reject the non-PRD adjustment series")
+
+
+async def test_indicator_and_state_persistence_reject_none_without_writing(
+    indicator_context,
+) -> None:
+    async with indicator_context() as session:
+        indicator_service = IndicatorService(session)
+        state_service = StateService(session)
+
+        before_snapshots = (
+            await session.execute(select(func.count()).select_from(IndicatorSnapshot))
+        ).scalar_one()
+        before_states = (
+            await session.execute(select(func.count()).select_from(IndicatorState))
+        ).scalar_one()
+
+        for operation in (
+            lambda: indicator_service.calculate("600519", adjustment="none"),
+            lambda: indicator_service.latest("600519", adjustment="none"),
+            lambda: state_service.calculate("600519", adjustment="none"),
+            lambda: state_service.current("600519", adjustment="none"),
+        ):
+            try:
+                await operation()
+            except ApiError as error:
+                assert error.code == "UNSUPPORTED_INDICATOR_ADJUSTMENT"
+                assert error.status_code == 400
+            else:
+                raise AssertionError("indicator/state persistence must reject none")
+
+        after_snapshots = (
+            await session.execute(select(func.count()).select_from(IndicatorSnapshot))
+        ).scalar_one()
+        after_states = (
+            await session.execute(select(func.count()).select_from(IndicatorState))
+        ).scalar_one()
+        assert after_snapshots == before_snapshots == 0
+        assert after_states == before_states == 0
 
 
 def test_indicator_projection_has_stable_delta_for_missing_and_present_values() -> None:

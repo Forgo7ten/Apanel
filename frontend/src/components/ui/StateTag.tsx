@@ -33,12 +33,14 @@ export function stateToneFromLevel(level?: string | null): StateTone {
 export function StateTag({
   tone = "neutral",
   children,
+  compact = false,
 }: {
   tone?: StateTone;
   children: ReactNode;
+  compact?: boolean;
 }) {
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[11px] font-medium ${toneStyles[tone]}`}>
+    <span className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border font-medium ${compact ? "h-5 px-1.5 py-0 text-[10px] leading-4" : "px-2 py-1 text-[11px]"} ${toneStyles[tone]}`}>
       <span className={`size-1.5 rounded-full ${dotStyles[tone]}`} />
       {children}
     </span>

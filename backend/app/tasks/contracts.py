@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Protocol
 
+from app.services.indicator_service import DEFAULT_INDICATOR_ADJUSTMENT
+
 EOD_STEP_ORDER: tuple[str, ...] = (
     "daily_sync",
     "adjustment_ready",
@@ -62,8 +64,10 @@ class PipelineContext:
 
     def __post_init__(self) -> None:
         adjustment = str(self.adjustment).strip().lower()
-        if adjustment not in {"qfq", "none"}:
-            raise ValueError("adjustment must be qfq or none")
+        if adjustment != DEFAULT_INDICATOR_ADJUSTMENT:
+            raise PipelineConfigurationError(
+                "indicator and state persistence require qfq adjustment"
+            )
         self.adjustment = adjustment
         self.symbols = tuple(
             dict.fromkeys(

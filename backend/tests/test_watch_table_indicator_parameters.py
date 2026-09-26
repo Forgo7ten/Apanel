@@ -227,7 +227,11 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
     assert stock["indicators"]["BOLL"]["upper"] == 110.0
     assert stock["indicators"]["BOLL"]["current_value"]["upper"] == 110.0
     assert stock["indicators"]["BOLL"]["delta"]["width"] == -0.01
-    assert stock["column_values"][str(ma_column.json()["data"]["id"])] == {
+    ma_column_value = stock["column_values"][str(ma_column.json()["data"]["id"])]
+    assert ma_column_value["parameter_key"].startswith("v1_")
+    assert {
+        key: value for key, value in ma_column_value.items() if key != "parameter_key"
+    } == {
         "column_id": ma_column.json()["data"]["id"],
         "view_mode": "DELTA",
         "indicator_type": "MA",
@@ -239,6 +243,7 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
         "direction": "UP",
     }
     boll_column_value = stock["column_values"][str(boll_column.json()["data"]["id"])]
+    assert boll_column_value["parameter_key"].startswith("v1_")
     assert boll_column_value["view_mode"] == "COMPOSITE"
     assert boll_column_value["available"] is True
     assert boll_column_value["fields"]["width"] == {

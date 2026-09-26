@@ -11,7 +11,7 @@ import {
   type VisibilityState,
 } from "@tanstack/react-table";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   Identifier,
@@ -32,12 +32,28 @@ import {
 import { getColumnTitle, getIndicatorValue } from "@/components/indicators/indicator-utils";
 import { IndicatorCell } from "@/components/indicators/IndicatorCell";
 import { isApiError } from "@/lib/api-errors";
-import { toColumnOrderPayload } from "@/lib/watch-contract.mjs";
+import { isDetailActivationKey } from "@/lib/detail-contract.mjs";
+import { getColumnFields } from "@/lib/indicator-contract.mjs";
+import {
+  calculateVirtualRange,
+  toColumnOrderPayload,
+  virtualScrollTopForKey,
+  WATCH_COMPOSITE_LAYOUT,
+  watchRowLayoutContract,
+} from "@/lib/watch-contract.mjs";
 import { useWatchStore } from "@/stores/watch-store";
 import { stateToneFromLevel, StateTag } from "@/components/ui/StateTag";
+import {
+  IndicatorDetailsDrawer,
+  type DetailNotificationHandler,
+  type DetailSelection,
+} from "@/components/indicators/IndicatorDetailsDrawer";
 
 import { AddColumnDialog } from "./AddColumnDialog";
 import { ColumnManager, type ColumnManagerItem } from "./ColumnManager";
+
+const WATCH_OVERSCAN = 4;
+const DEFAULT_VIEWPORT_HEIGHT = 560;
 
 function columnId(column: WatchTableColumn, index: number): string {
   return String(column.id ?? column.key ?? column.indicator_type ?? `${column.type}-${index}`);
@@ -88,20 +104,37 @@ function SortableHeader({ header }: { header: Header<WatchTableStock, unknown> }
   );
 }
 
-function StateList({ states }: { states: IndicatorState[] }) {
+function StateList({ states, onOpen }: { states: IndicatorState[]; onOpen?: (state: IndicatorState, trigger: HTMLButtonElement) => void }) {
   if (states.length === 0) return <span className="text-xs text-muted">—</span>;
 
   return (
-    <div className="flex max-w-[260px] flex-wrap gap-1">
-      {states.slice(0, 3).map((state) => (
-        <StateTag key={state.state_id} tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>
+    <div className="flex h-5 max-w-[260px] flex-nowrap items-center gap-1 overflow-x-auto">
+      {states.slice(0, WATCH_COMPOSITE_LAYOUT.maxStateTags).map((state) => (
+        <button
+          key={state.state_id}
+          type="button"
+          onClick={(event) => onOpen?.(state, event.currentTarget)}
+          onKeyDown={(event) => {
+            if (!isDetailActivationKey(event.key)) return;
+            event.preventDefault();
+            onOpen?.(state, event.currentTarget);
+          }}
+          className="rounded-full focus:outline-none focus:ring-2 focus:ring-brand/40"
+          aria-label={`查看状态${state.title}详情`}
+        >
+          <StateTag compact tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>
+        </button>
       ))}
-      {states.length > 3 ? <span className="self-center text-[11px] text-muted">+{states.length - 3}</span> : null}
+      {states.length > WATCH_COMPOSITE_LAYOUT.maxStateTags ? <span className="shrink-0 self-center text-[11px] text-muted">+{states.length - WATCH_COMPOSITE_LAYOUT.maxStateTags}</span> : null}
     </div>
   );
 }
 
-function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock, unknown>[] {
+function buildColumnDefs(
+  columns: WatchTableColumn[],
+  onOpenIndicator: (stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => void,
+  onOpenState: (stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => void,
+): ColumnDef<WatchTableStock, unknown>[] {
   const dynamicColumns = columns.map((column, index) => {
     const id = columnId(column, index);
     return {
@@ -114,7 +147,21 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
         if (typeof valueA === "number" && typeof valueB === "number") return valueA - valueB;
         return String(valueA).localeCompare(String(valueB), "zh-CN", { numeric: true });
       },
-      cell: ({ row }) => <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />,
+      cell: ({ row }) => (
+        <button
+          type="button"
+          onClick={(event) => onOpenIndicator(row.original, column, event.currentTarget)}
+          onKeyDown={(event) => {
+            if (!isDetailActivationKey(event.key)) return;
+            event.preventDefault();
+            onOpenIndicator(row.original, column, event.currentTarget);
+          }}
+          className="rounded-panel text-left focus:outline-none focus:ring-2 focus:ring-brand/40"
+          aria-label={`查看${getColumnTitle(column)}详情`}
+        >
+          <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />
+        </button>
+      ),
       meta: { label: getColumnTitle(column), movable: true, width: column.width },
     } satisfies ColumnDef<WatchTableStock, unknown>;
   });
@@ -128,7 +175,7 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
       cell: ({ row }) => {
         const stock = row.original;
         return (
-          <div className="min-w-[150px]">
+          <div className="min-w-[150px] whitespace-nowrap">
             <p className="font-medium text-primary">{stock.name ?? stock.security?.name ?? "未命名证券"}</p>
             <p className="mt-1 font-mono text-[11px] text-muted">{stock.symbol}</p>
           </div>
@@ -149,7 +196,7 @@ function buildColumnDefs(columns: WatchTableColumn[]): ColumnDef<WatchTableStock
       id: "states",
       accessorFn: (stock) => stock.states?.map((state) => state.title).join(" ") ?? "",
       header: "状态",
-      cell: ({ row }) => <StateList states={row.original.states ?? []} />,
+      cell: ({ row }) => <StateList states={row.original.states ?? []} onOpen={(state, trigger) => onOpenState(row.original, state, trigger)} />,
       meta: { label: "状态", movable: false, toggleable: false },
     },
   ];
@@ -222,11 +269,36 @@ function mutationErrorMessage(error: unknown): string | null {
   return error instanceof Error ? error.message : "操作失败，请稍后重试。";
 }
 
-export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; onAddStock?: () => void }) {
+export function WatchTable({
+  table,
+  onAddStock,
+  onCreateNotification,
+}: {
+  table: WatchTableDetails;
+  onAddStock?: (trigger?: HTMLButtonElement) => void;
+  onCreateNotification?: DetailNotificationHandler;
+}) {
   const queryClient = useQueryClient();
   const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
+  const addColumnTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeAddColumnDialog = useCallback(() => setAddColumnOpen(false), []);
+  const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(DEFAULT_VIEWPORT_HEIGHT);
   const tableId = table.id;
+
+  const openIndicatorDetail = useCallback((stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => {
+    detailTriggerRef.current = trigger;
+    setDetailSelection({ kind: "indicator", stock, column });
+  }, []);
+  const openStateDetail = useCallback((stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => {
+    detailTriggerRef.current = trigger;
+    setDetailSelection({ kind: "state", stock, state });
+  }, []);
+  const closeDetail = useCallback(() => setDetailSelection(null), []);
 
   const removeStockMutation = useMutation({
     mutationFn: ({ securityId }: { securityId: Identifier }) => removeStockFromWatchTable(tableId, securityId),
@@ -299,7 +371,10 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
   );
   const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
   const removeStock = removeStockMutation.mutate;
-  const baseColumnDefs = useMemo(() => buildColumnDefs(columns), [columns]);
+  const baseColumnDefs = useMemo(
+    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail),
+    [columns, openIndicatorDetail, openStateDetail],
+  );
   const columnDefs = useMemo(
     () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId })],
     [baseColumnDefs, pendingSecurityId, removeStock],
@@ -350,6 +425,62 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
   });
+  const tableRows = tableInstance.getRowModel().rows;
+  const maxCompositeFields = useMemo(() => {
+    let maximum = 0;
+    for (const column of columns) {
+      if (String(column.view_mode ?? "").toUpperCase() !== "COMPOSITE") continue;
+      for (const stock of table.stocks ?? []) {
+        maximum = Math.max(maximum, getColumnFields(getIndicatorValue(stock, column)).length);
+      }
+    }
+    return maximum;
+  }, [columns, table.stocks]);
+  const rowLayout = useMemo(() => watchRowLayoutContract(maxCompositeFields), [maxCompositeFields]);
+  const rowHeight = rowLayout.rowHeight;
+  const virtualRange = useMemo(
+    () => calculateVirtualRange({
+      itemCount: tableRows.length,
+      scrollTop,
+      viewportHeight,
+      rowHeight,
+      overscan: WATCH_OVERSCAN,
+    }),
+    [rowHeight, scrollTop, tableRows.length, viewportHeight],
+  );
+  const visibleRows = tableRows.slice(virtualRange.start, virtualRange.end);
+  const updateViewportHeight = useCallback(() => {
+    const element = viewportRef.current;
+    if (element) setViewportHeight(element.clientHeight || DEFAULT_VIEWPORT_HEIGHT);
+  }, []);
+  const handleViewportScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(event.currentTarget.scrollTop);
+  }, []);
+  const handleViewportKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
+    const nextScrollTop = virtualScrollTopForKey(
+      event.key,
+      event.currentTarget.scrollTop,
+      event.currentTarget.clientHeight,
+      virtualRange.totalHeight,
+      rowHeight,
+    );
+    if (nextScrollTop === null) return;
+    event.preventDefault();
+    event.currentTarget.scrollTop = nextScrollTop;
+    setScrollTop(nextScrollTop);
+  }, [rowHeight, virtualRange.totalHeight]);
+
+  useEffect(() => {
+    setScrollTop(0);
+    if (viewportRef.current) viewportRef.current.scrollTop = 0;
+  }, [tableId]);
+
+  useEffect(() => {
+    updateViewportHeight();
+    window.addEventListener("resize", updateViewportHeight);
+    return () => window.removeEventListener("resize", updateViewportHeight);
+  }, [updateViewportHeight]);
 
   function updateColumn(id: string, input: UpdateColumnInput) {
     const columnIdValue = persistentColumnId(id);
@@ -401,7 +532,7 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           {columns.length === 0 ? <span className="text-[11px] text-muted">暂无指标列</span> : null}
-          <button type="button" onClick={() => { setActionError(null); setAddColumnOpen(true); }} className="inline-flex h-8 items-center gap-1.5 rounded-panel bg-brand px-2.5 text-xs font-medium text-white transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
+          <button type="button" onClick={(event) => { addColumnTriggerRef.current = event.currentTarget; setActionError(null); setAddColumnOpen(true); }} className="inline-flex h-8 items-center gap-1.5 rounded-panel bg-brand px-2.5 text-xs font-medium text-white transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
             <span className="text-base leading-none">+</span>
             添加指标列
           </button>
@@ -423,11 +554,21 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
         </div>
       </div>
       {actionError ? <p className="border-b border-negative/30 bg-negative/10 px-4 py-2 text-xs text-negative" role="alert">{actionError}</p> : null}
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[860px] border-collapse text-left" aria-label={`${table.name}股票监控表`}>
-          <thead className="h-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary">
+      <div
+        ref={viewportRef}
+        className="max-h-[min(70vh,720px)] min-h-[180px] overflow-auto focus:outline-none focus:ring-2 focus:ring-brand/40"
+        onScroll={handleViewportScroll}
+        onKeyDown={handleViewportKeyDown}
+        tabIndex={0}
+        role="region"
+        aria-label={`${table.name}股票监控数据`}
+        aria-describedby={`watch-table-keyboard-help-${String(tableId)}`}
+      >
+        <p id={`watch-table-keyboard-help-${String(tableId)}`} className="sr-only">聚焦此区域后，使用上下方向键按行移动，PageUp/PageDown 按页移动，Home/End 跳转首尾；移动后按 Tab 访问当前区域内的操作。</p>
+        <table className="w-full min-w-[860px] border-collapse text-left" aria-label={`${table.name}股票监控表`} aria-rowcount={tableRows.length + 1}>
+          <thead className="sticky top-0 z-10 h-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary">
             {tableInstance.getHeaderGroups().map((headerGroup) => (
-              <tr key={headerGroup.id}>
+              <tr key={headerGroup.id} aria-rowindex={1}>
                 {headerGroup.headers.map((header) => (
                   <th key={header.id} style={columnWidthStyle(columns, header.column.id)} className="whitespace-nowrap px-4 font-medium first:pl-5 last:pr-5">
                     {header.isPlaceholder ? null : <SortableHeader header={header} />}
@@ -437,30 +578,50 @@ export function WatchTable({ table, onAddStock }: { table: WatchTableDetails; on
             ))}
           </thead>
           <tbody className="divide-y divide-line/80">
-            {tableInstance.getRowModel().rows.length === 0 ? (
+            {tableRows.length === 0 ? (
               <tr>
                 <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)}>
                   <div className="flex min-h-44 flex-col items-center justify-center px-6 py-10 text-center">
                     <p className="text-sm font-medium text-primary">还没有监控股票</p>
                     <p className="mt-1.5 text-xs text-muted">添加第一只股票后，后端行情和指标会出现在这里。</p>
-                    {onAddStock ? <button type="button" onClick={onAddStock} className="mt-4 rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white hover:bg-brand/90">添加股票</button> : null}
+                    {onAddStock ? <button type="button" onClick={(event) => onAddStock(event.currentTarget)} className="mt-4 rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">添加股票</button> : null}
                   </div>
                 </td>
               </tr>
             ) : null}
-            {tableInstance.getRowModel().rows.map((row) => (
-              <tr key={row.id} className="align-middle transition-colors hover:bg-card/40">
+            {tableRows.length > 0 ? (
+              <>
+                {virtualRange.offsetTop > 0 ? (
+                  <tr aria-hidden="true" role="presentation">
+                    <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)} className="p-0" style={{ height: virtualRange.offsetTop }} />
+                  </tr>
+                ) : null}
+                {visibleRows.map((row, visibleIndex) => (
+              <tr key={row.id} aria-rowindex={virtualRange.start + visibleIndex + 2} style={{ height: rowHeight }} className="align-middle transition-colors hover:bg-card/40">
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} style={columnWidthStyle(columns, cell.column.id)} className="px-4 py-3.5 first:pl-5 last:pr-5">
+                  <td key={cell.id} style={{ ...(columnWidthStyle(columns, cell.column.id) ?? {}), height: rowHeight }} className="whitespace-nowrap px-4 py-0 first:pl-5 last:pr-5">
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}
               </tr>
-            ))}
+                ))}
+                {virtualRange.offsetBottom > 0 ? (
+                  <tr aria-hidden="true" role="presentation">
+                    <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)} className="p-0" style={{ height: virtualRange.offsetBottom }} />
+                  </tr>
+                ) : null}
+              </>
+            ) : null}
           </tbody>
         </table>
       </div>
-      {addColumnOpen ? <AddColumnDialog tableId={tableId} onClose={() => setAddColumnOpen(false)} /> : null}
+      {addColumnOpen ? <AddColumnDialog tableId={tableId} restoreFocusRef={addColumnTriggerRef} onClose={closeAddColumnDialog} /> : null}
+      <IndicatorDetailsDrawer
+        selection={detailSelection}
+        onClose={closeDetail}
+        restoreFocusRef={detailTriggerRef}
+        onCreateNotification={onCreateNotification}
+      />
     </div>
   );
 }
