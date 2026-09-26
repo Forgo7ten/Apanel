@@ -2,7 +2,7 @@ import type { IndicatorState, IndicatorViewMode } from "@/api/types";
 import { StateTag, stateToneFromLevel } from "@/components/ui/StateTag";
 
 import { CompositeCell } from "./CompositeCell";
-import { formatMetricValue, getDelta, getDirection, getDisplayNumber, isRecord } from "./indicator-utils";
+import { formatMetricValue, getDelta, getDirection, getDisplayNumber, getFieldValue, isRecord } from "./indicator-utils";
 
 type IndicatorCellProps = {
   mode: IndicatorViewMode;
@@ -11,6 +11,8 @@ type IndicatorCellProps = {
 };
 
 function DeltaCell({ value }: { value: unknown }) {
+  const currentValue = getFieldValue(value, "value");
+  const previousValue = getFieldValue(value, "previous_value");
   const delta = getDelta(value);
   const direction = getDirection(value);
   const normalizedDelta = typeof delta === "number" ? Math.abs(delta) : typeof delta === "string" && delta.startsWith("-") ? delta.slice(1) : delta;
@@ -18,11 +20,11 @@ function DeltaCell({ value }: { value: unknown }) {
 
   return (
     <div className="space-y-0.5">
-      <div className="tabular-nums text-sm text-primary">{formatMetricValue(value)}</div>
+      <div className="tabular-nums text-sm text-primary">{formatMetricValue(currentValue)}</div>
       {deltaText !== null ? (
         <div className={`text-xs tabular-nums ${direction === "UP" ? "text-positive" : direction === "DOWN" ? "text-negative" : "text-muted"}`}>
           {direction === "UP" ? "↑" : direction === "DOWN" ? "↓" : "→"}
-          {deltaText}
+          {deltaText}{previousValue !== null ? <span className="ml-1 text-muted">(前 {formatMetricValue(previousValue)})</span> : null}
         </div>
       ) : null}
     </div>
@@ -51,6 +53,6 @@ export function IndicatorCell({ mode, value, states = [] }: IndicatorCellProps) 
       return <CompositeCell value={value} states={states} />;
     case "NUMBER":
     default:
-      return <span className="text-sm tabular-nums text-primary">{formatMetricValue(getDisplayNumber(value))}</span>;
+      return <span className="text-sm tabular-nums text-primary">{formatMetricValue(getFieldValue(value, "value") ?? getDisplayNumber(value))}</span>;
   }
 }

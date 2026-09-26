@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
+from app.indicators.parameters import IndicatorVariant, select_snapshot_variant
 from app.models import (
     IndicatorSnapshot as IndicatorSnapshotModel,
 )
@@ -75,8 +76,23 @@ class StateService:
                 if current_model is None:
                     continue
                 previous_model = previous_by_indicator.get(definition.indicator_type)
-                current = _to_domain_snapshot(current_model)
-                previous = _to_domain_snapshot(previous_model) if previous_model else None
+                current_variant = select_snapshot_variant(
+                    current_model,
+                    definition.indicator_type,
+                )
+                previous_variant = (
+                    select_snapshot_variant(previous_model, definition.indicator_type)
+                    if previous_model
+                    else None
+                )
+                if current_variant is None:
+                    continue
+                current = _to_domain_snapshot(current_model, current_variant)
+                previous = (
+                    _to_domain_snapshot(previous_model, previous_variant)
+                    if previous_model and previous_variant
+                    else None
+                )
                 prior_row = (
                     existing_by_key.get((previous_date, definition.code))
                     if previous_date is not None
@@ -204,19 +220,25 @@ class StateService:
             )
 
 
-def _to_domain_snapshot(model: IndicatorSnapshotModel | None) -> IndicatorSnapshot | None:
+def _to_domain_snapshot(
+    model: IndicatorSnapshotModel | None,
+    variant: IndicatorVariant | None = None,
+) -> IndicatorSnapshot | None:
     if model is None:
+        return None
+    variant = variant or select_snapshot_variant(model, model.indicator_type)
+    if variant is None:
         return None
     return IndicatorSnapshot(
         indicator=model.indicator_type,
-        values=model.values,
-        previous_values=model.previous_values,
+        values=variant.values,
+        previous_values=variant.previous_values,
         # The state domain contract accepts scalar numeric parameters.  MA
         # stores its two periods as a JSON list for the persistence/API
         # contract, so retain only scalar entries at this boundary.
         parameters={
             key: value
-            for key, value in model.parameters.items()
+            for key, value in variant.parameters.items()
             if isinstance(value, (int, float)) and not isinstance(value, bool)
         },
     )

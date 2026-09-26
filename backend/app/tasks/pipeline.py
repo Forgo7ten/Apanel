@@ -10,7 +10,13 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.models import Security, WatchTableSymbol
+from app.core.errors import ApiError
+from app.indicators.parameters import (
+    IndicatorRequest,
+    canonicalize_parameters,
+    merge_indicator_requests,
+)
+from app.models import Security, TableColumn, WatchTableSymbol
 from app.repositories.indicator_state import IndicatorStateRepository
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
@@ -139,12 +145,15 @@ def build_default_eod_steps(
     async def indicator_snapshots(context: PipelineContext) -> Mapping[str, int]:
         if session_factory is None:
             raise PipelineConfigurationError("indicator session factory is not configured")
+        async with session_factory() as session:
+            requests_by_symbol = await collect_indicator_requests(session, context.symbols)
         counts: dict[str, int] = {}
         for symbol in context.symbols:
             async with session_factory() as session:
                 rows = await IndicatorService(session).calculate(
                     symbol,
                     adjustment=context.adjustment,
+                    requests=requests_by_symbol.get(symbol),
                 )
             counts[symbol] = len(rows)
         return counts
@@ -371,12 +380,70 @@ async def resolve_watched_symbols(session_factory: Any) -> tuple[str, ...]:
         return tuple(str(symbol) for symbol in result.scalars())
 
 
+async def collect_indicator_requests(
+    session: Any,
+    symbols: Iterable[str],
+) -> dict[str, tuple[IndicatorRequest, ...]]:
+    """Collect shared calculation demand from all columns using each symbol.
+
+    Columns are configuration, not an ownership boundary for the shared
+    indicator data.  We therefore union every table's requests for a symbol;
+    the watch-table service still enforces user ownership when projecting the
+    result back to a caller.
+    """
+
+    normalized_symbols = tuple(str(symbol).strip().upper() for symbol in symbols)
+    if not normalized_symbols:
+        return {}
+    statement = (
+        select(Security.symbol, TableColumn.indicator_type, TableColumn.parameters)
+        .join(WatchTableSymbol, WatchTableSymbol.security_id == Security.id)
+        .join(TableColumn, TableColumn.watch_table_id == WatchTableSymbol.watch_table_id)
+        .where(
+            Security.symbol.in_(normalized_symbols),
+            TableColumn.indicator_type.is_not(None),
+        )
+    )
+    result = await session.execute(statement)
+    raw_by_symbol: dict[str, list[IndicatorRequest]] = {
+        symbol: [] for symbol in normalized_symbols
+    }
+    for symbol, indicator_type, parameters in result.all():
+        if not indicator_type:
+            continue
+        raw_parameters = dict(parameters or {})
+        raw_parameters = {
+            key: value
+            for key, value in raw_parameters.items()
+            if str(key).strip().lower() != "field"
+        }
+        try:
+            canonical = canonicalize_parameters(indicator_type, raw_parameters, fill_defaults=True)
+        except ApiError:
+            logger.warning(
+                "scheduled_indicator_column_ignored",
+                extra={
+                    "event": "scheduled_indicator_column_ignored",
+                    "indicator_type": indicator_type,
+                },
+            )
+            continue
+        raw_by_symbol.setdefault(str(symbol), []).append(
+            IndicatorRequest(str(indicator_type), canonical)
+        )
+    return {
+        symbol: merge_indicator_requests(requests)
+        for symbol, requests in raw_by_symbol.items()
+    }
+
+
 __all__ = [
     "ALERT_ENTRYPOINTS",
     "EODPipeline",
     "NOTIFICATION_ENTRYPOINTS",
     "PipelineDataError",
     "build_default_eod_steps",
+    "collect_indicator_requests",
     "resolve_alert_runner",
     "resolve_notification_runner",
     "resolve_watched_symbols",

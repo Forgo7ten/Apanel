@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 
 import type { Identifier } from "@/api/types";
-import { createWatchTable, getWatchTable, getWatchTables } from "@/api/watch";
+import { createWatchTable, deleteWatchTable, getWatchTable, getWatchTables } from "@/api/watch";
 import { AddStockDialog } from "@/components/table/AddStockDialog";
 import { WatchTable } from "@/components/table/WatchTable";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -44,6 +44,16 @@ export default function WatchPage() {
       resetTableView();
     },
   });
+  const deleteMutation = useMutation({
+    mutationFn: (tableId: Identifier) => deleteWatchTable(tableId),
+    onSuccess: async (_result, tableId) => {
+      queryClient.setQueryData<typeof tables>(["watch-tables"], (current) => current?.filter((table) => !sameId(table.id, tableId)));
+      queryClient.removeQueries({ queryKey: ["watch-table", tableId] });
+      setSelectedTableId(null);
+      resetTableView();
+      await queryClient.invalidateQueries({ queryKey: ["watch-tables"] });
+    },
+  });
 
   useEffect(() => {
     if (tables.length === 0) {
@@ -72,6 +82,12 @@ export default function WatchPage() {
     : createError instanceof Error
       ? createError.message
       : null;
+  const deleteError = deleteMutation.error;
+  const deleteErrorMessage = isApiError(deleteError) && deleteError.status === 404
+    ? "当前监控表不存在或无权限，请刷新后重试。"
+    : deleteError instanceof Error
+      ? deleteError.message
+      : null;
 
   return (
     <div className="space-y-5">
@@ -83,13 +99,25 @@ export default function WatchPage() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {activeTableId !== null ? (
-            <button type="button" onClick={() => setAddDialogOpen(true)} className="inline-flex h-9 items-center justify-center gap-2 rounded-panel bg-brand px-3.5 text-sm font-medium text-white shadow-panel transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
-              <span className="text-base leading-none">+</span>
-              添加股票
-            </button>
+            <>
+              <button type="button" onClick={() => setAddDialogOpen(true)} className="inline-flex h-9 items-center justify-center gap-2 rounded-panel bg-brand px-3.5 text-sm font-medium text-white shadow-panel transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
+                <span className="text-base leading-none">+</span>
+                添加股票
+              </button>
+              <button
+                type="button"
+                disabled={deleteMutation.isPending}
+                onClick={() => deleteMutation.mutate(activeTableId)}
+                className="inline-flex h-9 items-center justify-center rounded-panel border border-negative/30 bg-negative/5 px-3 text-sm font-medium text-negative transition hover:bg-negative/10 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {deleteMutation.isPending ? "删除中…" : "删除当前表格"}
+              </button>
+            </>
           ) : null}
         </div>
       </section>
+
+      {deleteErrorMessage ? <p className="rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs text-negative" role="alert">{deleteErrorMessage}</p> : null}
 
       {tablesQuery.isPending ? <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel"><LoadingState label="正在加载监控表…" /></div> : null}
       {tablesQuery.isError ? <div className="rounded-panel border border-line bg-panel shadow-panel"><QueryErrorState error={tablesQuery.error} onRetry={() => tablesQuery.refetch()} /></div> : null}
@@ -142,7 +170,7 @@ export default function WatchPage() {
             <div className="min-w-0">
               {detailsQuery.isPending ? <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel"><LoadingState /></div> : null}
               {detailsQuery.isError ? <div className="rounded-panel border border-line bg-panel shadow-panel"><QueryErrorState error={detailsQuery.error} onRetry={() => detailsQuery.refetch()} /></div> : null}
-              {detailsQuery.data ? <WatchTable table={detailsQuery.data} /> : null}
+              {detailsQuery.data ? <WatchTable table={detailsQuery.data} onAddStock={() => setAddDialogOpen(true)} /> : null}
             </div>
             <aside className="h-fit rounded-panel border border-line bg-panel p-card shadow-panel">
               <div className="flex items-center justify-between">
