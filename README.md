@@ -110,5 +110,8 @@ compose.yaml             本地服务编排
 - 指标结果和状态结果目前是后端纯计算对象，尚未写入 `IndicatorSnapshot` 等持久化表，也没有把它们接入前端表格。
 - 通知 provider 目前只有抽象边界，没有可用的飞书、邮件或其他发送实现。
 - `scheduler` 会启动 Celery Beat，但当前 Beat schedule 为空；Compose 没有单独的 Celery worker 服务。
-- provider 注册表当前只注册 `tdx`。TDX 默认客户端的原始日线是未复权数据；请求 `qfq` 需要注入复权因子转换器。默认行情服务没有注入该转换器，因此实际同步未复权日线时应显式使用 `adjustment=none`。
+- provider 注册表的全量行情 provider 当前只注册 `tdx`；证券主数据默认另有懒加载的 AKShare fallback，TDX
+  证券列表失败或为空时才使用。AKShare 不负责报价、日线或分红。TDX 默认客户端的原始日线是未复权数据；
+  请求 `qfq` 需要注入复权因子转换器。默认行情服务没有注入该转换器，因此实际同步未复权日线时应显式使用
+  `adjustment=none`。
 - TDX 网络节点和第三方数据可用性不由本仓库保证；部署前应自行验证数据授权、连通性和数据口径。

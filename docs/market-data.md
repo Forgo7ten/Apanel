@@ -26,6 +26,23 @@
 
 当前 `ProviderRegistry` 只注册 `tdx`。`TDXProvider` 把阻塞的 client 调用放到 worker thread，并使用超时、重试和多节点连接策略；无效记录、超时、provider 不可用和未配置会转换为稳定的 provider 错误类型。
 
+证券主数据另有 `SecurityMasterProvider` seam。组合 provider 每次先调用 TDX
+`get_symbols()`；TDX 返回非空完整批次时绝不调用 fallback，只有 TDX 失败或返回空批次才调用 AKShare。
+AKShare 通过 `stock_info_a_code_name()` 获取股票、通过 `fund_etf_spot_em()` 获取 ETF；两个源都必须分别完整读取、字段校验和数量阈值校验通过后，才合成一个批次。股票使用
+`code/name` 并标记为 `STOCK`，ETF 使用 `代码/名称` 并标记为 `ETF`，市场由现有领域规则推断为
+`SH`、`SZ` 或 `BJ`。空源、缺列、空名称、非法代码、重复冲突或低于最低数量会让整个 AKShare
+源失败，不会把 TDX 部分结果与 AKShare 结果混合，也不会写入半批数据。
+
+AKShare 调用是阻塞函数，适配器会在 worker thread 中以一个独立总超时执行，并保证超时后的后台线程
+结束前不会启动重叠航班；每次调用前会清理上游函数提供的 `cache_clear`，避免长驻进程复用永久旧快照。
+AKShare 依赖固定为 `akshare==1.18.97`，仅在 fallback 实际被调用时懒加载；TDX 成功路径不会导入或调用
+AKShare。股票最低默认 `1000` 条、ETF 最低默认 `1` 条，可通过配置调整。两边都失败时只返回稳定的
+`PROVIDER_UNAVAILABLE`/`ProviderUnavailableError` 语义，不向响应暴露上游正文或 URL。
+
+AKShare fallback 只负责证券主数据。报价、日线和现金分红始终继续使用原 TDX provider；AKShare
+不会注册为全局 `MARKET_DATA_PROVIDER` 替代物。配置见[配置参考](configuration.md)中的
+`SECURITY_MASTER_FALLBACK_PROVIDER`、`AKSHARE_SECURITY_TIMEOUT_SECONDS` 和最低数量设置。
+
 默认依赖为 `pytdx==1.72`。默认 TDX 节点是：
 
 ```text
@@ -78,7 +95,8 @@ docker compose run --rm security-bootstrap
 
 重试间隔和 HTTP 超时可通过 `.env` 中的
 `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 与 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 调整。
-默认 bootstrap HTTP 超时为 90 秒，高于行情服务证券列表同步默认的 60 秒超时。
+默认 bootstrap HTTP 超时为 180 秒，覆盖行情服务 TDX 证券列表默认 60 秒与 AKShare 完整批次默认 90 秒，
+并保留少量 HTTP 开销余量。
 内部 token 只注入 bootstrap 容器的环境变量，不会写入命令输出或日志。
 
 ### 日线
@@ -114,6 +132,7 @@ Redis client 当前用于健康探针和基础设施连接边界，行情查询�
 ## 可用性限制
 
 - TDX 公网节点可能不可达，`pytdx` 及其数据口径也需要部署方自行验证。
-- 当前没有 AKShare、同花顺或其他已注册 provider；修改 `MARKET_DATA_PROVIDER` 为未注册名称会导致启动失败。
+- AKShare 仅作为证券主数据的默认备用 provider；修改 `SECURITY_MASTER_FALLBACK_PROVIDER` 为 `none` 可关闭，
+  修改 `MARKET_DATA_PROVIDER` 为未注册名称仍会导致启动失败。
 - 默认 Compose 不传递 TDX 细化调参变量；要修改节点、连接重试或分页上限，需要显式扩展 Compose 环境映射。
 - 行情 API 是内部接口，没有由 Nginx 发布给外部浏览器。

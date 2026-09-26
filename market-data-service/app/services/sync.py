@@ -20,7 +20,7 @@ from app.domain.market_data import (
     normalize_adjustment,
     normalize_symbol,
 )
-from app.providers.base import MarketDataProvider
+from app.providers.base import MarketDataProvider, SecurityMasterProvider
 from app.providers.errors import (
     ProviderConfigurationError,
     ProviderTimeoutError,
@@ -87,7 +87,12 @@ class SyncSummary:
 class SecuritySyncService:
     """Synchronize security metadata as one validated, atomic batch."""
 
-    def __init__(self, *, provider: MarketDataProvider, repository: SecurityRepository) -> None:
+    def __init__(
+        self,
+        *,
+        provider: SecurityMasterProvider,
+        repository: SecurityRepository,
+    ) -> None:
         self._provider = provider
         self._repository = repository
 

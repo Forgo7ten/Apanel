@@ -68,3 +68,26 @@ def test_tdx_server_configuration_rejects_empty_invalid_and_more_than_four_endpo
                 "five.test:7709",
             )
         )
+
+
+def test_security_master_fallback_defaults_to_akshare_with_conservative_thresholds() -> None:
+    settings = Settings()
+
+    assert settings.security_master_fallback_provider == "akshare"
+    assert settings.akshare_security_timeout_seconds == 90
+    assert settings.akshare_min_stock_count == 1000
+    assert settings.akshare_min_etf_count == 1
+
+
+def test_security_master_fallback_settings_are_configurable() -> None:
+    settings = Settings(
+        security_master_fallback_provider="none",
+        akshare_security_timeout_seconds=17,
+        akshare_min_stock_count=12,
+        akshare_min_etf_count=3,
+    )
+
+    assert settings.security_master_fallback_provider == "none"
+    assert settings.akshare_security_timeout_seconds == 17
+    assert settings.akshare_min_stock_count == 12
+    assert settings.akshare_min_etf_count == 3

@@ -1,4 +1,5 @@
 asyncpg>=0.30,<1
+akshare==1.18.97
 fastapi>=0.115,<1
 pydantic-settings>=2.6,<3
 pytdx==1.72

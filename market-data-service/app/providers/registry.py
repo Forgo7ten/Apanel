@@ -10,7 +10,11 @@ from typing import Any
 
 from app.core.config import Settings, get_settings
 
-from .base import MarketDataProvider
+from .base import MarketDataProvider, SecurityMasterProvider
+from .security import (
+    AkshareSecurityProvider,
+    SecurityMasterFallbackProvider,
+)
 from .tdx import TDXProvider
 from .tdx_client import PytdxClient
 
@@ -131,6 +135,49 @@ def create_provider(
             kwargs.setdefault("bar_page_size", selected_settings.tdx_bar_page_size)
             kwargs.setdefault("bar_max_pages", selected_settings.tdx_bar_max_pages)
     return registry.create(provider_name, **kwargs)
+
+
+def create_security_master_provider(
+    settings: Settings | None = None,
+    *,
+    primary: SecurityMasterProvider,
+    **kwargs: Any,
+) -> SecurityMasterProvider:
+    """Build the security-only TDX/AKShare composition.
+
+    AKShare is intentionally not registered in ``DEFAULT_PROVIDER_REGISTRY``:
+    it cannot provide the quote, daily-bar, or dividend capabilities owned by
+    the configured TDX provider.
+    """
+
+    selected_settings = settings or get_settings()
+    fallback_name = _provider_name(selected_settings.security_master_fallback_provider)
+    if fallback_name in {"none", "disabled", "off", "false"}:
+        return primary
+    if fallback_name != "akshare":
+        raise UnknownProviderError(
+            f"unknown security master fallback provider: {fallback_name!r}"
+        )
+    fallback = AkshareSecurityProvider(
+        timeout_seconds=kwargs.pop(
+            "timeout_seconds",
+            selected_settings.akshare_security_timeout_seconds,
+        ),
+        min_stock_count=kwargs.pop(
+            "min_stock_count",
+            selected_settings.akshare_min_stock_count,
+        ),
+        min_etf_count=kwargs.pop(
+            "min_etf_count",
+            selected_settings.akshare_min_etf_count,
+        ),
+        stock_fetcher=kwargs.pop("stock_fetcher", None),
+        etf_fetcher=kwargs.pop("etf_fetcher", None),
+    )
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"unexpected security master provider options: {unknown}")
+    return SecurityMasterFallbackProvider(primary=primary, fallback=fallback)
 
 
 get_provider = create_provider

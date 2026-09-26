@@ -9,11 +9,14 @@ from app.core.config import Settings
 from app.domain.market_data import DailyBar, Dividend, Quote, Security
 from app.providers.base import MarketDataProvider
 from app.providers.registry import (
+    DEFAULT_PROVIDER_REGISTRY,
     ProviderRegistry,
     UnknownProviderError,
     close_provider,
     create_provider,
+    create_security_master_provider,
 )
+from app.providers.security import AkshareSecurityProvider, SecurityMasterFallbackProvider
 from app.providers.tdx import TDXProvider
 from app.providers.tdx_client import PytdxClient
 
@@ -87,6 +90,40 @@ def test_default_tdx_registry_builds_configured_real_client_without_connecting()
     assert provider._client.servers[0].host == "first.test"
     assert provider._client.servers[0].port == 7709
     assert provider._symbol_timeout_seconds == 60
+
+
+def test_akshare_is_not_registered_as_the_global_market_data_provider() -> None:
+    assert "akshare" not in DEFAULT_PROVIDER_REGISTRY.available()
+
+
+def test_security_master_factory_builds_lazy_akshare_fallback_without_importing_it() -> None:
+    primary = StubProvider()
+    provider = create_security_master_provider(
+        Settings(
+            security_master_fallback_provider="akshare",
+            akshare_security_timeout_seconds=8,
+            akshare_min_stock_count=12,
+            akshare_min_etf_count=2,
+        ),
+        primary=primary,
+    )
+
+    assert isinstance(provider, SecurityMasterFallbackProvider)
+    assert isinstance(provider._fallback, AkshareSecurityProvider)
+    assert provider._fallback._timeout_seconds == 8
+    assert provider._fallback._min_stock_count == 12
+    assert provider._fallback._min_etf_count == 2
+
+
+def test_security_master_factory_can_disable_fallback_without_replacing_tdx() -> None:
+    primary = StubProvider()
+
+    provider = create_security_master_provider(
+        Settings(security_master_fallback_provider="none"),
+        primary=primary,
+    )
+
+    assert provider is primary
 
 
 def test_close_provider_runs_blocking_client_cleanup_off_loop() -> None:

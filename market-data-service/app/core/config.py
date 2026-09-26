@@ -61,6 +61,43 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     market_data_provider: str = Field(default="tdx", min_length=1)
     provider_timeout_seconds: float = Field(default=5.0, gt=0)
+    security_master_fallback_provider: str = Field(
+        default="akshare",
+        min_length=1,
+        validation_alias=AliasChoices(
+            "SECURITY_MASTER_FALLBACK_PROVIDER",
+            "SECURITY_FALLBACK_PROVIDER",
+        ),
+        description="Security metadata fallback name; use none to disable fallback.",
+    )
+    akshare_security_timeout_seconds: float = Field(
+        default=90.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "AKSHARE_SECURITY_TIMEOUT_SECONDS",
+            "SECURITY_MASTER_FALLBACK_TIMEOUT_SECONDS",
+            "AKSHARE_TIMEOUT_SECONDS",
+        ),
+        description="Total timeout for the complete AKShare security batch.",
+    )
+    akshare_min_stock_count: int = Field(
+        default=1000,
+        gt=0,
+        validation_alias=AliasChoices(
+            "AKSHARE_MIN_STOCK_COUNT",
+            "SECURITY_MASTER_MIN_STOCK_COUNT",
+            "SECURITY_MASTER_FALLBACK_MIN_STOCK_COUNT",
+        ),
+    )
+    akshare_min_etf_count: int = Field(
+        default=1,
+        gt=0,
+        validation_alias=AliasChoices(
+            "AKSHARE_MIN_ETF_COUNT",
+            "SECURITY_MASTER_MIN_ETF_COUNT",
+            "SECURITY_MASTER_FALLBACK_MIN_ETF_COUNT",
+        ),
+    )
     tdx_servers: Annotated[tuple[str, ...], NoDecode] = Field(
         default=DEFAULT_TDX_SERVERS,
         min_length=1,
@@ -118,6 +155,33 @@ class Settings(BaseSettings):
         if len(values) > 4:
             raise ValueError("tdx_servers must contain at most 4 endpoints")
         return values
+
+    @field_validator("security_master_fallback_provider")
+    @classmethod
+    def normalize_security_master_fallback_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("security_master_fallback_provider must not be empty")
+        return normalized
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_security_master_aliases(cls, value: object) -> object:
+        """Accept stable semantic aliases when constructing Settings directly."""
+
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        aliases = {
+            "security_master_fallback_timeout_seconds": "akshare_security_timeout_seconds",
+            "akshare_timeout_seconds": "akshare_security_timeout_seconds",
+            "security_master_min_stock_count": "akshare_min_stock_count",
+            "security_master_min_etf_count": "akshare_min_etf_count",
+        }
+        for alias, canonical in aliases.items():
+            if alias in data and canonical not in data:
+                data[canonical] = data[alias]
+        return data
 
     @model_validator(mode="after")
     def normalize_environment(self) -> "Settings":

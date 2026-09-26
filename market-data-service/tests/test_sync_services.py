@@ -8,7 +8,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.domain.market_data import Adjustment, DailyBar, Dividend, Quote, Security
 from app.providers.base import MarketDataProvider
-from app.providers.errors import ProviderTimeoutError
+from app.providers.errors import ProviderTimeoutError, ProviderUnavailableError
 from app.services.sync import (
     DailyBarSyncService,
     DividendSyncService,
@@ -93,6 +93,11 @@ class FailingSecurityRepository(MemoryRepository):
     async def upsert_many(self, records) -> None:
         self.batches.append(tuple(records))
         raise RuntimeError("security persistence failed")
+
+
+class BothSecuritySourcesUnavailableProvider(FakeProvider):
+    async def get_symbols(self) -> Sequence[Security]:
+        raise ProviderUnavailableError("Security master providers are unavailable.")
 
 
 class QuoteRepositoryMemory:
@@ -216,6 +221,22 @@ async def test_security_sync_calls_batch_repository_once_and_never_retries_per_s
     assert result.items[0].error is not None
     assert result.items[0].error.code == "PERSISTENCE_ERROR"
     assert len(repository.batches) == 1
+
+
+@pytest.mark.asyncio
+async def test_security_sync_does_not_call_repository_when_both_sources_fail() -> None:
+    repository = MemoryRepository()
+    service = SecuritySyncService(
+        provider=BothSecuritySourcesUnavailableProvider(),
+        repository=repository,
+    )
+
+    result = await service.sync()
+
+    assert result.ok is False
+    assert result.items[0].error is not None
+    assert result.items[0].error.code == "PROVIDER_UNAVAILABLE"
+    assert repository.batches == []
 
 
 @pytest.mark.asyncio

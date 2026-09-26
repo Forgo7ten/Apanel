@@ -42,6 +42,7 @@ def test_lifespan_initializes_and_closes_provider_resource() -> None:
     provider = ClosingProvider()
     with (
         patch("app.main.create_provider", return_value=provider) as create_provider,
+        patch("app.main.create_security_master_provider", return_value=provider) as create_security,
         patch("app.main.close_provider", new_callable=AsyncMock) as close_provider,
         patch("app.main.close_redis_client", new_callable=AsyncMock),
         patch("app.main.dispose_engine", new_callable=AsyncMock),
@@ -50,4 +51,25 @@ def test_lifespan_initializes_and_closes_provider_resource() -> None:
             assert app.state.provider is provider
 
     create_provider.assert_called_once()
+    create_security.assert_called_once()
     close_provider.assert_awaited_once_with(provider)
+
+
+def test_lifespan_uses_security_composite_only_for_security_sync() -> None:
+    app = create_app(Settings(app_env="test"))
+    tdx_provider = ClosingProvider()
+    security_provider = ClosingProvider()
+    with (
+        patch("app.main.create_provider", return_value=tdx_provider),
+        patch("app.main.create_security_master_provider", return_value=security_provider),
+        patch("app.main.close_provider", new_callable=AsyncMock),
+        patch("app.main.close_redis_client", new_callable=AsyncMock),
+        patch("app.main.dispose_engine", new_callable=AsyncMock),
+    ):
+        with TestClient(app):
+            assert app.state.provider is tdx_provider
+            assert app.state.security_provider is security_provider
+            assert app.state.security_sync_service._provider is security_provider
+            assert app.state.daily_sync_service._provider is tdx_provider
+            assert app.state.quote_sync_service._provider is tdx_provider
+            assert app.state.dividend_sync_service._provider is tdx_provider
