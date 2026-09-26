@@ -123,6 +123,9 @@ class NotificationData(BaseModel):
     channel: str
     status: str
     content: dict[str, Any]
+    error_code: str | None = None
+    error_message: str | None = None
+    retryable: bool = False
     indicator: str | None = None
     state_id: str | None = None
     created_at: datetime

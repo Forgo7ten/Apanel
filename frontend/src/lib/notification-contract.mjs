@@ -78,3 +78,14 @@ export function buildAlertPayload(form) {
   payload.threshold = threshold;
   return payload;
 }
+
+/**
+ * The backend owns the age/window calculation for PENDING rows.  The browser
+ * only trusts the explicit retryable flag and never infers delivery state
+ * from provider error text or a webhook URL.
+ */
+export function shouldShowNotificationRetry(record) {
+  if (!record || typeof record !== "object") return false;
+  const status = typeof record.status === "string" ? record.status.toUpperCase() : "";
+  return status === "FAILED" || (status === "PENDING" && record.retryable === true);
+}

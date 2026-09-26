@@ -47,7 +47,11 @@ from app.schemas.alerts import (
     NotificationData,
 )
 from app.schemas.security import SecurityData
-from app.services.notification_service import NotificationService, ProviderFactory
+from app.services.notification_service import (
+    NotificationService,
+    ProviderFactory,
+    is_notification_retryable,
+)
 from app.states import DEFAULT_REGISTRY, StateRegistry, UnknownStateError
 
 
@@ -210,14 +214,15 @@ class AlertService:
         notification_id: int,
         *,
         provider: NotificationProvider | None = None,
-    ) -> Notification:
+    ) -> NotificationData:
         """Retry a failed notification while preserving its alert edge."""
 
-        return await self.notification_service.retry(
+        notification = await self.notification_service.retry(
             user_id=user_id,
             notification_id=notification_id,
             provider=provider,
         )
+        return _notification_data(notification)
 
     async def evaluate_user(
         self,
@@ -452,7 +457,7 @@ def _rule_data(rule: AlertRule) -> AlertRuleData:
 
 
 def _notification_data(notification: Notification) -> NotificationData:
-    content = dict(notification.content or {})
+    content = _safe_notification_content(notification)
     state_id = content.get("state")
     if not isinstance(state_id, str):
         state_id = None
@@ -460,6 +465,7 @@ def _notification_data(notification: Notification) -> NotificationData:
     if not isinstance(indicator, str):
         indicator = None
     security = notification.security
+    error_code, error_message = _safe_notification_error(notification)
     return NotificationData(
         id=notification.id,
         alert_rule_id=notification.alert_rule_id,
@@ -470,11 +476,55 @@ def _notification_data(notification: Notification) -> NotificationData:
         channel=notification.channel,
         status=notification.status,
         content=content,
+        error_code=error_code,
+        error_message=error_message,
+        retryable=is_notification_retryable(notification),
         indicator=indicator,
         state_id=state_id,
         created_at=notification.created_at,
         sent_at=notification.sent_at,
     )
+
+
+def _safe_notification_error(notification: Notification) -> tuple[str | None, str | None]:
+    """Project only bounded, provider-neutral delivery diagnostics."""
+
+    raw_code = notification.error_code
+    raw_message = notification.error_message
+    if not raw_code and not raw_message:
+        return None, None
+    if (
+        isinstance(raw_code, str)
+        and raw_code
+        and len(raw_code) <= 64
+        and all(
+            character.isupper() or character.isdigit() or character == "_"
+            for character in raw_code
+        )
+    ):
+        code = raw_code
+    else:
+        code = "PROVIDER_ERROR"
+    message = (
+        "Notification content cannot be retried."
+        if code == "INVALID_NOTIFICATION_CONTENT"
+        else "Notification provider failed."
+    )
+    return code, message
+
+
+def _safe_notification_content(notification: Notification) -> dict[str, Any]:
+    """Prevent legacy provider diagnostics nested in JSON from reaching clients."""
+
+    content = dict(notification.content or {})
+    if "error" not in content:
+        return content
+    error_code, error_message = _safe_notification_error(notification)
+    if error_code is None or error_message is None:
+        content.pop("error", None)
+    else:
+        content["error"] = {"code": error_code, "message": error_message}
+    return content
 
 
 def _security_data(security: Security) -> SecurityData:

@@ -18,6 +18,8 @@ from .base import NotificationProvider
 from .message import NotificationMessage
 
 logger = logging.getLogger(__name__)
+_MISSING_RESPONSE_CODE = object()
+FEISHU_WEBHOOK_TIMEOUT_SECONDS = 5.0
 
 
 class NotificationProviderError(RuntimeError):
@@ -75,13 +77,19 @@ def _message_text(message: NotificationMessage | str) -> str:
 
 def _response_code(payload: Any) -> Any:
     if not isinstance(payload, Mapping):
-        return None
+        return _MISSING_RESPONSE_CODE
     # Both spellings have appeared in Feishu webhook responses.
-    return payload.get("code", payload.get("StatusCode"))
+    if "code" in payload:
+        return payload["code"]
+    if "StatusCode" in payload:
+        return payload["StatusCode"]
+    return _MISSING_RESPONSE_CODE
 
 
 def _is_success_code(code: Any) -> bool:
-    return code is None or str(code).strip() == "0"
+    # Feishu's success contract is a JSON number, not a missing field, a
+    # stringified number, or a boolean (``False == 0`` in Python).
+    return type(code) is int and code == 0
 
 
 class FeishuWebhookProvider(NotificationProvider):
@@ -99,7 +107,7 @@ class FeishuWebhookProvider(NotificationProvider):
         *,
         client: Any | None = None,
         http_client: Any | None = None,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = FEISHU_WEBHOOK_TIMEOUT_SECONDS,
         timeout: float | None = None,
         logger_: logging.Logger | None = None,
     ) -> None:
@@ -200,10 +208,16 @@ class FeishuWebhookProvider(NotificationProvider):
             self._logger.warning("Feishu webhook returned invalid JSON endpoint=%s", endpoint_label)
             raise FeishuWebhookError("Feishu webhook returned an invalid response") from None
         business_code = _response_code(body)
+        if business_code is _MISSING_RESPONSE_CODE:
+            self._logger.warning(
+                "Feishu webhook response omitted business code endpoint=%s", endpoint_label
+            )
+            raise FeishuWebhookError("Feishu webhook returned an invalid response") from None
         if not _is_success_code(business_code):
+            safe_business_code = business_code if type(business_code) is int else "<invalid>"
             self._logger.warning(
                 "Feishu webhook rejected message code=%s endpoint=%s",
-                business_code,
+                safe_business_code,
                 endpoint_label,
             )
             raise FeishuWebhookError(
@@ -231,6 +245,7 @@ FeishuNotificationProvider = FeishuWebhookProvider
 
 
 __all__ = [
+    "FEISHU_WEBHOOK_TIMEOUT_SECONDS",
     "FeishuNotificationProvider",
     "FeishuProvider",
     "FeishuWebhookError",

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ALERT_STATE_OPTIONS,
   buildAlertPayload,
+  shouldShowNotificationRetry,
 } from "../src/lib/notification-contract.mjs";
 
 test("alert vocabulary keeps backend state IDs and user-facing titles together", () => {
@@ -61,5 +62,23 @@ test("value alerts reject non-numeric thresholds without echoing input", () => {
   assert.throws(
     () => buildAlertPayload({ security_id: 1, condition_type: "VALUE", indicator: "RSI", operator: ">=", threshold: "  " }),
     /阈值必须是有效数字/,
+  );
+});
+
+test("notification retry action is available for failed and server-marked recoverable pending rows", () => {
+  assert.equal(shouldShowNotificationRetry({ status: "FAILED" }), true);
+  assert.equal(shouldShowNotificationRetry({ status: "PENDING", retryable: true }), true);
+  assert.equal(shouldShowNotificationRetry({ status: "PENDING", retryable: false }), false);
+  assert.equal(shouldShowNotificationRetry({ status: "SENT", retryable: true }), false);
+});
+
+test("notification retry action never derives retryability from unsafe error text", () => {
+  assert.equal(
+    shouldShowNotificationRetry({
+      status: "PENDING",
+      retryable: false,
+      error_message: "https://open.feishu.cn/open-apis/bot/v2/hook/secret",
+    }),
+    false,
   );
 });
