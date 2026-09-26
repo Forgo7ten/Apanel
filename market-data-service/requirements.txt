@@ -4,5 +4,5 @@ fastapi>=0.115,<1
 pydantic-settings>=2.6,<3
 pytdx==1.72
 redis>=5.2,<6
-SQLAlchemy>=2.0.36,<3
+SQLAlchemy[asyncio]>=2.0.36,<3
 uvicorn[standard]>=0.30,<1

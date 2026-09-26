@@ -75,7 +75,7 @@ HTTP 读取接口的 `adjust` 默认是 `qfq`，同步请求体的 `adjustment` 
 
 ### 证券元数据
 
-`POST /internal/sync/securities` 调用 provider 获取证券列表，先在 domain 层校验并去重，再通过 PostgreSQL upsert 写入 `securities`。同一批次中的坏记录会形成单项失败结果，其他记录继续处理。
+`POST /internal/sync/securities` 调用 provider 获取证券列表，先在 domain 层校验并去重，再通过 PostgreSQL 以一个事务写入 `securities`。证券主数据是整批原子语义：任一记录校验失败或持久化失败都会让整个批次失败，不返回成功记录，也不会写入部分数据。
 
 Compose 包含一个一次性 `security-bootstrap` 服务。执行 `docker compose up --build -d` 时，
 它会等待 `market-data-service` 健康后调用上述接口，并在 provider 暂时不可用时持续重试；
@@ -95,8 +95,8 @@ docker compose run --rm security-bootstrap
 
 重试间隔和 HTTP 超时可通过 `.env` 中的
 `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` 与 `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` 调整。
-默认 bootstrap HTTP 超时为 180 秒，覆盖行情服务 TDX 证券列表默认 60 秒与 AKShare 完整批次默认 90 秒，
-并保留少量 HTTP 开销余量。
+默认 bootstrap HTTP 超时为 180 秒，覆盖行情服务 TDX 证券列表默认 60 秒、AKShare 完整批次默认 90 秒及
+AKShare worker 最多 5 秒的收尾，并保留少量 HTTP 开销余量。
 内部 token 只注入 bootstrap 容器的环境变量，不会写入命令输出或日志。
 
 ### 日线

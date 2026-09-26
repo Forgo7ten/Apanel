@@ -83,7 +83,7 @@ Compose 会把上述 TDX 连接、failover、证券列表和日线分页变量�
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `SECURITY_BOOTSTRAP_RETRY_INTERVAL_SECONDS` | `30` | Compose 中 `security-bootstrap` 在可重试失败之间等待的秒数；必须为正数 |
-| `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` | `180` | Compose 中 `security-bootstrap` 每次行情服务请求的超时秒数；应覆盖 TDX 证券列表超时（默认 `60`）与 AKShare 完整批次总超时（默认 `90`）及少量 HTTP 开销 |
+| `SECURITY_BOOTSTRAP_TIMEOUT_SECONDS` | `180` | Compose 中 `security-bootstrap` 每次行情服务请求的总预算；覆盖 TDX 证券列表超时（默认 `60`）、AKShare 完整批次总超时（默认 `90`）、worker 收尾（最多 `5`）及少量 HTTP 开销 |
 
 Compose 会创建一个 `security-bootstrap` 一次性任务。它等待 `market-data-service` 健康后，使用 `INTERNAL_API_TOKEN` 执行 `bootstrap-securities --retry-until-success`；网络/超时、HTTP `408`/`429`/`5xx`、HTTP 200 错误 envelope 中稳定的 `PROVIDER_TIMEOUT`/`PROVIDER_UNAVAILABLE`（包括同步摘要 item 的 `error.code`）和空同步结果会按间隔持续重试，协议错误、其他 `4xx`、业务/鉴权/验证失败、非 provider 的部分失败和意外错误会立即以非零退出。该任务设置 `restart: "no"`，不阻塞 backend 启动；需要手工重跑时执行 `docker compose run --rm security-bootstrap`。上述两个变量只影响该一次性任务，不会传给 frontend。
 

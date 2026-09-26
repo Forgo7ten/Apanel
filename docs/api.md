@@ -172,7 +172,11 @@ Authorization: Bearer <INTERNAL_API_TOKEN>
 
 ### `POST /internal/sync/securities`
 
-使用同样的内部 token，从 provider 拉取证券元数据并 upsert 到 `securities`。响应是 `operation: "security"` 的同步摘要。匿名调用返回 `401`；服务未配置 token 返回 `503`。
+使用同样的内部 token，从 provider 拉取证券元数据并以一个事务 upsert 到
+`securities`。证券主数据同步是整批原子操作：provider 返回空批次、记录校验失败或
+持久化失败时，响应不会报告任何成功项，也不会留下部分写入；只有整批成功才会报告
+逐证券成功项。响应是 `operation: "security"` 的同步摘要。匿名调用返回 `401`；服务未配置
+token 返回 `503`。
 
 ## 版本与限制
 

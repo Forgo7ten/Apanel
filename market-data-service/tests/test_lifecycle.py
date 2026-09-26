@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from fastapi.testclient import TestClient
 
@@ -73,3 +73,20 @@ def test_lifespan_uses_security_composite_only_for_security_sync() -> None:
             assert app.state.daily_sync_service._provider is tdx_provider
             assert app.state.quote_sync_service._provider is tdx_provider
             assert app.state.dividend_sync_service._provider is tdx_provider
+
+
+def test_lifespan_closes_tdx_and_security_composite_once_each() -> None:
+    app = create_app(Settings(app_env="test"))
+    tdx_provider = ClosingProvider()
+    security_provider = ClosingProvider()
+    with (
+        patch("app.main.create_provider", return_value=tdx_provider),
+        patch("app.main.create_security_master_provider", return_value=security_provider),
+        patch("app.main.close_provider", new_callable=AsyncMock) as close_provider,
+        patch("app.main.close_redis_client", new_callable=AsyncMock),
+        patch("app.main.dispose_engine", new_callable=AsyncMock),
+    ):
+        with TestClient(app):
+            pass
+
+    assert close_provider.await_args_list == [call(tdx_provider), call(security_provider)]
