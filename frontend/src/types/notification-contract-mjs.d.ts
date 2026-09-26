@@ -17,4 +17,5 @@ declare module "@/lib/notification-contract.mjs" {
     operator?: string;
     threshold?: number | string;
   }): Record<string, unknown>;
+  export function shouldShowNotificationRetry(record: unknown): boolean;
 }

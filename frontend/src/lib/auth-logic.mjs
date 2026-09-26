@@ -19,6 +19,9 @@ const SAFE_AUTH_MESSAGES = {
   AUTH_REQUIRED: "登录状态已失效，请重新登录。",
   NETWORK_ERROR: "暂时无法连接服务，请稍后重试。",
   INVALID_RESPONSE: "服务返回了无法识别的结果，请稍后重试。",
+  NOTIFICATION_NOT_FOUND: "通知记录不存在或无权操作。",
+  NOTIFICATION_RETRY_CONFLICT: "通知仍在投递中，请稍后重试。",
+  NOTIFICATION_NOT_RETRYABLE: "该通知当前不可重试。",
 };
 
 /**

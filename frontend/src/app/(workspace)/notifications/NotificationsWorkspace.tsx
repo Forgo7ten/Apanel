@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { createAlert, deleteAlert, getAlerts, updateAlert } from "@/api/alerts";
-import { getNotifications } from "@/api/notifications";
+import { getNotifications, retryNotification } from "@/api/notifications";
 import type { AlertRule, CreateAlertInput, Identifier, NotificationRecord } from "@/api/types";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertWizard } from "@/components/alerts/AlertWizard";
@@ -12,6 +12,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { LoadingState, QueryErrorState } from "@/components/ui/QueryState";
 import { StateTag } from "@/components/ui/StateTag";
 import { isApiError } from "@/lib/api-errors";
+import { shouldShowNotificationRetry } from "@/lib/notification-contract.mjs";
 
 function sameId(left: Identifier | undefined, right: Identifier | undefined): boolean {
   return left !== undefined && right !== undefined && String(left) === String(right);
@@ -32,9 +33,18 @@ function notificationName(record: NotificationRecord): string {
   return record.name ? `${record.name} · ${record.symbol}` : record.symbol;
 }
 
-function NotificationItem({ record }: { record: NotificationRecord }) {
+function NotificationItem({
+  record,
+  onRetry,
+  isRetrying,
+}: {
+  record: NotificationRecord;
+  onRetry: (id: Identifier) => void;
+  isRetrying: boolean;
+}) {
   const status = record.status?.toUpperCase();
   const statusTone = status === "FAILED" || status === "ERROR" ? "negative" : status === "SENT" || status === "SUCCESS" ? "positive" : "neutral";
+  const retryable = shouldShowNotificationRetry(record);
 
   return (
     <article className="border-b border-line/70 px-4 py-4 last:border-b-0">
@@ -52,8 +62,21 @@ function NotificationItem({ record }: { record: NotificationRecord }) {
             {record.alert_rule_id !== undefined && record.alert_rule_id !== null ? <span className="font-mono">规则 #{String(record.alert_rule_id)}</span> : null}
           </div>
         </div>
-        <time className="shrink-0 text-xs tabular-nums text-muted" dateTime={record.created_at}>{formatDate(record.created_at)}</time>
+        <div className="flex shrink-0 items-start gap-3">
+          {retryable && record.id !== undefined && record.id !== null ? (
+            <button
+              type="button"
+              onClick={() => onRetry(record.id as Identifier)}
+              disabled={isRetrying}
+              className="rounded-panel border border-line bg-card px-2.5 py-1.5 text-xs font-medium text-secondary transition hover:border-brand/60 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isRetrying ? "重试中…" : "重试"}
+            </button>
+          ) : null}
+          <time className="pt-1 text-xs tabular-nums text-muted" dateTime={record.created_at}>{formatDate(record.created_at)}</time>
+        </div>
       </div>
+      {record.error_message ? <p className="mt-2 rounded-panel border border-negative/20 bg-negative/5 px-3 py-2 text-xs leading-5 text-negative" role="status">{record.error_message}</p> : null}
     </article>
   );
 }
@@ -89,6 +112,10 @@ export function NotificationsWorkspace() {
   const deleteMutation = useMutation({
     mutationFn: (id: Identifier) => deleteAlert(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alerts"] }),
+  });
+  const retryMutation = useMutation({
+    mutationFn: (id: Identifier) => retryNotification(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
   });
 
   const rules = useMemo(() => alertsQuery.data ?? [], [alertsQuery.data]);
@@ -164,8 +191,17 @@ export function NotificationsWorkspace() {
             <EmptyState title="还没有通知记录" description="监听规则触发后，飞书通知记录会在此处留下记录。" />
           ) : null}
           {!notificationsQuery.isPending && !notificationsQuery.isError && notificationsQuery.data?.length ? (
-            <div>{notificationsQuery.data.map((record, index) => <NotificationItem key={String(record.id ?? `${record.symbol}-${record.created_at}-${index}`)} record={record} />)}</div>
+            <div>{notificationsQuery.data.map((record, index) => <NotificationItem
+              key={String(record.id ?? `${record.symbol}-${record.created_at}-${index}`)}
+              record={record}
+              onRetry={(id) => {
+                retryMutation.reset();
+                retryMutation.mutate(id);
+              }}
+              isRetrying={retryMutation.isPending && sameId(retryMutation.variables, record.id)}
+            />)}</div>
           ) : null}
+          {retryMutation.error ? <p className="mx-4 mb-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs text-negative" role="alert">{errorMessage(retryMutation.error, "通知重试失败，请稍后重试。")}</p> : null}
         </div>
 
         <div className="min-w-0 rounded-panel border border-line bg-panel shadow-panel">

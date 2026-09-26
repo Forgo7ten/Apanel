@@ -102,6 +102,52 @@ http://localhost:8080/api/v1
 
 需要 `Authorization: Bearer <access_token>`，返回当前数据库中的激活用户。每次请求都会重新读取用户状态和角色；禁用用户不会因为 JWT 尚未过期而继续访问。
 
+## 告警通知 API
+
+### `GET /notifications`
+
+需要当前用户的 Bearer access token，返回该用户自己的通知投递记录。每条记录包含
+`id`、`title`、`status`（`PENDING`、`SENT` 或 `FAILED`）、`created_at`，以及可选的
+安全诊断字段：
+
+```json
+{
+  "id": 17,
+  "title": "RSI >= 70",
+  "status": "FAILED",
+  "error_code": "FEISHU_ERROR",
+  "error_message": "Notification provider failed.",
+  "retryable": true,
+  "content": {
+    "stock_name": "贵州茅台",
+    "stock_code": "600519",
+    "indicator": "RSI",
+    "current_value": 71,
+    "date": "2026-09-24"
+  }
+}
+```
+
+`error_code`、`error_message` 和 `retryable` 可以为 `null`/缺省。错误字段只包含脱敏后的
+业务诊断，不返回 Feishu webhook URL、token 或原始 transport 异常。`retryable=true` 表示
+可以调用 retry 接口；FAILED 始终可重试，PENDING 只有在安全恢复窗口过期后才可重试。
+
+### `POST /notifications/{notification_id}/retry`
+
+需要当前用户的 Bearer access token。该接口只访问当前用户拥有的通知记录：其他用户的
+记录统一返回 `404 NOTIFICATION_NOT_FOUND`，不泄露记录是否存在。
+
+- `SENT`：幂等成功返回原记录，不会再次调用 Feishu。
+- `FAILED`：重新投递；成功后变为 `SENT`，失败后保留 `FAILED` 和安全错误字段。
+- 过期的 `PENDING`：按遗留/中断投递恢复。服务端使用行锁和并发保护，避免同一通知
+  并发产生重复 POST。
+- 近期 `PENDING`：返回 `409 NOTIFICATION_RETRY_CONFLICT`，调用方应稍后再试。
+- 其他不可重试状态：返回 `409 NOTIFICATION_NOT_RETRYABLE`。
+
+Feishu HTTP 响应必须是 JSON object，并明确包含数值 `code` 或 `StatusCode`，且严格等于
+`0`；缺字段、非法 JSON、非 object、非零业务码都会记录为失败。provider 请求超时固定为
+5 秒，错误响应不会回显 webhook 信息。
+
 ## 行情服务 API
 
 以下路径由 `market-data-service` 直接提供，不经过 Nginx，也没有 `/api/v1` 前缀。它们默认只在 Compose 网络内可访问。
@@ -181,5 +227,5 @@ token 返回 `503`。
 ## 版本与限制
 
 - `/api/v1` 是后端当前实际挂载的 API 路径；行情服务不使用该前缀。
-- 当前没有用户级监控表、指标快照、提醒规则和通知发送端点。
+- 通知历史和失败/遗留投递恢复端点见“告警通知 API”；告警规则由 `/alerts` 端点管理。
 - 行情读取只读持久化结果；报价写入由 provider/repository 边界提供，但当前没有公开的报价同步 HTTP 路由。

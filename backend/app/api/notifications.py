@@ -24,4 +24,18 @@ async def list_notifications(
     return SuccessResponse(data=await AlertService(session).notifications(user.id, limit=limit))
 
 
+@router.post(
+    "/notifications/{notification_id}/retry",
+    response_model=SuccessResponse[NotificationData],
+)
+async def retry_notification(
+    notification_id: int,
+    user: User = Depends(get_current_user),  # noqa: B008
+    session: AsyncSession = Depends(get_db),  # noqa: B008
+) -> SuccessResponse[NotificationData]:
+    return SuccessResponse(
+        data=await AlertService(session).retry_notification(user.id, notification_id)
+    )
+
+
 __all__ = ["router"]

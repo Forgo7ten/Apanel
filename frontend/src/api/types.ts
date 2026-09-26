@@ -213,6 +213,9 @@ export type NotificationRecord = {
   channel: string;
   status?: string | null;
   content?: Record<string, unknown> | string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  retryable?: boolean;
   indicator?: string | null;
   state_id?: string | null;
   created_at: string;

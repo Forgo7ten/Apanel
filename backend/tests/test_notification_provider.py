@@ -21,6 +21,11 @@ class FakeResponse:
         return self._body
 
 
+class InvalidJsonResponse(FakeResponse):
+    def json(self) -> object:
+        raise ValueError("not-json")
+
+
 class FakeClient:
     def __init__(
         self,
@@ -82,6 +87,38 @@ async def test_feishu_provider_reads_user_webhook_and_supports_string_message() 
 
     assert client.calls[0][0].startswith("https://example.test/")
     assert client.calls[0][1]["content"] == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"msg": "success"},
+        [],
+        "{\"code\":0}",
+        None,
+        {"code": 1},
+        {"StatusCode": 1},
+        {"code": "0"},
+        {"code": False},
+    ],
+)
+async def test_feishu_provider_requires_explicit_numeric_zero_business_code(body: object) -> None:
+    client = FakeClient(FakeResponse(200, body))
+    provider = FeishuWebhookProvider("https://example.test/hook", client=client)
+
+    with pytest.raises(FeishuWebhookError):
+        await provider.send(None, message())
+
+
+@pytest.mark.asyncio
+async def test_feishu_provider_rejects_invalid_json_body() -> None:
+    client = FakeClient(InvalidJsonResponse(200, object()))
+    provider = FeishuWebhookProvider("https://example.test/hook", client=client)
+
+    with pytest.raises(FeishuWebhookError, match="invalid response"):
+        await provider.send(None, message())
 
 
 @pytest.mark.asyncio
