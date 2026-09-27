@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime
@@ -47,6 +48,7 @@ class NotificationMessage:
     current_value: float | None
     previous_value: float | None
     change: float | None
+    value_details: Mapping[str, Mapping[str, float | None]]
     date: Date
 
     def __init__(
@@ -58,6 +60,7 @@ class NotificationMessage:
         current_value: Real | Decimal | None = None,
         previous_value: Real | Decimal | None = None,
         change: Real | Decimal | None = None,
+        value_details: Mapping[str, Mapping[str, Any]] | None = None,
         date: Date | datetime | None = None,
         *,
         symbol: str | None = None,
@@ -87,6 +90,37 @@ class NotificationMessage:
         normalized_current = _finite_value(current_value, field_name="current_value")
         normalized_previous = _finite_value(previous_value, field_name="previous_value")
         normalized_change = _finite_value(change, field_name="change")
+        normalized_details: dict[str, dict[str, float | None]] = {}
+        if value_details is not None:
+            if not isinstance(value_details, Mapping):
+                raise ValueError("value_details must be a mapping")
+            for raw_label, raw_values in value_details.items():
+                label = _text(raw_label, field_name="value_details key")
+                if not isinstance(raw_values, Mapping):
+                    raise ValueError("value_details entries must be mappings")
+                current_detail = _finite_value(
+                    raw_values.get("current_value"),
+                    field_name=f"value_details.{label}.current_value",
+                )
+                previous_detail = _finite_value(
+                    raw_values.get("previous_value"),
+                    field_name=f"value_details.{label}.previous_value",
+                )
+                change_detail = _finite_value(
+                    raw_values.get("change"),
+                    field_name=f"value_details.{label}.change",
+                )
+                if (
+                    change_detail is None
+                    and current_detail is not None
+                    and previous_detail is not None
+                ):
+                    change_detail = current_detail - previous_detail
+                normalized_details[label] = {
+                    "current_value": current_detail,
+                    "previous_value": previous_detail,
+                    "change": change_detail,
+                }
         if (
             normalized_change is None
             and normalized_current is not None
@@ -104,6 +138,7 @@ class NotificationMessage:
         object.__setattr__(self, "current_value", normalized_current)
         object.__setattr__(self, "previous_value", normalized_previous)
         object.__setattr__(self, "change", normalized_change)
+        object.__setattr__(self, "value_details", normalized_details)
         object.__setattr__(self, "date", resolved_date)
 
     @property
@@ -133,6 +168,7 @@ class NotificationMessage:
             "current_value": self.current_value,
             "previous_value": self.previous_value,
             "change": self.change,
+            "value_details": {key: dict(value) for key, value in self.value_details.items()},
             "date": self.date.isoformat(),
         }
 
@@ -151,6 +187,18 @@ class NotificationMessage:
             lines.append(f"上次值：{self.previous_value:g}")
         if self.change is not None:
             lines.append(f"变化：{self.change:+g}")
+        for label, values in self.value_details.items():
+            current = values.get("current_value")
+            previous = values.get("previous_value")
+            delta = values.get("change")
+            parts = [label]
+            if current is not None:
+                parts.append(f"当前 {current:g}")
+            if previous is not None:
+                parts.append(f"前值 {previous:g}")
+            if delta is not None:
+                parts.append(f"变化 {delta:+g}")
+            lines.append(" · ".join(parts))
         lines.append(f"日期：{self.date.isoformat()}")
         return "\n".join(lines)
 

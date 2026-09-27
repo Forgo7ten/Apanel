@@ -47,9 +47,30 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
     }),
     enabled: open && Boolean(historyColumn),
   });
+  const stateHistoryFilter = useMemo(() => {
+    if (!selection) return {};
+    if (selection.kind === "state") {
+      return {
+        state_code: selection.state.state_code ?? selection.state.state_id,
+        parameter_key: selection.state.parameter_key,
+      };
+    }
+    return { indicator_type: selection.column.indicator_type ?? selection.column.type };
+  }, [selection]);
   const stateQuery = useQuery({
-    queryKey: ["state-history", symbol, range.start, range.end, adjustment],
-    queryFn: () => getStateHistory(symbol, { ...range, adjust: adjustment }),
+    queryKey: [
+      "state-history",
+      symbol,
+      range.start,
+      range.end,
+      adjustment,
+      stateHistoryFilter,
+    ],
+    queryFn: () => getStateHistory(symbol, {
+      ...range,
+      adjust: adjustment,
+      ...stateHistoryFilter,
+    }),
     enabled: open,
   });
 

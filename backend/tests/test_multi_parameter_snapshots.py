@@ -23,6 +23,7 @@ from app.models import (
     IndicatorSnapshot,
     Security,
     TableColumn,
+    TradingCalendar,
     User,
     UserStatus,
     WatchTable,
@@ -75,6 +76,20 @@ async def multi_parameter_context(
         )
         session.add(security)
         await session.flush()
+        calendar_day = date(2026, 1, 1)
+        while calendar_day <= date(2026, 2, 28):
+            session.add(
+                TradingCalendar(
+                    market="CN",
+                    trade_date=calendar_day,
+                    expected_open=True,
+                    actual_open=True,
+                    status="OPEN",
+                    source="TEST",
+                    source_metadata={},
+                )
+            )
+            calendar_day += timedelta(days=1)
         for index in range(45):
             close = Decimal(str(100 + index * 0.2))
             session.add(

@@ -332,6 +332,7 @@ class AlertService:
                 "current_value": None,
                 "previous_value": None,
                 "change": None,
+                "value_details": resolved_state.value_context,
                 "snapshot": None,
                 "state": resolved_state.state,
             }
@@ -710,6 +711,7 @@ def _notification_message(rule: AlertRule, context: Mapping[str, Any]) -> Notifi
         current_value=current,
         previous_value=previous,
         change=change,
+        value_details=context.get("value_details"),
         date=context["date"],
     )
 

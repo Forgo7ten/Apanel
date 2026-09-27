@@ -257,6 +257,19 @@ class SecurityRepository:
             result[event.security_id].append(event)
         return result
 
+    async def latest_daily_bar_date(
+        self,
+        security_id: int,
+        *,
+        adjust_type: str | None = None,
+    ) -> date | None:
+        statement = select(func.max(DailyBar.trade_date)).where(
+            DailyBar.security_id == security_id
+        )
+        if adjust_type is not None:
+            statement = statement.where(DailyBar.adjust_type == adjust_type)
+        return (await self.session.execute(statement)).scalar_one_or_none()
+
     async def daily_bars(
         self,
         security_id: int,

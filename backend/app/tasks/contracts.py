@@ -45,6 +45,34 @@ class PipelineConfigurationError(PipelineError):
     """A required pipeline integration is not configured."""
 
 
+@dataclass(frozen=True, slots=True)
+class PipelineIssue:
+    """One safe per-symbol issue recorded while healthy symbols keep running."""
+
+    step: str
+    symbol: str
+    code: str
+    retryable: bool
+    adjustment: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "symbol": self.symbol,
+            "code": self.code,
+            "retryable": self.retryable,
+            "adjustment": self.adjustment,
+        }
+
+
+class PipelineRetryableDataError(PipelineError):
+    """Healthy symbols completed but transient data issues require a retry."""
+
+    def __init__(self, issues: tuple[PipelineIssue, ...]) -> None:
+        self.issues = issues
+        super().__init__("scheduled pipeline has retryable data issues")
+
+
 @dataclass(slots=True)
 class PipelineContext:
     """Immutable-in-practice input plus private step artifacts.
@@ -100,6 +128,7 @@ class PipelineResult:
     symbols: int
     completed_steps: tuple[str, ...] = ()
     skipped_reason: str | None = None
+    issues: tuple[PipelineIssue, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +138,7 @@ class PipelineResult:
             "symbols": self.symbols,
             "completed_steps": list(self.completed_steps),
             "skipped_reason": self.skipped_reason,
+            "issues": [issue.to_dict() for issue in self.issues],
         }
 
 
@@ -129,7 +159,9 @@ __all__ = [
     "PipelineConfigurationError",
     "PipelineContext",
     "PipelineError",
+    "PipelineIssue",
     "PipelineResult",
+    "PipelineRetryableDataError",
     "PipelineStep",
     "PipelineStepError",
     "safe_summary",

@@ -75,6 +75,26 @@ async def test_feishu_provider_posts_text_payload_with_injected_client() -> None
     assert "600519" in payload["content"]["text"]
 
 
+def test_notification_message_renders_state_value_details() -> None:
+    detail_message = NotificationMessage(
+        stock_name="贵州茅台",
+        stock_code="600519",
+        indicator="MA",
+        state="MA_CROSS_UP",
+        value_details={
+            "MA5": {"current_value": 101.0, "previous_value": 99.0, "change": 2.0},
+            "MA10": {"current_value": 100.0, "previous_value": 100.5, "change": -0.5},
+        },
+        date=date(2026, 9, 24),
+    )
+
+    payload = detail_message.to_dict()
+    text = detail_message.render_text()
+    assert payload["value_details"]["MA5"]["change"] == 2.0
+    assert "MA5 · 当前 101 · 前值 99 · 变化 +2" in text
+    assert "MA10 · 当前 100 · 前值 100.5 · 变化 -0.5" in text
+
+
 @pytest.mark.asyncio
 async def test_feishu_provider_reads_user_webhook_and_supports_string_message() -> None:
     client = FakeClient(FakeResponse(200, {"StatusCode": 0}))

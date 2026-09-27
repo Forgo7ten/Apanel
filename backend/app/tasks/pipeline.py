@@ -27,6 +27,7 @@ from .contracts import (
     EOD_STEP_ORDER,
     PipelineConfigurationError,
     PipelineContext,
+    PipelineIssue,
     PipelineResult,
     PipelineStep,
     PipelineStepError,
@@ -108,12 +109,25 @@ class EODPipeline:
                     "symbol_count": len(context.symbols),
                 },
             )
+        issues = tuple(context.resources.get("pipeline_issues", ()))
+        status = "completed_with_errors" if issues else "completed"
+        if issues:
+            logger.warning(
+                "scheduled_pipeline_completed_with_errors",
+                extra={
+                    "event": "scheduled_pipeline_completed_with_errors",
+                    "trade_date": context.trade_date.isoformat(),
+                    "issue_count": len(issues),
+                    "retryable_issue_count": sum(issue.retryable for issue in issues),
+                },
+            )
         return PipelineResult(
-            status="completed",
+            status=status,
             trade_date=context.trade_date.isoformat(),
             adjustment=context.adjustment,
             symbols=len(context.symbols),
             completed_steps=tuple(completed),
+            issues=issues,
         )
 
 
@@ -156,6 +170,12 @@ def build_default_eod_steps(
                 "daily",
                 adjustment=adjustment,
             )
+            _record_sync_issues(
+                context,
+                output[adjustment],
+                step="daily_sync",
+                adjustment=adjustment,
+            )
         return output
 
     async def dividend_sync(context: PipelineContext) -> Mapping[str, Any]:
@@ -167,6 +187,7 @@ def build_default_eod_steps(
             if not getattr(item, "succeeded", False)
         }
         context.resources["dividend_unavailable_symbols"] = frozenset(failed)
+        _record_sync_issues(context, result, step="dividend_sync", adjustment=None)
         return result
 
     async def adjustment_ready(context: PipelineContext) -> Mapping[str, Any]:
@@ -198,6 +219,20 @@ def build_default_eod_steps(
                 no_bar[adjustment] = tuple(
                     symbol for symbol in context.symbols if symbol not in found
                 )
+                for symbol in no_bar[adjustment]:
+                    if not _has_pipeline_issue(
+                        context, step="daily_sync", symbol=symbol, adjustment=adjustment
+                    ):
+                        _record_pipeline_issue(
+                            context,
+                            PipelineIssue(
+                                step="adjustment_ready",
+                                symbol=symbol,
+                                adjustment=adjustment,
+                                code="EOD_BAR_NOT_READY",
+                                retryable=True,
+                            ),
+                        )
         return {"ready_symbols": ready, "no_bar_symbols": no_bar}
 
     async def indicator_snapshots(context: PipelineContext) -> Mapping[str, Any]:
@@ -318,19 +353,80 @@ async def _sync_in_chunks(
         else:
             raise PipelineConfigurationError("unsupported sync operation")
         items.extend(getattr(result, "items", ()))
-    succeeded = sum(getattr(item, "succeeded", False) for item in items)
+    succeeded = sum(bool(getattr(item, "succeeded", False)) for item in items)
+    retryable_symbols = tuple(
+        dict.fromkeys(
+            str(item.symbol)
+            for item in items
+            if not getattr(item, "succeeded", False)
+            and getattr(item, "error_code", None)
+            in {"PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "PERSISTENCE_ERROR"}
+        )
+    )
+    permanent_failures = tuple(
+        dict.fromkeys(
+            str(item.symbol)
+            for item in items
+            if not getattr(item, "succeeded", False)
+            and str(item.symbol) not in retryable_symbols
+        )
+    )
     return {
         "operation": operation,
         "total": len(items),
         "succeeded": succeeded,
         "failed": len(items) - succeeded,
-        "ok": not any(
-            getattr(item, "error_code", None)
-            in {"PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "PERSISTENCE_ERROR"}
-            for item in items
-        ),
+        "ok": succeeded == len(items),
+        "retryable_symbols": retryable_symbols,
+        "permanent_failures": permanent_failures,
         "items": tuple(items),
     }
+
+
+def _record_sync_issues(
+    context: PipelineContext,
+    result: Mapping[str, Any],
+    *,
+    step: str,
+    adjustment: str | None,
+) -> None:
+    retryable = set(result.get("retryable_symbols", ()))
+    for item in result.get("items", ()):
+        if getattr(item, "succeeded", False):
+            continue
+        symbol = str(getattr(item, "symbol", "*") or "*")
+        code = str(getattr(item, "error_code", None) or "SYNC_FAILED")
+        _record_pipeline_issue(
+            context,
+            PipelineIssue(
+                step=step,
+                symbol=symbol,
+                adjustment=adjustment,
+                code=code,
+                retryable=symbol in retryable,
+            ),
+        )
+
+
+def _record_pipeline_issue(context: PipelineContext, issue: PipelineIssue) -> None:
+    issues = context.resources.setdefault("pipeline_issues", [])
+    key = (issue.step, issue.symbol, issue.adjustment, issue.code)
+    if any((item.step, item.symbol, item.adjustment, item.code) == key for item in issues):
+        return
+    issues.append(issue)
+
+
+def _has_pipeline_issue(
+    context: PipelineContext,
+    *,
+    step: str,
+    symbol: str,
+    adjustment: str | None,
+) -> bool:
+    return any(
+        item.step == step and item.symbol == symbol and item.adjustment == adjustment
+        for item in context.resources.get("pipeline_issues", ())
+    )
 
 
 def _rebase_dates(value: Any) -> dict[str, Any]:

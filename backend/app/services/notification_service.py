@@ -525,6 +525,7 @@ def _message_from_content(content: object) -> NotificationMessage:
         current_value=content.get("current_value"),
         previous_value=content.get("previous_value"),
         change=content.get("change"),
+        value_details=content.get("value_details"),
         date=date.fromisoformat(raw_date),
     )
 

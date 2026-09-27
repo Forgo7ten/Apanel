@@ -26,6 +26,7 @@ from app.models import DailyBar
 from app.models import IndicatorSnapshot as IndicatorSnapshotModel
 from app.repositories.indicator_state import IndicatorStateRepository
 from app.schemas.indicator_state import IndicatorHistoryData, IndicatorSnapshotData
+from app.services.history_window import resolve_history_window
 
 DEFAULT_BOLL_PARAMETERS = _parameter_contract.DEFAULT_BOLL_PARAMETERS
 DEFAULT_KDJ_PERIODS = _parameter_contract.DEFAULT_KDJ_PERIODS
@@ -268,11 +269,21 @@ class IndicatorService:
         end: date | None = None,
         adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
     ) -> list[IndicatorSnapshotModel]:
-        _validate_range(start, end)
         adjustment = _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
+        latest_date = await self.repository.latest_snapshot_date(
+            security.id, adjustment=adjustment
+        )
+        if latest_date is None:
+            raise ApiError("INDICATOR_DATA_NOT_FOUND", "No indicator data is available.", 404)
+        resolved_start, resolved_end = resolve_history_window(
+            start=start, end=end, latest_date=latest_date
+        )
         persisted = await self.repository.list_snapshots(
-            security.id, start=start, end=end, adjustment=adjustment
+            security.id,
+            start=resolved_start,
+            end=resolved_end,
+            adjustment=adjustment,
         )
         if not persisted:
             raise ApiError("INDICATOR_DATA_NOT_FOUND", "No indicator data is available.", 404)

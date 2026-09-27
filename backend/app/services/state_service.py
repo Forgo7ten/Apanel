@@ -21,14 +21,15 @@ from app.models import (
     IndicatorState,
 )
 from app.repositories.indicator_state import IndicatorStateRepository
+from app.services.history_window import MAX_STATE_HISTORY_ROWS, resolve_history_window
 from app.services.indicator_service import (
     DEFAULT_HISTORY_ADJUSTMENT,
     DEFAULT_INDICATOR_ADJUSTMENT,
     _validate_history_adjustment,
     _validate_indicator_adjustment,
-    _validate_range,
     normalize_symbol,
 )
+from app.services.trading_calendar_service import TradingCalendarService
 from app.states import DEFAULT_REGISTRY, IndicatorSnapshot, StateEngine, StateRegistry, StateStatus
 
 
@@ -55,10 +56,19 @@ class StateService:
     ) -> list[IndicatorState]:
         adjustment = _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
+        calendar = TradingCalendarService(self.session)
+
+        persist_from = start
+        read_from = start
+        if start is not None:
+            previous_for_start = (await calendar.previous_open_dates((start,))).get(start)
+            if previous_for_start is not None:
+                read_from = previous_for_start
+
         snapshots = await self.repository.list_snapshots(
             security.id,
             adjustment=adjustment,
-            start=start,
+            start=read_from,
         )
         if not snapshots:
             raise ApiError("STATE_DATA_NOT_FOUND", "No indicator data is available.", 404)
@@ -68,7 +78,7 @@ class StateService:
         existing_by_key = {
             (item.trade_date, item.state_code, item.parameter_key): item for item in existing_states
         }
-        computed_by_key: dict[tuple[date, str, str], bool] = {}
+        computed_status_by_key: dict[tuple[date, str, str], StateStatus] = {}
         bars = await self.repository.get_daily_bars(security.id, adjustment=adjustment)
         close_by_date = {item.trade_date: float(item.close) for item in bars}
 
@@ -76,17 +86,24 @@ class StateService:
         for snapshot in snapshots:
             by_date[snapshot.trade_date][snapshot.indicator_type] = snapshot
         dates = sorted(by_date)
+        previous_open_by_date = await calendar.previous_open_dates(dates)
         if latest_only and dates:
             dates_to_persist = {dates[-1]}
+        elif persist_from is not None:
+            dates_to_persist = {item for item in dates if item >= persist_from}
         else:
             dates_to_persist = set(dates)
         engine = StateEngine(registry=self.registry)
         persisted: list[IndicatorState] = []
 
-        for index, trade_date in enumerate(dates):
-            previous_date = dates[index - 1] if index else None
+        for trade_date in dates:
+            expected_previous_date = previous_open_by_date.get(trade_date)
             current_by_indicator = by_date[trade_date]
-            previous_by_indicator = by_date.get(previous_date, {}) if previous_date else {}
+            previous_by_indicator = (
+                by_date.get(expected_previous_date, {})
+                if expected_previous_date is not None
+                else {}
+            )
             for definition in self.registry.definitions():
                 current_model = current_by_indicator.get(definition.indicator_type)
                 if current_model is None:
@@ -97,33 +114,102 @@ class StateService:
                     current_model,
                     previous_model,
                 ):
-                    if current_variant is None or previous_variant is None:
+                    if current_variant is None:
                         continue
                     state_key = state_parameter_key(definition.code, state_parameters)
                     current = _to_domain_snapshot(current_model, current_variant)
-                    previous = _to_domain_snapshot(previous_model, previous_variant)
-                    if current is None or previous is None:
+                    if current is None:
                         continue
-                    prior_row = (
-                        existing_by_key.get((previous_date, definition.code, state_key))
-                        if previous_date is not None
-                        else None
+
+                    if expected_previous_date is None:
+                        computed_status_by_key[(trade_date, definition.code, state_key)] = (
+                            StateStatus.UNKNOWN
+                        )
+                        if trade_date in dates_to_persist:
+                            persisted.append(
+                                await self._persist_unknown_state(
+                                    security_id=security.id,
+                                    trade_date=trade_date,
+                                    adjustment=adjustment,
+                                    definition=definition,
+                                    state_parameters=state_parameters,
+                                    state_key=state_key,
+                                    current=current,
+                                    reason="trading_calendar_unavailable",
+                                    expected_previous_date=None,
+                                )
+                            )
+                        continue
+
+                    previous = _to_domain_snapshot(previous_model, previous_variant)
+                    if previous is None:
+                        computed_status_by_key[(trade_date, definition.code, state_key)] = (
+                            StateStatus.UNKNOWN
+                        )
+                        if trade_date in dates_to_persist:
+                            persisted.append(
+                                await self._persist_unknown_state(
+                                    security_id=security.id,
+                                    trade_date=trade_date,
+                                    adjustment=adjustment,
+                                    definition=definition,
+                                    state_parameters=state_parameters,
+                                    state_key=state_key,
+                                    current=current,
+                                    reason="missing_previous_trading_day",
+                                    expected_previous_date=expected_previous_date,
+                                )
+                            )
+                        continue
+
+                    prior_row = existing_by_key.get(
+                        (expected_previous_date, definition.code, state_key)
                     )
-                    prior_active = (
-                        prior_row.status == StateStatus.ACTIVE.value
-                        if prior_row is not None
-                        else computed_by_key.get((previous_date, definition.code, state_key), False)
+                    prior_status = (
+                        _state_status(prior_row.status) if prior_row is not None else None
+                    )
+                    if prior_status is None:
+                        prior_status = computed_status_by_key.get(
+                            (expected_previous_date, definition.code, state_key)
+                        )
+                    previous_active = (
+                        False
+                        if prior_status is StateStatus.UNKNOWN
+                        else prior_status is StateStatus.ACTIVE
+                        if prior_status is not None
+                        else None
                     )
                     result = engine.evaluate_state(
                         definition.code,
                         current,
                         previous,
                         current_price=close_by_date.get(trade_date),
-                        previous_price=close_by_date.get(previous_date) if previous_date else None,
+                        previous_price=close_by_date.get(expected_previous_date),
                         stream_id=f"security:{security.id}:{adjustment}:{state_key}",
-                        previous_active=prior_active,
+                        previous_active=previous_active,
                     )
-                    computed_by_key[(trade_date, definition.code, state_key)] = result.active
+
+                    if prior_status is StateStatus.UNKNOWN and (result.active or result.reason):
+                        computed_status_by_key[(trade_date, definition.code, state_key)] = (
+                            StateStatus.UNKNOWN
+                        )
+                        if trade_date in dates_to_persist:
+                            persisted.append(
+                                await self._persist_unknown_state(
+                                    security_id=security.id,
+                                    trade_date=trade_date,
+                                    adjustment=adjustment,
+                                    definition=definition,
+                                    state_parameters=state_parameters,
+                                    state_key=state_key,
+                                    current=current,
+                                    reason=result.reason or "previous_state_unknown",
+                                    expected_previous_date=expected_previous_date,
+                                )
+                            )
+                        continue
+
+                    computed_status_by_key[(trade_date, definition.code, state_key)] = result.status
                     if trade_date not in dates_to_persist:
                         continue
                     state = await self.repository.upsert_state(
@@ -142,12 +228,55 @@ class StateService:
                             "transition": result.transition,
                             "reason": result.reason,
                             "values": dict(result.values),
+                            "value_context": _state_value_context(
+                                definition,
+                                current,
+                                previous,
+                                current_price=close_by_date.get(trade_date),
+                                previous_price=close_by_date.get(expected_previous_date),
+                            ),
                             "definition": _json_value(result.metadata),
                         },
                     )
                     persisted.append(state)
         await self.session.commit()
         return persisted
+
+    async def _persist_unknown_state(
+        self,
+        *,
+        security_id: int,
+        trade_date: date,
+        adjustment: str,
+        definition: Any,
+        state_parameters: Mapping[str, Any],
+        state_key: str,
+        current: IndicatorSnapshot,
+        reason: str,
+        expected_previous_date: date | None,
+    ) -> IndicatorState:
+        metadata: dict[str, Any] = {
+            "name": definition.name,
+            "level": definition.level,
+            "active": False,
+            "transition": False,
+            "reason": reason,
+            "values": dict(current.values),
+            "definition": _json_value(definition.metadata),
+        }
+        if expected_previous_date is not None:
+            metadata["expected_previous_trade_date"] = expected_previous_date.isoformat()
+        return await self.repository.upsert_state(
+            security_id=security_id,
+            trade_date=trade_date,
+            state_code=definition.code,
+            indicator_type=definition.indicator_type,
+            status=StateStatus.UNKNOWN.value,
+            parameters=dict(state_parameters),
+            parameter_key=state_key,
+            adjust_type=adjustment,
+            metadata=metadata,
+        )
 
     async def rebuild_history(
         self,
@@ -194,20 +323,43 @@ class StateService:
         adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
         state_code: str | None = None,
         parameter_key: str | None = None,
+        indicator_type: str | None = None,
     ) -> list[IndicatorState]:
-        _validate_range(start, end)
         adjustment = _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
-        persisted = await self.repository.list_states(
+        normalized_indicator = (
+            str(indicator_type).strip().upper() if indicator_type is not None else None
+        )
+        latest_date = await self.repository.latest_state_date(
             security.id,
-            start=start,
-            end=end,
             adjustment=adjustment,
             state_code=state_code,
             parameter_key=parameter_key,
+            indicator_type=normalized_indicator,
+        )
+        if latest_date is None:
+            raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
+        resolved_start, resolved_end = resolve_history_window(
+            start=start, end=end, latest_date=latest_date
+        )
+        persisted = await self.repository.list_states(
+            security.id,
+            start=resolved_start,
+            end=resolved_end,
+            adjustment=adjustment,
+            state_code=state_code,
+            parameter_key=parameter_key,
+            indicator_type=normalized_indicator,
+            limit=MAX_STATE_HISTORY_ROWS + 1,
         )
         if not persisted:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
+        if len(persisted) > MAX_STATE_HISTORY_ROWS:
+            raise ApiError(
+                "HISTORY_RESULT_TOO_LARGE",
+                "State history result is too large; narrow the range or filters.",
+                413,
+            )
         return persisted
 
     async def _get_security(self, symbol: str):
@@ -228,6 +380,13 @@ class StateService:
                 metadata=metadata,
                 enabled=True,
             )
+
+
+def _state_status(value: Any) -> StateStatus | None:
+    try:
+        return StateStatus(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def state_parameter_key(state_code: str, parameters: Mapping[str, Any]) -> str:
@@ -336,6 +495,50 @@ def _to_domain_snapshot(
             if isinstance(value, (int, float)) and not isinstance(value, bool)
         },
     )
+
+
+def _state_value_context(
+    definition: Any,
+    current: IndicatorSnapshot,
+    previous: IndicatorSnapshot,
+    *,
+    current_price: float | None,
+    previous_price: float | None,
+) -> dict[str, dict[str, float | None]]:
+    raw_fields = definition.metadata.get("fields", ())
+    fields = tuple(str(field).strip().lower() for field in raw_fields if str(field).strip())
+    result: dict[str, dict[str, float | None]] = {}
+    for field in fields:
+        label = field
+        if current.indicator == "MA" and field in {"short", "long"}:
+            period_key = f"{field}_period"
+            period = current.parameters.get(period_key)
+            if period is None:
+                continue
+            label = f"MA{int(period)}"
+            value_key = label.lower()
+            current_value = current.values.get(value_key)
+            previous_value = previous.values.get(value_key)
+        elif field == "price":
+            label = "price"
+            current_value = current_price
+            previous_value = previous_price
+        else:
+            current_value = current.values.get(field)
+            previous_value = previous.values.get(field)
+        if current_value is None and previous_value is None:
+            continue
+        change = (
+            float(current_value) - float(previous_value)
+            if current_value is not None and previous_value is not None
+            else None
+        )
+        result[label] = {
+            "current_value": None if current_value is None else float(current_value),
+            "previous_value": None if previous_value is None else float(previous_value),
+            "change": change,
+        }
+    return result
 
 
 def _json_value(value: Any) -> Any:

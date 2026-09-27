@@ -27,6 +27,17 @@ test("history requests use one stable date-range envelope", () => {
     }),
     "/securities/600519/indicators/history?start=2026-01-01&end=2026-03-31&adjust=qfq&parameter_key=v1_rsi6",
   );
+  assert.equal(
+    buildHistoryPath("/securities/600519/states/history", {
+      start: "2026-01-01",
+      end: "2026-03-31",
+      adjust: "qfq",
+      state_code: "MA_CROSS_UP",
+      parameter_key: "v1_ma",
+      indicator_type: "MA",
+    }),
+    "/securities/600519/states/history?start=2026-01-01&end=2026-03-31&adjust=qfq&parameter_key=v1_ma&state_code=MA_CROSS_UP&indicator_type=MA",
+  );
   assert.deepEqual(historyWindow(new Date("2026-03-31T12:00:00Z")), { start: "2026-01-01", end: "2026-03-31" });
 });
 

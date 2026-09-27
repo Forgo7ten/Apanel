@@ -24,6 +24,7 @@ class StateStatus(StrEnum):
 
     ACTIVE = "ACTIVE"
     INACTIVE = "INACTIVE"
+    UNKNOWN = "UNKNOWN"
 
 
 def _finite_float(value: Any, *, field_name: str) -> float:

@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import httpx
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import Settings
@@ -21,7 +21,9 @@ from app.models import (
     IndicatorState,
     Security,
     StateDefinition,
+    TradingCalendar,
 )
+from app.services.history_window import resolve_history_window
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
 
@@ -44,6 +46,20 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
         )
         session.add(security)
         await session.flush()
+        calendar_day = date(2026, 1, 1)
+        while calendar_day <= date(2026, 2, 28):
+            session.add(
+                TradingCalendar(
+                    market="CN",
+                    trade_date=calendar_day,
+                    expected_open=True,
+                    actual_open=True,
+                    status="OPEN",
+                    source="TEST",
+                    source_metadata={},
+                )
+            )
+            calendar_day += timedelta(days=1)
         for index in range(40):
             close = Decimal(str(100 + index * 0.2))
             for adjustment, offset in (("qfq", Decimal("0")), ("none", Decimal("5"))):
@@ -64,6 +80,28 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
         await session.commit()
     yield session_factory
     await engine.dispose()
+
+
+def test_history_window_defaults_to_90_days_and_rejects_large_ranges() -> None:
+    from app.core.errors import ApiError
+
+    start, end = resolve_history_window(
+        start=None, end=None, latest_date=date(2026, 9, 24)
+    )
+    assert start == date(2026, 6, 27)
+    assert end == date(2026, 9, 24)
+
+    try:
+        resolve_history_window(
+            start=date(2025, 1, 1),
+            end=date(2026, 9, 24),
+            latest_date=date(2026, 9, 24),
+        )
+    except ApiError as exc:
+        assert exc.code == "HISTORY_RANGE_TOO_LARGE"
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("large history range must be rejected")
 
 
 async def test_indicator_calculation_persists_defaults_and_is_idempotent(indicator_context) -> None:
@@ -112,6 +150,71 @@ async def test_state_history_survives_a_new_service_instance(indicator_context) 
         assert any(item.status == "ACTIVE" for item in second)
 
 
+async def test_state_persistence_keeps_notification_value_context(indicator_context) -> None:
+    async with indicator_context() as session:
+        await IndicatorService(session).calculate("600519")
+        await StateService(session).calculate("600519")
+        state = (
+            await session.execute(
+                select(IndicatorState)
+                .where(IndicatorState.state_code == "MA_CROSS_UP")
+                .order_by(IndicatorState.trade_date.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+
+        context = state.metadata["value_context"]
+        assert set(context) == {"MA5", "MA10"}
+        for values in context.values():
+            assert values["current_value"] is not None
+            assert values["previous_value"] is not None
+            assert values["change"] == pytest.approx(
+                values["current_value"] - values["previous_value"]
+            )
+
+        boll_break = (
+            await session.execute(
+                select(IndicatorState)
+                .where(IndicatorState.state_code == "BOLL_BREAK_UPPER")
+                .order_by(IndicatorState.trade_date.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+        assert set(boll_break.metadata["value_context"]) == {"upper", "price"}
+        assert boll_break.metadata["value_context"]["price"]["current_value"] is not None
+
+
+async def test_state_calculation_marks_missing_previous_trading_day_unknown(
+    indicator_context,
+) -> None:
+    async with indicator_context() as session:
+        await IndicatorService(session).calculate("600519")
+        missing_date = date(2026, 1, 20)
+        affected_date = date(2026, 1, 21)
+        await session.execute(
+            delete(IndicatorSnapshot).where(IndicatorSnapshot.trade_date == missing_date)
+        )
+        await session.commit()
+
+        await StateService(session).calculate("600519")
+        affected = list(
+            (
+                await session.execute(
+                    select(IndicatorState).where(IndicatorState.trade_date == affected_date)
+                )
+            ).scalars()
+        )
+
+        assert affected
+        assert {row.status for row in affected} == {"UNKNOWN"}
+        assert {row.metadata["reason"] for row in affected} == {
+            "missing_previous_trading_day"
+        }
+        assert {row.metadata["expected_previous_trade_date"] for row in affected} == {
+            missing_date.isoformat()
+        }
+
+
 async def test_indicator_and_state_routes_return_current_and_history(indicator_context) -> None:
     settings = Settings(
         app_env="test",
@@ -139,6 +242,14 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
             indicator_history = await client.get("/api/v1/securities/600519/indicators/history")
             states = await client.get("/api/v1/securities/600519/states")
             state_history = await client.get("/api/v1/securities/600519/states/history")
+            ma_state_history = await client.get(
+                "/api/v1/securities/600519/states/history",
+                params={"indicator_type": "MA"},
+            )
+            too_large = await client.get(
+                "/api/v1/securities/600519/indicators/history",
+                params={"start": "2025-01-01", "end": "2026-09-24"},
+            )
             none_results = {
                 path: await client.get(path, params={"adjust": "none"})
                 for path in (
@@ -158,6 +269,11 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
     assert states.status_code == 200
     assert state_history.status_code == 200
     assert state_history.json()["data"]["items"]
+    assert ma_state_history.status_code == 200
+    assert ma_state_history.json()["data"]["items"]
+    assert {item["indicator_type"] for item in ma_state_history.json()["data"]["items"]} == {"MA"}
+    assert too_large.status_code == 400
+    assert too_large.json()["error"]["code"] == "HISTORY_RANGE_TOO_LARGE"
     assert all(response.status_code == 200 for response in none_results.values())
     assert (
         none_results["/api/v1/securities/600519/indicators/history"].json()["data"]["items"][0][
@@ -233,3 +349,30 @@ async def test_indicator_and_state_persistence_keep_adjustments_separate(indicat
         ).scalar_one()
         assert qfq_snapshot_count > 0
         assert none_snapshot_count > 0
+
+async def test_alert_state_observation_ignores_unknown_state() -> None:
+    from types import SimpleNamespace
+
+    from app.services.alert_observation_service import AlertObservationService
+
+    class Repository:
+        async def latest_states(self, *_args, **_kwargs):
+            return [
+                SimpleNamespace(
+                    status="UNKNOWN",
+                    trade_date=date(2026, 1, 21),
+                    state_code="MA_CROSS_UP",
+                    parameter_key="v1_test",
+                )
+            ]
+
+    service = AlertObservationService(SimpleNamespace())
+    service.alert_repository = Repository()
+    rule = SimpleNamespace(
+        security_id=1,
+        adjust_type="qfq",
+        state_code="MA_CROSS_UP",
+        parameter_key="v1_test",
+    )
+
+    assert await service.resolve_state(rule) is None

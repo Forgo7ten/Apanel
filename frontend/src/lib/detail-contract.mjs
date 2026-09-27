@@ -23,6 +23,8 @@ export function buildHistoryPath(path, query = {}) {
   if (query.end) params.set("end", query.end);
   if (query.adjust) params.set("adjust", query.adjust);
   if (query.parameter_key) params.set("parameter_key", query.parameter_key);
+  if (query.state_code) params.set("state_code", query.state_code);
+  if (query.indicator_type) params.set("indicator_type", query.indicator_type);
   const suffix = params.toString();
   return `${path}${suffix ? `?${suffix}` : ""}`;
 }

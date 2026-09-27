@@ -114,6 +114,22 @@ class IndicatorStateRepository:
         )
         return list((await self.session.execute(statement)).scalars())
 
+    async def latest_snapshot_date(
+        self, security_id: int, *, adjustment: str | None = None
+    ) -> date | None:
+        return (
+            await self.session.execute(
+                select(func.max(IndicatorSnapshot.trade_date)).where(
+                    IndicatorSnapshot.security_id == security_id,
+                    *(
+                        ()
+                        if adjustment is None
+                        else (IndicatorSnapshot.adjust_type == adjustment,)
+                    ),
+                )
+            )
+        ).scalar_one_or_none()
+
     async def latest_snapshots(
         self, security_id: int, *, adjustment: str | None = None
     ) -> list[IndicatorSnapshot]:
@@ -249,6 +265,8 @@ class IndicatorStateRepository:
         adjustment: str | None = None,
         state_code: str | None = None,
         parameter_key: str | None = None,
+        indicator_type: str | None = None,
+        limit: int | None = None,
     ) -> list[IndicatorState]:
         statement: Select[tuple[IndicatorState]] = select(IndicatorState).where(
             IndicatorState.security_id == security_id
@@ -265,20 +283,34 @@ class IndicatorStateRepository:
             statement = statement.where(IndicatorState.state_code == state_code)
         if parameter_key is not None:
             statement = statement.where(IndicatorState.parameter_key == parameter_key)
+        if indicator_type is not None:
+            statement = statement.where(IndicatorState.indicator_type == indicator_type)
         statement = statement.order_by(IndicatorState.trade_date.asc(), IndicatorState.id.asc())
+        if limit is not None:
+            statement = statement.limit(limit)
         return list((await self.session.execute(statement)).scalars())
 
     async def latest_state_date(
-        self, security_id: int, *, adjustment: str | None = None
+        self,
+        security_id: int,
+        *,
+        adjustment: str | None = None,
+        state_code: str | None = None,
+        parameter_key: str | None = None,
+        indicator_type: str | None = None,
     ) -> date | None:
-        return (
-            await self.session.execute(
-                select(func.max(IndicatorState.trade_date)).where(
-                    IndicatorState.security_id == security_id,
-                    *(() if adjustment is None else (IndicatorState.adjust_type == adjustment,)),
-                )
-            )
-        ).scalar_one_or_none()
+        statement = select(func.max(IndicatorState.trade_date)).where(
+            IndicatorState.security_id == security_id
+        )
+        if adjustment is not None:
+            statement = statement.where(IndicatorState.adjust_type == adjustment)
+        if state_code is not None:
+            statement = statement.where(IndicatorState.state_code == state_code)
+        if parameter_key is not None:
+            statement = statement.where(IndicatorState.parameter_key == parameter_key)
+        if indicator_type is not None:
+            statement = statement.where(IndicatorState.indicator_type == indicator_type)
+        return (await self.session.execute(statement)).scalar_one_or_none()
 
     async def previous_state(
         self,

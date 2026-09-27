@@ -14,7 +14,11 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { LoadingState, QueryErrorState } from "@/components/ui/QueryState";
 import { StateTag } from "@/components/ui/StateTag";
 import { isApiError } from "@/lib/api-errors";
-import { isCurrentWatchDetail, watchDetailViewState } from "@/lib/watch-contract.mjs";
+import {
+  isCurrentWatchDetail,
+  WATCH_DETAIL_REFRESH_INTERVAL_MS,
+  watchDetailViewState,
+} from "@/lib/watch-contract.mjs";
 import { useWatchStore } from "@/stores/watch-store";
 
 function sameId(left: Identifier | null, right: Identifier | null): boolean {
@@ -38,6 +42,8 @@ export default function WatchPage() {
     queryFn: () => getWatchTable(activeTableId as Identifier),
     enabled: activeTableId !== null,
     placeholderData: (previous) => previous,
+    refetchInterval: WATCH_DETAIL_REFRESH_INTERVAL_MS,
+    refetchIntervalInBackground: false,
   });
   const currentDetail = detailsQuery.data && isCurrentWatchDetail(detailsQuery.data, activeTableId)
     ? detailsQuery.data
