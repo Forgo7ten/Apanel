@@ -119,6 +119,9 @@ class Security(Base):
         back_populates="security", cascade="all, delete-orphan"
     )
     notifications: Mapped[list[Notification]] = relationship(back_populates="security")
+    adjustment_state: Mapped[MarketDataAdjustmentState | None] = relationship(
+        back_populates="security", cascade="all, delete-orphan", uselist=False
+    )
 
 
 class DailyBar(Base):
@@ -189,12 +192,14 @@ class IndicatorSnapshot(Base):
             "security_id",
             "trade_date",
             "indicator_type",
-            name="uq_indicator_snapshots_security_date_type",
+            "adjust_type",
+            name="uq_indicator_snapshots_security_date_type_adjust",
         ),
         Index(
-            "ix_indicator_snapshots_security_indicator_date",
+            "ix_indicator_snapshots_security_indicator_adjust_date",
             "security_id",
             "indicator_type",
+            "adjust_type",
             "trade_date",
         ),
     )
@@ -205,6 +210,9 @@ class IndicatorSnapshot(Base):
     )
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    adjust_type: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="qfq", server_default="qfq"
+    )
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     values: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     previous_values: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -259,9 +267,16 @@ class IndicatorState(Base):
             "security_id",
             "trade_date",
             "state_code",
-            name="uq_indicator_states_security_date_code",
+            "parameter_key",
+            "adjust_type",
+            name="uq_indicator_states_security_date_code_param_adjust",
         ),
-        Index("ix_indicator_states_security_trade_date", "security_id", "trade_date"),
+        Index(
+            "ix_indicator_states_security_adjust_date",
+            "security_id",
+            "adjust_type",
+            "trade_date",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -271,6 +286,13 @@ class IndicatorState(Base):
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     state_code: Mapped[str] = mapped_column(String(64), nullable=False)
     indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    parameter_key: Mapped[str] = mapped_column(
+        String(67), nullable=False, default="default", server_default="default"
+    )
+    adjust_type: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="qfq", server_default="qfq"
+    )
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSON, nullable=False, default=dict
@@ -290,6 +312,48 @@ class IndicatorState(Base):
         if name == "metadata":
             return object.__getattribute__(self, "metadata_json")
         return super().__getattribute__(name)
+
+
+class MarketDataAdjustmentState(Base):
+    """Opaque provider revision used to detect qfq history rebases."""
+
+    __tablename__ = "market_data_adjustment_state"
+
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    qfq_coverage_start: Mapped[date | None] = mapped_column(Date, nullable=True)
+    qfq_coverage_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_rebased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    security: Mapped[Security] = relationship(back_populates="adjustment_state")
+
+
+class TradingCalendar(Base):
+    """Expected and validated market-open state for one exchange date."""
+
+    __tablename__ = "trading_calendar"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('OPEN', 'CLOSED', 'UNKNOWN')", name="ck_trading_calendar_status"
+        ),
+    )
+
+    market: Mapped[str] = mapped_column(String(8), primary_key=True, default="CN")
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    expected_open: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    actual_open: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="UNKNOWN")
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class User(Base):
@@ -330,6 +394,9 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     notifications: Mapped[list[Notification]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    secrets: Mapped[list[UserSecret]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -391,9 +458,7 @@ class WatchTable(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -457,6 +522,7 @@ class TableColumn(Base):
     )
     column_type: Mapped[str] = mapped_column(String(16), nullable=False)
     indicator_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    state_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     view_mode: Mapped[str] = mapped_column(String(16), nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -481,9 +547,7 @@ class UserSetting(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     settings: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -492,6 +556,29 @@ class UserSetting(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     user: Mapped[User] = relationship(back_populates="settings")
+
+
+class UserSecret(Base):
+    """Encrypted per-user secret material kept outside JSON settings."""
+
+    __tablename__ = "user_secrets"
+    __table_args__ = (
+        UniqueConstraint("user_id", "secret_type", name="uq_user_secrets_user_type"),
+        Index("ix_user_secrets_user_id", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    secret_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    key_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    user: Mapped[User] = relationship(back_populates="secrets")
 
 
 class AlertRule(Base):
@@ -507,7 +594,7 @@ class AlertRule(Base):
             "((condition_type = 'VALUE' AND indicator_type IS NOT NULL "
             "AND operator IS NOT NULL AND threshold IS NOT NULL AND state_code IS NULL) "
             "OR (condition_type = 'STATE' AND state_code IS NOT NULL "
-            "AND indicator_type IS NULL AND operator IS NULL AND threshold IS NULL))",
+            "AND operator IS NULL AND threshold IS NULL))",
             name="ck_alert_rules_condition_fields",
         ),
         Index("ix_alert_rules_user_id", "user_id"),
@@ -516,9 +603,7 @@ class AlertRule(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     security_id: Mapped[int] = mapped_column(
         ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
     )
@@ -527,6 +612,12 @@ class AlertRule(Base):
     state_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     operator: Mapped[str | None] = mapped_column(String(4), nullable=True)
     threshold: Mapped[Any | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    parameters: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    parameter_key: Mapped[str | None] = mapped_column(String(67), nullable=True)
+    field: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    adjust_type: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="qfq", server_default="qfq"
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -573,6 +664,9 @@ class AlertInstance(Base):
     last_trigger_time: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    trigger_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -596,12 +690,16 @@ class Notification(Base):
         Index("ix_notifications_user_created_at", "user_id", "created_at"),
         Index("ix_notifications_user_status", "user_id", "status"),
         Index("ix_notifications_alert_rule_id", "alert_rule_id"),
+        UniqueConstraint(
+            "alert_rule_id",
+            "security_id",
+            "trigger_sequence",
+            name="uq_notifications_rule_security_sequence",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     alert_rule_id: Mapped[int | None] = mapped_column(
         ForeignKey("alert_rules.id", ondelete="SET NULL"), nullable=True
     )
@@ -619,6 +717,8 @@ class Notification(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trigger_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    observation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -651,4 +751,7 @@ __all__ = [
     "Notification",
     "NotificationChannel",
     "NotificationStatus",
+    "MarketDataAdjustmentState",
+    "TradingCalendar",
+    "UserSecret",
 ]
