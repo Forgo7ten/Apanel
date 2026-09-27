@@ -15,6 +15,7 @@ from app.models import AlertRule, IndicatorSnapshot, IndicatorState
 from app.repositories.alert import AlertRepository
 from app.repositories.security import SecurityRepository
 from app.services.dividend_service import DividendYieldService
+from app.states import StateStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +105,10 @@ class AlertObservationService:
         if not rows:
             return None
         state = rows[0]
+        if state.status == StateStatus.UNKNOWN.value:
+            return None
         return StateObservation(
-            active=state.status == "ACTIVE",
+            active=state.status == StateStatus.ACTIVE.value,
             observation_date=state.trade_date,
             state=state,
         )

@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import httpx
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import Settings
@@ -21,6 +21,7 @@ from app.models import (
     IndicatorState,
     Security,
     StateDefinition,
+    TradingCalendar,
 )
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
@@ -44,6 +45,20 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
         )
         session.add(security)
         await session.flush()
+        calendar_day = date(2026, 1, 1)
+        while calendar_day <= date(2026, 2, 28):
+            session.add(
+                TradingCalendar(
+                    market="CN",
+                    trade_date=calendar_day,
+                    expected_open=True,
+                    actual_open=True,
+                    status="OPEN",
+                    source="TEST",
+                    source_metadata={},
+                )
+            )
+            calendar_day += timedelta(days=1)
         for index in range(40):
             close = Decimal(str(100 + index * 0.2))
             for adjustment, offset in (("qfq", Decimal("0")), ("none", Decimal("5"))):
@@ -110,6 +125,37 @@ async def test_state_history_survives_a_new_service_instance(indicator_context) 
         assert first_count == second_count
         assert len(first) == len(second)
         assert any(item.status == "ACTIVE" for item in second)
+
+
+async def test_state_calculation_marks_missing_previous_trading_day_unknown(
+    indicator_context,
+) -> None:
+    async with indicator_context() as session:
+        await IndicatorService(session).calculate("600519")
+        missing_date = date(2026, 1, 20)
+        affected_date = date(2026, 1, 21)
+        await session.execute(
+            delete(IndicatorSnapshot).where(IndicatorSnapshot.trade_date == missing_date)
+        )
+        await session.commit()
+
+        await StateService(session).calculate("600519")
+        affected = list(
+            (
+                await session.execute(
+                    select(IndicatorState).where(IndicatorState.trade_date == affected_date)
+                )
+            ).scalars()
+        )
+
+        assert affected
+        assert {row.status for row in affected} == {"UNKNOWN"}
+        assert {row.metadata["reason"] for row in affected} == {
+            "missing_previous_trading_day"
+        }
+        assert {row.metadata["expected_previous_trade_date"] for row in affected} == {
+            missing_date.isoformat()
+        }
 
 
 async def test_indicator_and_state_routes_return_current_and_history(indicator_context) -> None:
@@ -233,3 +279,30 @@ async def test_indicator_and_state_persistence_keep_adjustments_separate(indicat
         ).scalar_one()
         assert qfq_snapshot_count > 0
         assert none_snapshot_count > 0
+
+async def test_alert_state_observation_ignores_unknown_state() -> None:
+    from types import SimpleNamespace
+
+    from app.services.alert_observation_service import AlertObservationService
+
+    class Repository:
+        async def latest_states(self, *_args, **_kwargs):
+            return [
+                SimpleNamespace(
+                    status="UNKNOWN",
+                    trade_date=date(2026, 1, 21),
+                    state_code="MA_CROSS_UP",
+                    parameter_key="v1_test",
+                )
+            ]
+
+    service = AlertObservationService(SimpleNamespace())
+    service.alert_repository = Repository()
+    rule = SimpleNamespace(
+        security_id=1,
+        adjust_type="qfq",
+        state_code="MA_CROSS_UP",
+        parameter_key="v1_test",
+    )
+
+    assert await service.resolve_state(rule) is None

@@ -177,6 +177,8 @@ Settings 响应不会返回 Webhook 明文，只返回 `notification_settings.fe
 
 指标历史 item 包含 `indicator_type`、`parameter_key`、`parameters`、`adjust_type`、`values`、`previous_values` 和 `delta`。状态历史 item 还包含 `state_code`、`parameter_key`、`parameters`、`adjust_type` 与 metadata。状态 history 支持按 `state_code` / `parameter_key` 精确筛选。
 
+状态 `status` 可为 `ACTIVE`、`INACTIVE` 或 `UNKNOWN`。`UNKNOWN` 表示系统无法证明该日与上一真实交易日之间的数据连续性（例如上一交易日指标缺失或交易日历不可用）；此时 `transition=false`，状态型告警不会把 UNKNOWN 当作 RESET，也不会据此触发通知。
+
 ## 告警通知 API
 
 ### `/alerts` 提醒规则
