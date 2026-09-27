@@ -107,6 +107,8 @@ Beat 只在 09:30–11:30、13:00–15:00 的候选时段产生任务；worker �
 ```text
 TradingCalendar guard / Hub actual validation
         ↓
+minimum-history readiness（不足则同步 bootstrap，不评估历史 Alert）
+        ↓
 Daily sync(qfq，按配置可同时 none)
         ↓
 Dividend sync
@@ -129,7 +131,8 @@ notification dispatcher → Feishu
 HTTP 读取路径与后台物化路径明确分离：
 
 - `GET /securities/{symbol}/indicators*`、`states*`、Watch detail 只读取已经持久化的数据，不通过页面访问补算历史。
-- 新增 Watch 股票、创建/启用需要新参数的 Alert 会 best-effort 触发 `bootstrap_security_data`。
+- 新增 Watch 股票、创建/启用需要新参数的 Alert，以及修改已有指标/状态列目标，都会通过可注入的 `SecurityBootstrapScheduler` seam 请求 `bootstrap_security_data`；业务 Service 不直接依赖 Celery task。
+- EOD 在增量同步前重新计算当前 Watch/Alert 指标需求与最小历史根数；若 API-side enqueue 曾失败或历史深度不足，会复用共享 bootstrap 自愈，且 bootstrap 不执行 Alert evaluation。
 - 盘中 Quote、EOD、Dividend refresh、qfq rebase 与 pending notification recovery 都由 Celery worker 执行。
 - `market-data-hub` 是唯一允许直接接触 eltdx/AKShare 的服务；Backend/Worker 只能走 Hub 内部 HTTP contract。
 
