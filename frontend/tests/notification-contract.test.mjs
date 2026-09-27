@@ -37,6 +37,26 @@ test("state alert payload omits stale value fields", () => {
   );
 });
 
+
+test("state alert payload preserves exact state parameters", () => {
+  assert.deepEqual(
+    buildAlertPayload({
+      security_id: 1,
+      condition_type: "STATE",
+      state_id: "MA_CROSS_UP",
+      parameters: { short_period: 20, long_period: 60 },
+      adjust_type: "none",
+    }),
+    {
+      security_id: 1,
+      condition_type: "STATE",
+      state_id: "MA_CROSS_UP",
+      parameters: { short_period: 20, long_period: 60 },
+      adjust_type: "none",
+    },
+  );
+});
+
 test("value alert payload serializes numeric thresholds", () => {
   assert.deepEqual(
     buildAlertPayload({

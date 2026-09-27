@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { createWatchTableColumn } from "@/api/watch";
 import type { Identifier, IndicatorViewMode } from "@/api/types";
 import { isApiError } from "@/lib/api-errors";
+import { ALERT_STATE_OPTIONS } from "@/lib/notification-contract.mjs";
 import {
   getDefaultIndicatorParameters,
   getIndicatorFieldOptions,
@@ -65,6 +66,27 @@ function toNumericParameters(parameters: Record<string, string>): Record<string,
   return Object.fromEntries(Object.entries(parameters).map(([key, value]) => [key, Number(value)]));
 }
 
+
+function compatibleStateOptions(indicatorType: string) {
+  const prefix = `${indicatorType.toUpperCase()}_`;
+  return ALERT_STATE_OPTIONS.filter((option) => option.id.startsWith(prefix));
+}
+
+function toStatusFormParameters(indicatorType: string): Record<string, string> {
+  if (indicatorType === "MA") return { short_period: "5", long_period: "10" };
+  return toFormParameters(indicatorType);
+}
+
+function getStatusParameterFields(indicatorType: string): ParameterField[] {
+  if (indicatorType === "MA") {
+    return [
+      { key: "short_period", label: "短周期" },
+      { key: "long_period", label: "长周期" },
+    ];
+  }
+  return getParameterFields(indicatorType);
+}
+
 function mutationErrorMessage(error: unknown): string | null {
   if (!error) return null;
   if (isApiError(error)) {
@@ -91,18 +113,28 @@ export function AddColumnDialog({
   const [viewMode, setViewMode] = useState<IndicatorViewMode>("COMPOSITE");
   const [parameters, setParameters] = useState(() => toFormParameters("MA"));
   const [field, setField] = useState("");
-  const fields = useMemo(() => getParameterFields(indicatorType), [indicatorType]);
+  const [stateCode, setStateCode] = useState("");
+  const stateOptions = useMemo(() => compatibleStateOptions(indicatorType), [indicatorType]);
+  const fields = useMemo(
+    () => viewMode === "STATUS" ? getStatusParameterFields(indicatorType) : getParameterFields(indicatorType),
+    [indicatorType, viewMode],
+  );
   const fieldOptions = useMemo(() => getIndicatorFieldOptions(indicatorType), [indicatorType]);
   const requiresField = (viewMode === "NUMBER" || viewMode === "DELTA") && fieldOptions.length > 0;
   const fieldError = requiresField && field.length === 0 ? "NUMBER/DELTA 模式需要选择明确字段。" : null;
+  const stateError = viewMode === "STATUS" && stateCode.length === 0 ? "STATUS 模式需要选择明确状态。" : null;
   const createMutation = useMutation({
     mutationFn: () => {
       if (fieldError) throw new Error(fieldError);
+      if (stateError) throw new Error(stateError);
       const numericParameters = toNumericParameters(parameters);
       const payload = toCreateColumnPayload({
         indicatorType,
         viewMode,
-        parameters: { ...numericParameters, ...(field ? { field } : {}) },
+        stateCode,
+        parameters: viewMode === "STATUS"
+          ? numericParameters
+          : { ...numericParameters, ...(field ? { field } : {}) },
       });
       if (Object.values(numericParameters).some((value) => !Number.isFinite(value) || value <= 0)) {
         throw new Error("指标参数必须是正数。 ");
@@ -170,8 +202,16 @@ export function AddColumnDialog({
               ref={indicatorSelectRef}
               value={indicatorType}
               onChange={(event) => {
-                setIndicatorType(event.target.value);
-                setParameters(toFormParameters(event.target.value));
+                const nextIndicator = event.target.value;
+                setIndicatorType(nextIndicator);
+                if (viewMode === "STATUS") {
+                  const options = compatibleStateOptions(nextIndicator);
+                  setParameters(toStatusFormParameters(nextIndicator));
+                  setStateCode(options[0]?.id ?? "");
+                } else {
+                  setParameters(toFormParameters(nextIndicator));
+                  setStateCode("");
+                }
                 setField("");
               }}
               className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
@@ -186,7 +226,15 @@ export function AddColumnDialog({
               onChange={(event) => {
                 const nextMode = event.target.value as IndicatorViewMode;
                 setViewMode(nextMode);
-                if (nextMode === "COMPOSITE") setField("");
+                if (nextMode === "STATUS") {
+                  setField("");
+                  setParameters(toStatusFormParameters(indicatorType));
+                  setStateCode(compatibleStateOptions(indicatorType)[0]?.id ?? "");
+                } else {
+                  setParameters(toFormParameters(indicatorType));
+                  setStateCode("");
+                  if (nextMode === "COMPOSITE") setField("");
+                }
               }}
               className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
             >
@@ -194,6 +242,21 @@ export function AddColumnDialog({
             </select>
           </label>
         </div>
+
+        {viewMode === "STATUS" ? (
+          <label className="mt-4 block text-xs font-medium text-secondary">
+            状态
+            <select
+              value={stateCode}
+              onChange={(event) => setStateCode(event.target.value)}
+              className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
+              aria-label="状态目标"
+            >
+              {stateOptions.length === 0 ? <option value="">该指标暂无可识别状态</option> : null}
+              {stateOptions.map((option) => <option key={option.id} value={option.id}>{option.title} · {option.id}</option>)}
+            </select>
+          </label>
+        ) : null}
 
         {fields.length > 0 ? (
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
@@ -233,11 +296,12 @@ export function AddColumnDialog({
         ) : null}
 
         {fieldError ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{fieldError}</p> : null}
+        {stateError ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{stateError}</p> : null}
         {errorMessage ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{errorMessage}</p> : null}
 
         <div className="mt-5 flex justify-end gap-2">
           <button type="button" onClick={onClose} disabled={createMutation.isPending} className="rounded-panel border border-line bg-card px-3 py-2 text-xs font-medium text-secondary hover:text-primary disabled:opacity-40">取消</button>
-          <button type="button" onClick={() => createMutation.mutate()} disabled={createMutation.isPending || Boolean(fieldError)} className="rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50">
+          <button type="button" onClick={() => createMutation.mutate()} disabled={createMutation.isPending || Boolean(fieldError) || Boolean(stateError)} className="rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50">
             {createMutation.isPending ? "保存中…" : "添加指标列"}
           </button>
         </div>

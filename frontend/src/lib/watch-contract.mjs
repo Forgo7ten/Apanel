@@ -47,30 +47,38 @@ export { getDefaultIndicatorParameters, getIndicatorFieldOptions };
 /**
  * Build the exact add-column request accepted by the watch-table API.
  */
-export function toCreateColumnPayload({ indicatorType, viewMode = "COMPOSITE", parameters }) {
+export function toCreateColumnPayload({ indicatorType, viewMode = "COMPOSITE", parameters, stateCode }) {
   const normalizedType = normalizeIndicatorType(indicatorType);
-  const nextParameters = parameters && typeof parameters === "object"
-    ? { ...getDefaultIndicatorParameters(normalizedType), ...parameters }
-    : getDefaultIndicatorParameters(normalizedType);
+  const normalizedViewMode = typeof viewMode === "string" ? viewMode.toUpperCase() : "COMPOSITE";
+  const nextParameters = normalizedViewMode === "STATUS"
+    ? (parameters && typeof parameters === "object" ? { ...parameters } : {})
+    : parameters && typeof parameters === "object"
+      ? { ...getDefaultIndicatorParameters(normalizedType), ...parameters }
+      : getDefaultIndicatorParameters(normalizedType);
 
   if (Object.hasOwn(nextParameters, "stddev")) {
     nextParameters.multiplier = nextParameters.stddev;
     delete nextParameters.stddev;
   }
 
-  const normalizedViewMode = typeof viewMode === "string" ? viewMode.toUpperCase() : "COMPOSITE";
   if (normalizedViewMode === "COMPOSITE") {
     delete nextParameters.field;
   } else if (typeof nextParameters.field === "string") {
     nextParameters.field = nextParameters.field.trim().toLowerCase();
   }
 
-  return {
+  const payload = {
     column_type: "INDICATOR",
     indicator_type: normalizedType,
     parameters: nextParameters,
     view_mode: normalizedViewMode,
   };
+  if (normalizedViewMode === "STATUS") {
+    const normalizedStateCode = typeof stateCode === "string" ? stateCode.trim().toUpperCase() : "";
+    if (!normalizedStateCode) throw new Error("STATUS 模式需要选择明确状态。");
+    payload.state_code = normalizedStateCode;
+  }
+  return payload;
 }
 
 /**

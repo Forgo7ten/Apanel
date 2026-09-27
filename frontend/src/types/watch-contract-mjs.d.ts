@@ -8,9 +8,11 @@ declare module "@/lib/watch-contract.mjs" {
     indicatorType: unknown;
     viewMode?: string;
     parameters?: Record<string, number | string | boolean | null | number[] | string[]>;
+    stateCode?: string;
   }): {
     column_type: "INDICATOR";
     indicator_type: string;
+    state_code?: string;
     parameters: Record<string, number | string | boolean | null | number[] | string[]>;
     view_mode: "NUMBER" | "DELTA" | "STATUS" | "COMPOSITE";
   };

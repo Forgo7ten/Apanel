@@ -88,6 +88,29 @@ test("composite indicator field options use the canonical backend vocabulary", (
   assert.deepEqual(getIndicatorFieldOptions("MA"), []);
 });
 
+
+test("STATUS columns preserve an explicit state target and exact state parameters", () => {
+  assert.deepEqual(
+    toCreateColumnPayload({
+      indicatorType: "MA",
+      viewMode: "STATUS",
+      stateCode: "ma_cross_up",
+      parameters: { short_period: 20, long_period: 60 },
+    }),
+    {
+      column_type: "INDICATOR",
+      indicator_type: "MA",
+      state_code: "MA_CROSS_UP",
+      parameters: { short_period: 20, long_period: 60 },
+      view_mode: "STATUS",
+    },
+  );
+  assert.throws(
+    () => toCreateColumnPayload({ indicatorType: "MA", viewMode: "STATUS", parameters: { short_period: 5, long_period: 10 } }),
+    /STATUS 模式需要选择明确状态/,
+  );
+});
+
 test("column order payload only contains persisted dynamic column ids", () => {
   assert.deepEqual(toColumnOrderPayload(["security", "price", "14", "7", "states"]), {
     column_ids: [14, 7],
