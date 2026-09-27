@@ -49,7 +49,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 
 ## 前端
 
-需要 Node.js 20。安装锁定依赖：
+需要 Node.js latest/current。安装锁定依赖：
 
 ```bash
 cd frontend
@@ -91,7 +91,7 @@ docker compose exec backend alembic upgrade head
 
 - Backend：Python 3.12、PostgreSQL 16、pytest、Ruff、`alembic upgrade head`。
 - Market Data Hub：Python 3.12、pytest、Ruff。
-- Frontend：Node 20、`npm test`、lint、typecheck、production build。
+- Frontend：Node latest、`npm test`、lint、typecheck、production build。
 - Compose：使用测试凭据执行 `docker compose config -q`。
 
 CI 不访问真实行情 provider；真实 eltdx/AKShare smoke test 应放在 staging/manual gate，避免把第三方网络可用性当成代码单元测试。

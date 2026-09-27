@@ -49,7 +49,7 @@ Nginx 的路由规则如下：
 | `frontend` | 运行 Next.js standalone server | 后端健康 |
 | `nginx` | 发布 `${HTTP_PORT:-8080}`，聚合前后端 | 后端和前端健康 |
 
-后端和行情数据中枢的容器镜像都基于 Python 3.12；前端镜像使用 Node 20 Alpine。Compose 同时启动 Celery worker 与 Beat；Beat 只负责产生任务，实际任务由 worker 执行。
+后端和行情数据中枢的容器镜像都基于 Python 3.12；前端镜像使用 Node current Alpine，并随 Node.js Current/latest 更新。Compose 同时启动 Celery worker 与 Beat；Beat 只负责产生任务，实际任务由 worker 执行。
 
 ## 后端模块边界
 
