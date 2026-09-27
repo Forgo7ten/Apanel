@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type RefObject } from "react";
 
 import { searchSecurities } from "@/api/securities";
-import type { Identifier, Security } from "@/api/types";
+import type { Identifier, Security, WatchTableDetails, WatchTableStock, WatchTableSummary } from "@/api/types";
 import { addStockToWatchTable } from "@/api/watch";
 import { isApiError } from "@/lib/api-errors";
 import { getSecurityIdentifier, toAddStockPayload } from "@/lib/watch-contract.mjs";
@@ -17,10 +17,12 @@ function securityId(security: Security): Identifier | null {
 export function AddStockDialog({
   tableId,
   restoreFocusRef,
+  onAdded,
   onClose,
 }: {
   tableId: Identifier;
   restoreFocusRef?: RefObject<HTMLButtonElement | null>;
+  onAdded?: (stock: WatchTableStock) => void;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -42,11 +44,21 @@ export function AddStockDialog({
       if (payload === null) throw new Error("搜索结果缺少 security_id，暂时无法添加。");
       return addStockToWatchTable(tableId, payload);
     },
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
-      ]);
+    onSuccess: (stock) => {
+      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => {
+        if (!current) return current;
+        if (current.stocks.some((item) => String(item.security_id) === String(stock.security_id))) {
+          return current;
+        }
+        const stocks = [...current.stocks, stock];
+        return { ...current, stocks, stock_count: stocks.length };
+      });
+      queryClient.setQueryData<WatchTableSummary[]>(["watch-tables"], (current) => current?.map((summary) => (
+        String(summary.id) === String(tableId)
+          ? { ...summary, stock_count: summary.stock_count + 1 }
+          : summary
+      )));
+      onAdded?.(stock);
       onClose();
     },
   });
@@ -115,7 +127,7 @@ export function AddStockDialog({
           ) : searchQuery.isPending ? (
             <p className="grid min-h-24 place-items-center text-xs text-muted" aria-live="polite">正在搜索证券…</p>
           ) : searchQuery.data?.length ? (
-            <div className="space-y-1" role="listbox" aria-label="证券搜索结果">
+            <div className="max-h-[15rem] space-y-1 overflow-y-auto pr-1" role="listbox" aria-label="证券搜索结果">
               {searchQuery.data.map((security) => {
                 const id = securityId(security);
                 const active = selected?.symbol === security.symbol;
@@ -128,8 +140,8 @@ export function AddStockDialog({
                     role="option"
                     aria-selected={active}
                   >
-                    <span>
-                      <span className="block text-sm font-medium text-primary">{security.name}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block break-words text-sm font-medium text-primary" title={security.name}>{security.name}</span>
                       <span className="mt-0.5 block font-mono text-[11px] text-muted">{security.symbol} · {security.market}</span>
                     </span>
                     {id === null ? <span className="text-[10px] text-warning">缺少 ID</span> : null}

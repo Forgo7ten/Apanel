@@ -8,6 +8,7 @@ import type {
   UpdateColumnInput,
   WatchTableColumn,
   WatchTableDetails,
+  WatchTableStock,
   WatchTableSummary,
 } from "./types";
 
@@ -30,8 +31,8 @@ export function getWatchTable(tableId: Identifier): Promise<WatchTableDetails> {
   return apiFetch<WatchTableDetails>(`/watch-tables/${encodeURIComponent(tableId)}`);
 }
 
-export function addStockToWatchTable(tableId: Identifier, input: AddStockInput): Promise<unknown> {
-  return apiFetch<unknown>(`/watch-tables/${encodeURIComponent(tableId)}/stocks`, {
+export function addStockToWatchTable(tableId: Identifier, input: AddStockInput): Promise<WatchTableStock> {
+  return apiFetch<WatchTableStock>(`/watch-tables/${encodeURIComponent(tableId)}/stocks`, {
     method: "POST",
     body: JSON.stringify(input),
   });

@@ -185,7 +185,7 @@ export function AlertWizard({
                   <span className="text-[11px] text-positive">已选择</span>
                 </div>
               ) : null}
-              {searchQuery.isPending ? <p className="mt-2 text-xs text-muted" aria-live="polite">正在搜索证券…</p> : null}
+              {!selectedSecurity && searchQuery.isFetching ? <p className="mt-2 text-xs text-muted" aria-live="polite">正在搜索证券…</p> : null}
               {!selectedSecurity && searchQuery.data?.length ? (
                 <div className="mt-2 max-h-48 overflow-y-auto rounded-panel border border-line bg-card p-1" role="listbox" aria-label="证券搜索结果">
                   {searchQuery.data.map((security) => {

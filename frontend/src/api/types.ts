@@ -2,6 +2,19 @@ export type Identifier = number | string;
 
 export type IndicatorViewMode = "NUMBER" | "DELTA" | "STATUS" | "COMPOSITE";
 
+export type DependencyHealth = {
+  status: "healthy" | "unhealthy";
+  latency_ms?: number | null;
+  detail?: string | null;
+};
+
+export type BackendHealth = {
+  service: string;
+  version: string;
+  status: "healthy" | "degraded";
+  dependencies: Record<string, DependencyHealth>;
+};
+
 export type IndicatorParameterValue = string | number | boolean | null | string[] | number[];
 
 export type IndicatorParameters = Record<string, IndicatorParameterValue>;
@@ -121,6 +134,7 @@ export type WatchTableStock = {
   name?: string;
   market?: string;
   security?: Security;
+  bootstrap_ready?: boolean;
   price?: PriceSnapshot | number | string | null;
   indicators?: Record<string, unknown>;
   indicator_values?: Record<string, unknown>;

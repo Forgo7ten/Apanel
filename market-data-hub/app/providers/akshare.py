@@ -2,9 +2,10 @@
 
 The security universe is deliberately a narrower seam than the full
 capability contracts. eltdx remains the primary provider for quotes, daily
-bars, and dividends; this module only composes the security-list operation.
-AKShare is imported inside the blocking worker, so constructing the fallback
-never changes the startup path or the TDX-only path.
+bars, dividends and the security universe; this module composes the
+security-list operation and can best-effort enrich suspiciously truncated ETF
+display names from the exact AKShare symbol. AKShare remains lazily imported
+inside the blocking worker.
 """
 
 from __future__ import annotations
@@ -216,7 +217,7 @@ class AkshareSecurityProvider:
 
 
 class SecurityMasterFallbackProvider:
-    """Use TDX security metadata first, then one complete AKShare batch."""
+    """Use TDX as the universe source and AKShare as fallback/name enrichment."""
 
     name = "security-master-fallback"
 
@@ -245,7 +246,17 @@ class SecurityMasterFallbackProvider:
         if primary_records:
             if self._closed:
                 raise ProviderUnavailableError(_SECURITY_MASTER_UNAVAILABLE)
-            return primary_records
+            if self._fallback is None or not any(
+                _may_have_truncated_tdx_name(record) for record in primary_records
+            ):
+                return primary_records
+            try:
+                fallback_records = tuple(await self._fallback.get_symbols())
+            except Exception:
+                return primary_records
+            if not fallback_records:
+                return primary_records
+            return _enrich_display_names(primary_records, fallback_records)
 
         if self._closed:
             raise ProviderUnavailableError(_SECURITY_MASTER_UNAVAILABLE)
@@ -321,6 +332,47 @@ def _clear_cache(fetcher: object) -> None:
     clear_cache = getattr(fetcher, "cache_clear", None)
     if callable(clear_cache):
         clear_cache()
+
+
+def _may_have_truncated_tdx_name(record: Security) -> bool:
+    """TDX code-table ETF names can be capped near the protocol field width."""
+
+    if record.security_type != SecurityType.ETF:
+        return False
+    try:
+        return len(record.name.encode("gb18030")) >= 15
+    except UnicodeEncodeError:
+        return True
+
+
+def _enrich_display_names(
+    primary_records: Sequence[Security],
+    fallback_records: Sequence[Security],
+) -> tuple[Security, ...]:
+    """Keep the TDX universe/metadata but accept a longer exact-symbol display name."""
+
+    fallback_by_symbol = {record.symbol: record for record in fallback_records}
+    enriched: list[Security] = []
+    for record in primary_records:
+        fallback = fallback_by_symbol.get(record.symbol)
+        if (
+            fallback is not None
+            and fallback.market == record.market
+            and fallback.security_type == record.security_type
+            and len(fallback.name) > len(record.name)
+        ):
+            enriched.append(
+                Security(
+                    symbol=record.symbol,
+                    name=fallback.name,
+                    market=record.market,
+                    security_type=record.security_type,
+                    exchange=record.exchange,
+                )
+            )
+            continue
+        enriched.append(record)
+    return tuple(enriched)
 
 
 def _records_from_source(

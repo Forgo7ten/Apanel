@@ -7,7 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+ARG PYPI_MIRROR_URL=
+RUN if [ -n "$PYPI_MIRROR_URL" ]; then \
+        pip config set global.index-url "$PYPI_MIRROR_URL"; \
+    fi \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 

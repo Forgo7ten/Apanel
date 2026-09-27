@@ -182,6 +182,28 @@ async def test_security_repository_uses_one_explicit_transaction_for_a_batch() -
     )
 
 
+async def test_security_repository_chunks_large_batches_below_asyncpg_bind_limit() -> None:
+    session = RecordingSession()
+    repository = SqlAlchemySecurityRepository(RecordingSessionFactory(session))
+    records = [
+        Security(
+            symbol=str(600000 + index),
+            name=f"证券{index}",
+            market="SH",
+            security_type="STOCK",
+        )
+        for index in range(6000)
+    ]
+
+    await repository.upsert_many(records)
+
+    assert len(session.statements) > 1
+    assert all(
+        len(statement.compile(dialect=postgresql.dialect()).params) <= 32767
+        for statement in session.statements
+    )
+
+
 @pytest.mark.asyncio
 async def test_security_sync_rolls_back_a_real_sqlalchemy_batch_on_a_later_constraint_failure(
 ) -> None:

@@ -66,6 +66,8 @@ class SecurityDataBootstrapService:
                     )
                 )
         dividend_result = await self.market_data_client.sync_dividends(symbols=(symbol,))
+        if not dividend_result.ok:
+            raise RuntimeError("dividend bootstrap did not complete")
         return BootstrapResult(
             symbol=symbol,
             adjustments=adjustments,

@@ -58,18 +58,15 @@ docker compose up --build
 
 Compose 只把 Nginx 的 `${HTTP_PORT}` 发布到宿主机；后端和行情服务的 `8000`/`8001` 只在 Compose 网络中可见。
 
-### 为行情服务配置出站代理
+### 镜像构建网络与 Python 镜像源
 
-如果行情 provider 需要经由代理访问外网，只在 `.env` 中设置行情服务专用变量：
+Compose 默认让所有 Dockerfile 构建步骤使用宿主机网络，避免 Docker 默认构建网络的 DNS 不可达问题：
 
 ```dotenv
-MARKET_DATA_HTTP_PROXY=http://host.docker.internal:your-proxy-port
-MARKET_DATA_HTTPS_PROXY=http://host.docker.internal:your-proxy-port
-MARKET_DATA_ALL_PROXY=
-MARKET_DATA_NO_PROXY=
+DOCKER_BUILD_NETWORK=host
 ```
 
-这些变量只注入 `market-data-hub`；默认留空时不会启用代理。Compose 会自动把 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-hub` 加入 `NO_PROXY`，保证内部请求不经过外部代理。`host.docker.internal` 使用跨 Linux 的 `host-gateway` 映射；宿主代理必须监听 Docker 可达接口，不能只监听宿主机的 `127.0.0.1`。代理 URL 可能包含敏感凭据，请只保存在被 Git 忽略的 `.env` 中，应用日志不会打印这些值。
+`DOCKER_BUILD_NETWORK` 可选 `host`（使用宿主机网络，适合 Linux 开发机）或 `default`（使用 Docker 默认构建网络）。`PYPI_MIRROR_URL` 指定 Python 包索引地址；非空时构建使用该镜像，留空时使用 pip 默认源。`.env.example` 默认填写清华 PyPI 镜像。Frontend 使用 npm 官方 lockfile 安装依赖。配置完成后直接运行 `docker compose up --build`。
 
 ## 初始化管理员
 

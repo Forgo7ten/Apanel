@@ -5,4 +5,9 @@ declare module "@/lib/indicator-metadata.mjs" {
   export function getDefaultIndicatorParameters(indicatorType: string): Record<string, number>;
   export function getIndicatorFieldOptions(indicatorType: string): Array<{ value: string; label: string }>;
   export function indicatorUsesAdjustment(indicatorType: string): boolean;
+  export function getIndicatorDisplayTitle(
+    indicatorType: string,
+    parameters?: Record<string, unknown>,
+    fallback?: string,
+  ): string;
 }
