@@ -28,7 +28,6 @@ from app.models import (
     WatchTable,
     WatchTableSymbol,
 )
-from app.services.alert_service import _observation_for_rule
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
 from app.tasks.contracts import PipelineContext
@@ -188,8 +187,7 @@ async def test_history_expands_parameter_variants_without_mixing_values(
             source = next(
                 item
                 for item in rows
-                if item.indicator_type == indicator_type
-                and item.parameters == parameters
+                if item.indicator_type == indicator_type and item.parameters == parameters
             )
             selected = await service.history_data(
                 "600519",
@@ -231,7 +229,7 @@ async def test_pipeline_collects_column_parameters_and_keeps_default_requests() 
     )
 
 
-def test_alert_observation_uses_the_default_variant_not_an_arbitrary_custom_variant() -> None:
+def test_alert_target_selects_the_exact_parameter_variant() -> None:
     snapshot = SimpleNamespace(
         trade_date=date(2026, 9, 24),
         indicator_type="RSI",
@@ -249,12 +247,10 @@ def test_alert_observation_uses_the_default_variant_not_an_arbitrary_custom_vari
         previous_values={},
         delta={},
     )
-    rule = SimpleNamespace(indicator_type="RSI", state_code=None)
-
-    observation, context = _observation_for_rule(rule, [snapshot], [])
-
-    assert observation["values"]["RSI"] == 65.0
-    assert context["snapshot"].parameters == {"period": 14}
+    selected = select_snapshot_variant(snapshot, "RSI", {"period": 6})
+    assert selected is not None
+    assert selected.parameters == {"period": 6}
+    assert selected.values["value"] == 95.0
 
 
 async def test_state_recalculation_keeps_custom_variants_and_default_state_semantics(
@@ -318,9 +314,17 @@ async def test_eod_pipeline_reuses_one_snapshot_row_and_keeps_column_demand(
         )
         await session.commit()
 
+    class SyncResult:
+        items = ()
+        ok = True
+        retryable_symbols = ()
+
     class MarketData:
         async def sync_daily(self, **_kwargs):
-            return {"ok": True}
+            return SyncResult()
+
+        async def sync_dividends(self, **_kwargs):
+            return SyncResult()
 
     async def alert_runner(_context):
         return []
@@ -334,12 +338,8 @@ async def test_eod_pipeline_reuses_one_snapshot_row_and_keeps_column_demand(
         alert_runner=alert_runner,
         notification_runner=notification_runner,
     )
-    first = await EODPipeline(steps).run(
-        PipelineContext(date(2026, 2, 14), "qfq", ("600519",))
-    )
-    second = await EODPipeline(steps).run(
-        PipelineContext(date(2026, 2, 14), "qfq", ("600519",))
-    )
+    first = await EODPipeline(steps).run(PipelineContext(date(2026, 2, 14), "qfq", ("600519",)))
+    second = await EODPipeline(steps).run(PipelineContext(date(2026, 2, 14), "qfq", ("600519",)))
 
     assert first.completed_steps == second.completed_steps
     async with multi_parameter_context() as session:

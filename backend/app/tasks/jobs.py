@@ -18,14 +18,17 @@ from app.clients.market_data_hub import MarketDataHubClient, MarketDataHubClient
 from app.core.config import Settings, get_settings
 from app.db.redis import close_redis_client, create_redis_client
 from app.db.session import create_engine, dispose_engine
+from app.services.data_bootstrap_service import SecurityDataBootstrapService
+from app.services.notification_service import dispatch_pending_notifications
+from app.services.trading_calendar_service import TradingCalendarService
 
 from .celery_app import celery_app
-from .contracts import PipelineContext, PipelineError
+from .contracts import PipelineConfigurationError, PipelineContext, PipelineError
 from .locks import RedisTaskLock
 from .pipeline import (
     EODPipeline,
     build_default_eod_steps,
-    resolve_watched_symbols,
+    resolve_monitored_symbols,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +106,27 @@ async def execute_quote_refresh(
 
     app_settings = settings or get_settings()
     app_settings.validate_database_credentials()
+    if symbols is None:
+        now = datetime.now(ZoneInfo(app_settings.timezone))
+        minutes = now.hour * 60 + now.minute
+        in_session = (9 * 60 + 30 <= minutes <= 11 * 60 + 30) or (13 * 60 <= minutes <= 15 * 60)
+        calendar_engine = None
+        calendar_factory = session_factory
+        try:
+            if calendar_factory is None:
+                calendar_engine, calendar_factory = _new_session_factory(app_settings)
+            async with calendar_factory() as calendar_session:
+                if not in_session or not await TradingCalendarService(calendar_session).is_open(
+                    now.date()
+                ):
+                    return {
+                        "status": "skipped",
+                        "reason": "market_closed",
+                        "operation": "quote_refresh",
+                    }
+        finally:
+            if calendar_engine is not None:
+                await dispose_engine(calendar_engine)
     own_redis = redis_client is None and lock is None
     own_engine = session_factory is None
     own_client = market_data_client is None
@@ -132,11 +156,9 @@ async def execute_quote_refresh(
         if symbols is None:
             if session_factory is None:
                 engine, session_factory = _new_session_factory(app_settings)
-            symbols = await resolve_watched_symbols(session_factory)
+            symbols = await resolve_monitored_symbols(session_factory)
         normalized_symbols = tuple(
-            dict.fromkeys(
-                str(symbol).strip() for symbol in symbols if str(symbol).strip()
-            )
+            dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip())
         )
         if not normalized_symbols:
             return {"status": "skipped", "reason": "no_symbols", "operation": "quote_refresh"}
@@ -145,14 +167,27 @@ async def execute_quote_refresh(
                 app_settings.market_data_hub_url,
                 internal_api_token=app_settings.internal_api_token,
                 timeout_seconds=app_settings.market_data_request_timeout_seconds,
+                quote_timeout_seconds=app_settings.market_data_quote_timeout_seconds,
+                daily_timeout_seconds=app_settings.market_data_daily_timeout_seconds,
+                bootstrap_timeout_seconds=app_settings.market_data_bootstrap_timeout_seconds,
             )
-        result = await client.sync_quotes(symbols=normalized_symbols)
-        summary = _ensure_ok(result, "quote synchronization")
+        totals = {"total": 0, "succeeded": 0, "failed": 0}
+        batch_size = app_settings.market_data_sync_batch_size
+        for offset in range(0, len(normalized_symbols), batch_size):
+            result = await client.sync_quotes(
+                symbols=normalized_symbols[offset : offset + batch_size]
+            )
+            totals["total"] += result.total
+            totals["succeeded"] += result.succeeded
+            totals["failed"] += result.failed
+            if result.retryable_symbols:
+                raise PipelineError("quote synchronization has retryable failures")
         return {
             "status": "completed",
             "operation": "quote_refresh",
             "symbols": len(normalized_symbols),
-            **summary,
+            **totals,
+            "ok": totals["failed"] == 0,
         }
     finally:
         if task_lock is not None:
@@ -190,6 +225,23 @@ async def execute_eod_pipeline(
     app_settings = settings or get_settings()
     app_settings.validate_database_credentials()
     selected_date = trade_date or _today(app_settings)
+    if steps is None:
+        calendar_engine = None
+        calendar_factory = session_factory
+        try:
+            if calendar_factory is None:
+                calendar_engine, calendar_factory = _new_session_factory(app_settings)
+            async with calendar_factory() as calendar_session:
+                if not await TradingCalendarService(calendar_session).is_open(selected_date):
+                    return {
+                        "status": "skipped",
+                        "reason": "non_trading_day",
+                        "operation": "eod_pipeline",
+                        "trade_date": selected_date.isoformat(),
+                    }
+        finally:
+            if calendar_engine is not None:
+                await dispose_engine(calendar_engine)
     own_redis = redis_client is None and lock is None
     own_engine = session_factory is None and steps is None
     own_client = market_data_client is None and steps is None
@@ -224,11 +276,9 @@ async def execute_eod_pipeline(
         if symbols is None:
             if session_factory is None:
                 engine, session_factory = _new_session_factory(app_settings)
-            symbols = await resolve_watched_symbols(session_factory)
+            symbols = await resolve_monitored_symbols(session_factory)
         normalized_symbols = tuple(
-            dict.fromkeys(
-                str(symbol).strip() for symbol in symbols if str(symbol).strip()
-            )
+            dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip())
         )
         if not normalized_symbols:
             return {
@@ -245,7 +295,23 @@ async def execute_eod_pipeline(
                     app_settings.market_data_hub_url,
                     internal_api_token=app_settings.internal_api_token,
                     timeout_seconds=app_settings.market_data_request_timeout_seconds,
+                    quote_timeout_seconds=app_settings.market_data_quote_timeout_seconds,
+                    daily_timeout_seconds=app_settings.market_data_daily_timeout_seconds,
+                    bootstrap_timeout_seconds=app_settings.market_data_bootstrap_timeout_seconds,
                 )
+            if hasattr(client, "validate_calendar"):
+                validation = await client.validate_calendar(trade_date=selected_date)
+                if validation.get("status") == "UNKNOWN":
+                    raise PipelineConfigurationError(
+                        "trading calendar actual validation is unknown"
+                    )
+                if validation.get("status") == "CLOSED":
+                    return {
+                        "status": "skipped",
+                        "reason": "non_trading_day",
+                        "operation": "eod_pipeline",
+                        "trade_date": selected_date.isoformat(),
+                    }
             steps = build_default_eod_steps(
                 session_factory=session_factory,
                 market_data_client=client,
@@ -263,6 +329,9 @@ async def execute_eod_pipeline(
                 "session_factory": session_factory,
                 "market_data_client": client,
                 "notification_provider": notification_provider,
+                "analysis_adjustments": (
+                    ("qfq", "none") if app_settings.enable_none_analysis else (adjustment,)
+                ),
             },
         )
         result = await EODPipeline(steps).run(context)
@@ -347,6 +416,128 @@ def run_eod_pipeline(
         _retry_or_raise(task, "eod_pipeline", exc)
 
 
+async def execute_security_bootstrap(
+    symbol: str,
+    *,
+    settings: Settings | None = None,
+    session_factory: Any | None = None,
+    market_data_client: MarketDataHubClientProtocol | None = None,
+    redis_client: Any | None = None,
+) -> dict[str, Any]:
+    app_settings = settings or get_settings()
+    own_engine = session_factory is None
+    own_client = market_data_client is None
+    own_redis = redis_client is None
+    engine = None
+    client = market_data_client
+    redis = redis_client
+    task_lock = None
+    try:
+        redis = redis or create_redis_client(
+            app_settings.redis_url,
+            socket_connect_timeout_seconds=app_settings.redis_socket_connect_timeout_seconds,
+            socket_timeout_seconds=app_settings.redis_socket_timeout_seconds,
+        )
+        task_lock = RedisTaskLock(
+            redis,
+            f"apanel:task-lock:bootstrap-security-data:{symbol.strip().upper()}",
+            ttl_seconds=app_settings.scheduler_lock_ttl_seconds,
+        )
+        if not await task_lock.acquire():
+            return {
+                "status": "skipped",
+                "reason": "lock_held",
+                "operation": "security_bootstrap",
+                "symbol": symbol,
+            }
+        if session_factory is None:
+            engine, session_factory = _new_session_factory(app_settings)
+        if client is None:
+            client = MarketDataHubClient(
+                app_settings.market_data_hub_url,
+                internal_api_token=app_settings.internal_api_token,
+                timeout_seconds=app_settings.market_data_request_timeout_seconds,
+                quote_timeout_seconds=app_settings.market_data_quote_timeout_seconds,
+                daily_timeout_seconds=app_settings.market_data_daily_timeout_seconds,
+                bootstrap_timeout_seconds=app_settings.market_data_bootstrap_timeout_seconds,
+            )
+        async with session_factory() as session:
+            from app.tasks.pipeline import collect_indicator_requests
+
+            requests = (await collect_indicator_requests(session, (symbol,))).get(symbol)
+        result = await SecurityDataBootstrapService(
+            session_factory=session_factory,
+            market_data_client=client,
+            minimum_bars=app_settings.analysis_bootstrap_min_bars,
+        ).ensure_ready(
+            symbol,
+            adjustments=("qfq", "none") if app_settings.enable_none_analysis else ("qfq",),
+            requests=requests,
+        )
+        return {
+            "status": "completed",
+            "operation": "security_bootstrap",
+            "symbol": result.symbol,
+            "indicators": result.indicators_materialized,
+            "states": result.states_materialized,
+            "dividend_synced": result.dividend_synced,
+        }
+    finally:
+        if task_lock is not None:
+            with suppress(Exception):
+                await task_lock.release()
+        if own_client and client is not None:
+            with suppress(Exception):
+                await _close_optional(client)
+        if own_engine and engine is not None:
+            with suppress(Exception):
+                await dispose_engine(engine)
+        if own_redis and redis is not None:
+            with suppress(Exception):
+                await close_redis_client(redis)
+
+
+@celery_app.task(bind=True, name="apanel.tasks.bootstrap_security_data", max_retries=None)
+def bootstrap_security_data(task: Task, symbol: str) -> dict[str, Any]:
+    try:
+        return asyncio.run(execute_security_bootstrap(symbol))
+    except Exception as exc:
+        _retry_or_raise(task, "security_bootstrap", exc)
+
+
+def enqueue_security_bootstrap(symbol: str) -> None:
+    """Best-effort API-side enqueue; EOD readiness remains the recovery path."""
+    if get_settings().app_env.casefold() == "test":
+        return
+    try:
+        bootstrap_security_data.delay(symbol)
+    except Exception:
+        logger.warning(
+            "security_bootstrap_enqueue_failed",
+            extra={"event": "security_bootstrap_enqueue_failed", "symbol": symbol},
+        )
+
+
+async def execute_pending_notification_dispatch(
+    *, settings: Settings | None = None
+) -> dict[str, int]:
+    app_settings = settings or get_settings()
+    engine, session_factory = _new_session_factory(app_settings)
+    try:
+        async with session_factory() as session:
+            return await dispatch_pending_notifications(session)
+    finally:
+        await dispose_engine(engine)
+
+
+@celery_app.task(bind=True, name="apanel.tasks.dispatch_pending_notifications", max_retries=None)
+def dispatch_pending_notifications_task(task: Task) -> dict[str, int]:
+    try:
+        return asyncio.run(execute_pending_notification_dispatch())
+    except Exception as exc:
+        _retry_or_raise(task, "notification_dispatch", exc)
+
+
 # Descriptive aliases for callers that prefer an explicit task suffix.
 refresh_quotes_task = refresh_quotes
 run_eod_pipeline_task = run_eod_pipeline
@@ -356,9 +547,14 @@ __all__ = [
     "ScheduledTaskError",
     "ScheduledTaskRetry",
     "execute_eod_pipeline",
+    "execute_security_bootstrap",
+    "enqueue_security_bootstrap",
     "execute_quote_refresh",
+    "execute_pending_notification_dispatch",
     "refresh_quotes",
     "refresh_quotes_task",
     "run_eod_pipeline",
     "run_eod_pipeline_task",
+    "bootstrap_security_data",
+    "dispatch_pending_notifications_task",
 ]

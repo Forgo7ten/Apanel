@@ -17,7 +17,12 @@ def test_worker_and_scheduler_share_the_celery_application() -> None:
     assert scheduler_app is celery_app
     assert worker_app is celery_app
     assert set(celery_app.conf.beat_schedule) == {
-        "refresh-intraday-quotes",
+        "refresh-quotes-open",
+        "refresh-quotes-morning",
+        "refresh-quotes-before-lunch",
+        "refresh-quotes-afternoon",
+        "refresh-quotes-close",
+        "dispatch-pending-notifications",
         "run-end-of-day-pipeline",
     }
     assert celery_app.conf.timezone == "Asia/Shanghai"

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -48,6 +49,87 @@ class PermanentMarketDataHubError(MarketDataHubClientError):
     public_message = "market data synchronization failed"
 
 
+@dataclass(frozen=True, slots=True)
+class SyncItem:
+    symbol: str
+    status: str
+    fetched: int = 0
+    persisted: int = 0
+    error_code: str | None = None
+    history_rebased: bool = False
+    changed_from: date | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "success"
+
+
+@dataclass(frozen=True, slots=True)
+class SyncResult(Mapping[str, Any]):
+    operation: str
+    items: tuple[SyncItem, ...]
+
+    @property
+    def total(self) -> int:
+        return len(self.items)
+
+    @property
+    def succeeded(self) -> int:
+        return sum(item.succeeded for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        return self.total - self.succeeded
+
+    @property
+    def ok(self) -> bool:
+        return self.failed == 0
+
+    @property
+    def retryable_symbols(self) -> tuple[str, ...]:
+        return tuple(
+            item.symbol for item in self.items if item.error_code in _RETRYABLE_ERROR_CODES
+        )
+
+    @property
+    def permanent_failures(self) -> tuple[str, ...]:
+        return tuple(
+            item.symbol
+            for item in self.items
+            if not item.succeeded and item.error_code not in _RETRYABLE_ERROR_CODES
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation": self.operation,
+            "total": self.total,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "ok": self.ok,
+            "items": [
+                {
+                    "symbol": item.symbol,
+                    "status": item.status,
+                    "fetched": item.fetched,
+                    "persisted": item.persisted,
+                    "error": ({"code": item.error_code} if item.error_code else None),
+                    "history_rebased": item.history_rebased,
+                    "changed_from": item.changed_from.isoformat() if item.changed_from else None,
+                }
+                for item in self.items
+            ],
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("operation", "total", "succeeded", "failed", "ok", "items"))
+
+    def __len__(self) -> int:
+        return 6
+
+
 class MarketDataHubClientProtocol(Protocol):
     async def sync_securities(self) -> Mapping[str, Any]: ...
 
@@ -55,12 +137,15 @@ class MarketDataHubClientProtocol(Protocol):
         self,
         *,
         symbols: Iterable[str],
-        start: date,
-        end: date,
+        start: date | None = None,
+        end: date | None = None,
+        lookback_bars: int | None = None,
         adjustment: str,
-    ) -> Mapping[str, Any]: ...
+    ) -> SyncResult: ...
 
-    async def sync_quotes(self, *, symbols: Iterable[str]) -> Mapping[str, Any]: ...
+    async def sync_quotes(self, *, symbols: Iterable[str]) -> SyncResult: ...
+    async def sync_dividends(self, *, symbols: Iterable[str]) -> SyncResult: ...
+    async def validate_calendar(self, *, trade_date: date) -> Mapping[str, Any]: ...
 
 
 def _validate_base_url(value: str) -> str:
@@ -82,6 +167,9 @@ class MarketDataHubClient:
         *,
         internal_api_token: str | None = None,
         timeout_seconds: float = 10.0,
+        quote_timeout_seconds: float | None = None,
+        daily_timeout_seconds: float | None = None,
+        bootstrap_timeout_seconds: float | None = None,
         client: Any | None = None,
     ) -> None:
         if timeout_seconds <= 0:
@@ -89,6 +177,11 @@ class MarketDataHubClient:
         self.base_url = _validate_base_url(base_url)
         self.internal_api_token = internal_api_token.strip() if internal_api_token else None
         self.timeout_seconds = float(timeout_seconds)
+        self.quote_timeout_seconds = float(quote_timeout_seconds or timeout_seconds)
+        self.daily_timeout_seconds = float(daily_timeout_seconds or timeout_seconds)
+        self.bootstrap_timeout_seconds = float(
+            bootstrap_timeout_seconds or self.daily_timeout_seconds
+        )
         self._client = client
         self._owns_client = client is None
 
@@ -99,24 +192,61 @@ class MarketDataHubClient:
         self,
         *,
         symbols: Iterable[str],
-        start: date,
-        end: date,
+        start: date | None = None,
+        end: date | None = None,
+        lookback_bars: int | None = None,
         adjustment: str,
-    ) -> Mapping[str, Any]:
-        return await self._post(
-            "/internal/sync/daily",
-            {
-                "symbols": list(symbols),
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "adjustment": adjustment,
-            },
+    ) -> SyncResult:
+        payload: dict[str, Any] = {"symbols": list(symbols), "adjustment": adjustment}
+        if lookback_bars is not None:
+            payload["lookback_bars"] = int(lookback_bars)
+            timeout = self.bootstrap_timeout_seconds
+        else:
+            if start is None or end is None:
+                raise ValueError("start/end are required outside bootstrap mode")
+            payload.update({"start": start.isoformat(), "end": end.isoformat()})
+            timeout = self.daily_timeout_seconds
+        return _parse_sync_result(
+            await self._post(
+                "/internal/sync/daily", payload, allow_partial=True, timeout_seconds=timeout
+            )
         )
 
-    async def sync_quotes(self, *, symbols: Iterable[str]) -> Mapping[str, Any]:
-        return await self._post("/internal/sync/quotes", {"symbols": list(symbols)})
+    async def sync_quotes(self, *, symbols: Iterable[str]) -> SyncResult:
+        return _parse_sync_result(
+            await self._post(
+                "/internal/sync/quotes",
+                {"symbols": list(symbols)},
+                allow_partial=True,
+                timeout_seconds=self.quote_timeout_seconds,
+            )
+        )
 
-    async def _post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    async def sync_dividends(self, *, symbols: Iterable[str]) -> SyncResult:
+        return _parse_sync_result(
+            await self._post(
+                "/internal/sync/dividends",
+                {"symbols": list(symbols)},
+                allow_partial=True,
+                timeout_seconds=self.daily_timeout_seconds,
+            )
+        )
+
+    async def validate_calendar(self, *, trade_date: date) -> Mapping[str, Any]:
+        return await self._post(
+            "/internal/calendar/validate",
+            {"trade_date": trade_date.isoformat()},
+            timeout_seconds=self.daily_timeout_seconds,
+        )
+
+    async def _post(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        allow_partial: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> Mapping[str, Any]:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_seconds))
         headers = {}
@@ -127,7 +257,7 @@ class MarketDataHubClient:
                 f"{self.base_url}{path}",
                 json=dict(payload),
                 headers=headers,
-                timeout=self.timeout_seconds,
+                timeout=timeout_seconds or self.timeout_seconds,
             )
         except (httpx.TimeoutException, TimeoutError, ConnectionError) as exc:
             raise RetryableMarketDataHubError from exc
@@ -150,6 +280,11 @@ class MarketDataHubClient:
         if not isinstance(body, Mapping):
             raise PermanentMarketDataHubError
         if body.get("success") is not True:
+            if allow_partial and body.get("success") is False and _is_partial_sync_envelope(body):
+                data = body.get("data")
+                if not isinstance(data, Mapping):
+                    raise PermanentMarketDataHubError
+                return data
             if body.get("success") is False and _has_retryable_error_code(body):
                 raise RetryableMarketDataHubError
             raise PermanentMarketDataHubError
@@ -162,6 +297,42 @@ class MarketDataHubClient:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
             self._client = None
+
+
+def _is_partial_sync_envelope(body: Mapping[str, Any]) -> bool:
+    error = body.get("error")
+    return isinstance(error, Mapping) and error.get("code") == "PARTIAL_SYNC_FAILURE"
+
+
+def _parse_sync_result(data: Mapping[str, Any]) -> SyncResult:
+    items_raw = data.get("items")
+    if not isinstance(items_raw, list):
+        raise PermanentMarketDataHubError
+    items: list[SyncItem] = []
+    for raw in items_raw:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("symbol"), str):
+            raise PermanentMarketDataHubError
+        error = raw.get("error")
+        code = _error_code(error) if error is not None else None
+        changed_from = raw.get("changed_from")
+        try:
+            changed_date = (
+                date.fromisoformat(changed_from) if isinstance(changed_from, str) else None
+            )
+        except ValueError as exc:
+            raise PermanentMarketDataHubError from exc
+        items.append(
+            SyncItem(
+                symbol=raw["symbol"],
+                status=str(raw.get("status", "failed")),
+                fetched=int(raw.get("fetched", 0)),
+                persisted=int(raw.get("persisted", 0)),
+                error_code=code,
+                history_rebased=bool(raw.get("history_rebased", False)),
+                changed_from=changed_date,
+            )
+        )
+    return SyncResult(operation=str(data.get("operation", "unknown")), items=tuple(items))
 
 
 def _has_retryable_error_code(body: Mapping[str, Any]) -> bool:
@@ -247,4 +418,6 @@ __all__ = [
     "MarketDataHubClientError",
     "PermanentMarketDataHubError",
     "RetryableMarketDataHubError",
+    "SyncItem",
+    "SyncResult",
 ]

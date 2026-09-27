@@ -14,10 +14,9 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Protocol
 
-from app.services.indicator_service import DEFAULT_INDICATOR_ADJUSTMENT
-
 EOD_STEP_ORDER: tuple[str, ...] = (
     "daily_sync",
+    "dividend_sync",
     "adjustment_ready",
     "indicator_snapshots",
     "delta",
@@ -64,15 +63,11 @@ class PipelineContext:
 
     def __post_init__(self) -> None:
         adjustment = str(self.adjustment).strip().lower()
-        if adjustment != DEFAULT_INDICATOR_ADJUSTMENT:
-            raise PipelineConfigurationError(
-                "indicator and state persistence require qfq adjustment"
-            )
+        if adjustment not in {"qfq", "none"}:
+            raise PipelineConfigurationError("analysis adjustment must be qfq or none")
         self.adjustment = adjustment
         self.symbols = tuple(
-            dict.fromkeys(
-                str(symbol).strip() for symbol in self.symbols if str(symbol).strip()
-            )
+            dict.fromkeys(str(symbol).strip() for symbol in self.symbols if str(symbol).strip())
         )
         if self.idempotency_key is None:
             self.idempotency_key = f"{self.trade_date.isoformat()}:{self.adjustment}"

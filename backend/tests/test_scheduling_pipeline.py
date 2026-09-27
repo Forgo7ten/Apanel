@@ -27,11 +27,15 @@ def test_schedule_uses_shanghai_trading_sessions_and_env_overrides() -> None:
     )
 
     schedule = build_beat_schedule(settings)
-    quote = schedule["refresh-intraday-quotes"]["schedule"]
+    quote_open = schedule["refresh-quotes-open"]["schedule"]
+    quote_lunch = schedule["refresh-quotes-before-lunch"]["schedule"]
+    quote_close = schedule["refresh-quotes-close"]["schedule"]
     eod = schedule["run-end-of-day-pipeline"]["schedule"]
 
-    assert quote.minute == {0, 10, 20, 30, 40, 50}
-    assert quote.hour == {9, 10, 11, 13, 14}
+    assert quote_open.hour == {9}
+    assert quote_lunch.hour == {11}
+    assert quote_close.hour == {15}
+    assert quote_close.minute == {0}
     assert eod.hour == {16}
     assert eod.minute == {5}
 
@@ -47,9 +51,7 @@ async def test_eod_pipeline_is_strictly_ordered() -> None:
         PipelineStep(name, lambda context, name=name: handler(context, name))
         for name in EOD_STEP_ORDER
     )
-    result = await EODPipeline(steps).run(
-        PipelineContext(date(2026, 9, 24), "qfq", ("600519",))
-    )
+    result = await EODPipeline(steps).run(PipelineContext(date(2026, 9, 24), "qfq", ("600519",)))
 
     assert tuple(calls) == EOD_STEP_ORDER
     assert result.completed_steps == EOD_STEP_ORDER
@@ -78,7 +80,13 @@ async def test_eod_pipeline_stops_after_the_first_failure() -> None:
         await EODPipeline(steps).run(PipelineContext(date(2026, 9, 24), "qfq", ("600519",)))
 
     assert error.value.step == "delta"
-    assert calls == ["daily_sync", "adjustment_ready", "indicator_snapshots", "delta"]
+    assert calls == [
+        "daily_sync",
+        "dividend_sync",
+        "adjustment_ready",
+        "indicator_snapshots",
+        "delta",
+    ]
     assert "secret.example" not in str(error.value)
 
 
@@ -158,7 +166,7 @@ def test_custom_default_steps_keep_alert_and_notification_boundaries_injected() 
 
 
 @pytest.mark.asyncio
-async def test_eod_pipeline_rejects_none_before_any_persistence_step() -> None:
+async def test_eod_pipeline_accepts_none_as_an_explicit_analysis_adjustment() -> None:
     calls: list[str] = []
 
     async def handler(_context: PipelineContext, name: str) -> None:
@@ -168,21 +176,16 @@ async def test_eod_pipeline_rejects_none_before_any_persistence_step() -> None:
         PipelineStep(name, lambda context, name=name: handler(context, name))
         for name in EOD_STEP_ORDER
     )
-
-    with pytest.raises(PipelineConfigurationError, match="qfq"):
-        await execute_eod_pipeline(
-            trade_date=date(2026, 9, 24),
-            symbols=["600519"],
-            adjustment="none",
-            lock=SimpleNamespace(
-                acquire=lambda: _true_async(),
-                release=lambda: _noop_async(),
-            ),
-            steps=steps,
-            settings=Settings(),
-        )
-
-    assert calls == []
+    result = await execute_eod_pipeline(
+        trade_date=date(2026, 9, 24),
+        symbols=["600519"],
+        adjustment="none",
+        lock=SimpleNamespace(acquire=lambda: _true_async(), release=lambda: _noop_async()),
+        steps=steps,
+        settings=Settings(),
+    )
+    assert result["status"] == "completed"
+    assert tuple(calls) == EOD_STEP_ORDER
 
 
 async def _true_async() -> bool:
