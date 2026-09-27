@@ -121,7 +121,7 @@ http://localhost:8080/api/v1
 | `GET` | `/securities/{symbol}/daily-bars` | 读取日线；支持 `start_date`、`end_date`、`adjust_type` |
 | `GET` | `/securities/{symbol}/dividend-yield` | 返回 TTM 现金股息率及计算输入 |
 
-`daily-bars` 的 `adjust_type` 可使用 `qfq` 或 `none`。Dividend Yield 使用过去 12 个月已落库的每股现金分红总额除以当前价格；优先使用最新 Quote，缺少 Quote 时由后端使用可用的未复权收盘价 fallback，并在响应中返回 `price_source` 与 `as_of`。
+`daily-bars` 的 `adjust_type` 可使用 `qfq` 或 `none`。省略日期时默认返回以该证券最新持久化日线为结束日的最近 90 个日历日；显式 `start_date/end_date` 最大跨度为 366 个日历日，超过时返回 `HISTORY_RANGE_TOO_LARGE`。Dividend Yield 使用过去 12 个月已落库的每股现金分红总额除以当前价格；优先使用最新 Quote，缺少 Quote 时由后端使用可用的未复权收盘价 fallback，并在响应中返回 `price_source` 与 `as_of`。
 
 ## Watch Table API
 
@@ -166,16 +166,16 @@ Settings 响应不会返回 Webhook 明文，只返回 `notification_settings.fe
 
 ## 指标与状态历史 API
 
-以下接口读取已经由 bootstrap/EOD/rebase 流程物化的分析结果：
+以下接口读取已经由 bootstrap/EOD/rebase 流程物化的分析结果。公共历史读取默认返回以该证券最新持久化日期为结束日的最近 90 个日历日；显式 `start/end` 最大跨度为 366 个日历日，超过时返回 `HISTORY_RANGE_TOO_LARGE`。状态历史还设置 20,000 行结果上限，超限返回 `HISTORY_RESULT_TOO_LARGE`，调用方应缩小日期范围或增加过滤条件。
 
 - `GET /securities/{symbol}/indicators`
 - `GET /securities/{symbol}/indicators/history`
 - `GET /securities/{symbol}/states`
 - `GET /securities/{symbol}/states/history`
 
-四个接口都使用查询参数 `adjust=qfq|none`（注意参数名是 `adjust`，不是 `adjust_type`），省略时默认 `qfq`。两种 adjustment 使用独立的 snapshot/state identity，不会互相覆盖。GET 接口只读持久化结果，不再隐式触发重算或数据库写入。指标/状态 history 还支持 `start`、`end`；指标 history 支持 `parameter_key`，状态 history 支持 `state_code` 与 `parameter_key`。
+四个接口都使用查询参数 `adjust=qfq|none`（注意参数名是 `adjust`，不是 `adjust_type`），省略时默认 `qfq`。两种 adjustment 使用独立的 snapshot/state identity，不会互相覆盖。GET 接口只读持久化结果，不再隐式触发重算或数据库写入。指标/状态 history 还支持 `start`、`end`；指标 history 支持 `parameter_key`，状态 history 支持 `state_code`、`parameter_key` 与 `indicator_type`。
 
-指标历史 item 包含 `indicator_type`、`parameter_key`、`parameters`、`adjust_type`、`values`、`previous_values` 和 `delta`。状态历史 item 还包含 `state_code`、`parameter_key`、`parameters`、`adjust_type` 与 metadata。状态 history 支持按 `state_code` / `parameter_key` 精确筛选。
+指标历史 item 包含 `indicator_type`、`parameter_key`、`parameters`、`adjust_type`、`values`、`previous_values` 和 `delta`。状态历史 item 还包含 `state_code`、`parameter_key`、`parameters`、`adjust_type` 与 metadata。状态 history 支持按 `state_code` / `parameter_key` / `indicator_type` 精确筛选。
 
 状态 `status` 可为 `ACTIVE`、`INACTIVE` 或 `UNKNOWN`。`UNKNOWN` 表示系统无法证明该日与上一真实交易日之间的数据连续性（例如上一交易日指标缺失或交易日历不可用）；此时 `transition=false`，状态型告警不会把 UNKNOWN 当作 RESET，也不会据此触发通知。
 

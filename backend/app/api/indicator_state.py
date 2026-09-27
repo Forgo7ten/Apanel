@@ -80,6 +80,7 @@ async def get_state_history(
     adjustment: str | None = Query(default="qfq", alias="adjust"),  # noqa: B008
     state_code: str | None = Query(default=None),  # noqa: B008
     parameter_key: str | None = Query(default=None),  # noqa: B008
+    indicator_type: str | None = Query(default=None),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[StateHistoryData]:
     states = await StateService(session).history(
@@ -89,6 +90,7 @@ async def get_state_history(
         adjustment=adjustment,
         state_code=state_code,
         parameter_key=parameter_key,
+        indicator_type=indicator_type,
     )
     return SuccessResponse(data=StateHistoryData(items=[_state_data(item) for item in states]))
 

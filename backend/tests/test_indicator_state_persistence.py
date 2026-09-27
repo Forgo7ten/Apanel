@@ -23,6 +23,7 @@ from app.models import (
     StateDefinition,
     TradingCalendar,
 )
+from app.services.history_window import resolve_history_window
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
 
@@ -79,6 +80,28 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
         await session.commit()
     yield session_factory
     await engine.dispose()
+
+
+def test_history_window_defaults_to_90_days_and_rejects_large_ranges() -> None:
+    from app.core.errors import ApiError
+
+    start, end = resolve_history_window(
+        start=None, end=None, latest_date=date(2026, 9, 24)
+    )
+    assert start == date(2026, 6, 27)
+    assert end == date(2026, 9, 24)
+
+    try:
+        resolve_history_window(
+            start=date(2025, 1, 1),
+            end=date(2026, 9, 24),
+            latest_date=date(2026, 9, 24),
+        )
+    except ApiError as exc:
+        assert exc.code == "HISTORY_RANGE_TOO_LARGE"
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("large history range must be rejected")
 
 
 async def test_indicator_calculation_persists_defaults_and_is_idempotent(indicator_context) -> None:
@@ -185,6 +208,14 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
             indicator_history = await client.get("/api/v1/securities/600519/indicators/history")
             states = await client.get("/api/v1/securities/600519/states")
             state_history = await client.get("/api/v1/securities/600519/states/history")
+            ma_state_history = await client.get(
+                "/api/v1/securities/600519/states/history",
+                params={"indicator_type": "MA"},
+            )
+            too_large = await client.get(
+                "/api/v1/securities/600519/indicators/history",
+                params={"start": "2025-01-01", "end": "2026-09-24"},
+            )
             none_results = {
                 path: await client.get(path, params={"adjust": "none"})
                 for path in (
@@ -204,6 +235,11 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
     assert states.status_code == 200
     assert state_history.status_code == 200
     assert state_history.json()["data"]["items"]
+    assert ma_state_history.status_code == 200
+    assert ma_state_history.json()["data"]["items"]
+    assert {item["indicator_type"] for item in ma_state_history.json()["data"]["items"]} == {"MA"}
+    assert too_large.status_code == 400
+    assert too_large.json()["error"]["code"] == "HISTORY_RANGE_TOO_LARGE"
     assert all(response.status_code == 200 for response in none_results.values())
     assert (
         none_results["/api/v1/securities/600519/indicators/history"].json()["data"]["items"][0][

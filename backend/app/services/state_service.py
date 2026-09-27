@@ -21,12 +21,12 @@ from app.models import (
     IndicatorState,
 )
 from app.repositories.indicator_state import IndicatorStateRepository
+from app.services.history_window import MAX_STATE_HISTORY_ROWS, resolve_history_window
 from app.services.indicator_service import (
     DEFAULT_HISTORY_ADJUSTMENT,
     DEFAULT_INDICATOR_ADJUSTMENT,
     _validate_history_adjustment,
     _validate_indicator_adjustment,
-    _validate_range,
     normalize_symbol,
 )
 from app.services.trading_calendar_service import TradingCalendarService
@@ -165,7 +165,9 @@ class StateService:
                     prior_row = existing_by_key.get(
                         (expected_previous_date, definition.code, state_key)
                     )
-                    prior_status = _state_status(prior_row.status) if prior_row is not None else None
+                    prior_status = (
+                        _state_status(prior_row.status) if prior_row is not None else None
+                    )
                     if prior_status is None:
                         prior_status = computed_status_by_key.get(
                             (expected_previous_date, definition.code, state_key)
@@ -314,20 +316,43 @@ class StateService:
         adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
         state_code: str | None = None,
         parameter_key: str | None = None,
+        indicator_type: str | None = None,
     ) -> list[IndicatorState]:
-        _validate_range(start, end)
         adjustment = _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
-        persisted = await self.repository.list_states(
+        normalized_indicator = (
+            str(indicator_type).strip().upper() if indicator_type is not None else None
+        )
+        latest_date = await self.repository.latest_state_date(
             security.id,
-            start=start,
-            end=end,
             adjustment=adjustment,
             state_code=state_code,
             parameter_key=parameter_key,
+            indicator_type=normalized_indicator,
+        )
+        if latest_date is None:
+            raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
+        resolved_start, resolved_end = resolve_history_window(
+            start=start, end=end, latest_date=latest_date
+        )
+        persisted = await self.repository.list_states(
+            security.id,
+            start=resolved_start,
+            end=resolved_end,
+            adjustment=adjustment,
+            state_code=state_code,
+            parameter_key=parameter_key,
+            indicator_type=normalized_indicator,
+            limit=MAX_STATE_HISTORY_ROWS + 1,
         )
         if not persisted:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
+        if len(persisted) > MAX_STATE_HISTORY_ROWS:
+            raise ApiError(
+                "HISTORY_RESULT_TOO_LARGE",
+                "State history result is too large; narrow the range or filters.",
+                413,
+            )
         return persisted
 
     async def _get_security(self, symbol: str):

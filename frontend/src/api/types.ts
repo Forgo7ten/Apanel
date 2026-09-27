@@ -179,6 +179,8 @@ export type HistoryQuery = {
   end?: string;
   adjust?: "qfq" | "none";
   parameter_key?: string;
+  state_code?: string;
+  indicator_type?: string;
 };
 
 export type CreateWatchTableInput = {

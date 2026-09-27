@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import ApiError
 from app.repositories.security import SecurityRepository
 from app.services.dividend_service import DividendYieldResult, DividendYieldService
+from app.services.history_window import resolve_history_window
 from app.services.indicator_service import normalize_symbol
 
 
@@ -59,15 +60,21 @@ class SecurityService:
         end_date: date | None = None,
         adjust_type: str | None = None,
     ):
-        if start_date is not None and end_date is not None and start_date > end_date:
-            raise ApiError("INVALID_DATE_RANGE", "Start date must not be after end date.", 400)
         if adjust_type is not None and adjust_type not in {"qfq", "none"}:
             raise ApiError("INVALID_ADJUSTMENT", "Adjustment must be qfq or none.", 400)
         security = await self.get(symbol)
+        latest_date = await self.repository.latest_daily_bar_date(
+            security.id, adjust_type=adjust_type
+        )
+        if latest_date is None:
+            raise ApiError("DAILY_BAR_NOT_FOUND", "No daily bars are available.", 404)
+        resolved_start, resolved_end = resolve_history_window(
+            start=start_date, end=end_date, latest_date=latest_date
+        )
         return await self.repository.daily_bars(
             security.id,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=resolved_start,
+            end_date=resolved_end,
             adjust_type=adjust_type,
         )
 
