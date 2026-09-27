@@ -1,3 +1,5 @@
+import { INDICATOR_OPTIONS, getDefaultIndicatorParameters, getIndicatorFieldOptions, indicatorUsesAdjustment } from "./indicator-metadata.mjs";
+
 /**
  * Shared alert vocabulary. These labels mirror the state IDs exposed by the
  * state engine; the browser only presents them and never evaluates them.
@@ -23,14 +25,7 @@ export const ALERT_STATE_OPTIONS = Object.freeze([
   { id: "MACD_RED_BAR_SHRINKING", title: "红柱缩短", level: "NEGATIVE" },
 ]);
 
-export const ALERT_INDICATOR_OPTIONS = Object.freeze([
-  { id: "RSI", title: "RSI" },
-  { id: "MA", title: "MA" },
-  { id: "KDJ", title: "KDJ" },
-  { id: "BOLL", title: "BOLL" },
-  { id: "MACD", title: "MACD" },
-  { id: "DIVIDEND_YIELD", title: "股息率" },
-]);
+export const ALERT_INDICATOR_OPTIONS = INDICATOR_OPTIONS.map((item) => ({ id: item.id, title: item.title }));
 
 export const ALERT_OPERATOR_OPTIONS = Object.freeze([
   { id: ">=", title: "大于等于" },
@@ -58,6 +53,7 @@ export function buildAlertPayload(form) {
       throw new Error("请选择状态条件。");
     }
     payload.state_id = form.state_id.trim();
+    payload.adjust_type = form.adjust_type === "none" ? "none" : "qfq";
     return payload;
   }
 
@@ -73,9 +69,19 @@ export function buildAlertPayload(form) {
     throw new Error("阈值必须是有效数字。");
   }
 
-  payload.indicator = form.indicator.trim();
+  const indicator = form.indicator.trim().toUpperCase();
+  payload.indicator = indicator;
   payload.operator = form.operator;
   payload.threshold = threshold;
+  payload.parameters = form.parameters && typeof form.parameters === "object" ? form.parameters : getDefaultIndicatorParameters(indicator);
+  const fields = getIndicatorFieldOptions(indicator);
+  if (fields.length > 1 || indicator === "MA") {
+    if (!form.field?.trim()) throw new Error("请选择具体指标字段。");
+    payload.field = form.field.trim();
+  } else if (fields.length === 1) {
+    payload.field = fields[0].value;
+  }
+  if (indicatorUsesAdjustment(indicator)) payload.adjust_type = form.adjust_type === "none" ? "none" : "qfq";
   return payload;
 }
 

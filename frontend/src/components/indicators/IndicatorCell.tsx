@@ -34,13 +34,8 @@ function DeltaCell({ value }: { value: unknown }) {
 function StatusCell({ value, states }: { value: unknown; states: IndicatorState[] }) {
   const stateValue = isRecord(value) ? value.status ?? value.state ?? value.title ?? value.label : value;
   const stateText = typeof stateValue === "string" || typeof stateValue === "number" ? String(stateValue) : null;
-  const state = states[0];
-
-  if (state) {
-    return <StateTag tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>;
-  }
-
-  return stateText ? <StateTag>{stateText}</StateTag> : <span className="text-sm text-muted">—</span>;
+  if (stateText) return <StateTag>{stateText}</StateTag>;
+  return <span className="text-sm text-muted">—</span>;
 }
 
 export function IndicatorCell({ mode, value, states = [] }: IndicatorCellProps) {

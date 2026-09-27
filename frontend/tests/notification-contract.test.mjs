@@ -26,11 +26,13 @@ test("state alert payload omits stale value fields", () => {
       indicator: "RSI",
       operator: ">=",
       threshold: "70",
+      adjust_type: "qfq",
     }),
     {
       security_id: 7,
       condition_type: "STATE",
       state_id: "BOLL_WIDTH_NARROWING",
+      adjust_type: "qfq",
     },
   );
 });
@@ -43,6 +45,7 @@ test("value alert payload serializes numeric thresholds", () => {
       indicator: "RSI",
       operator: ">=",
       threshold: "70.5",
+      adjust_type: "none",
     }),
     {
       security_id: "42",
@@ -50,6 +53,9 @@ test("value alert payload serializes numeric thresholds", () => {
       indicator: "RSI",
       operator: ">=",
       threshold: 70.5,
+      parameters: { period: 14 },
+      field: "value",
+      adjust_type: "none",
     },
   );
 });
@@ -63,6 +69,17 @@ test("value alerts reject non-numeric thresholds without echoing input", () => {
     () => buildAlertPayload({ security_id: 1, condition_type: "VALUE", indicator: "RSI", operator: ">=", threshold: "  " }),
     /阈值必须是有效数字/,
   );
+});
+
+
+test("composite value alerts require an explicit scalar field", () => {
+  assert.throws(
+    () => buildAlertPayload({ security_id: 1, condition_type: "VALUE", indicator: "MACD", operator: ">=", threshold: "1", parameters: { fast_period: 12, slow_period: 26, signal_period: 9 } }),
+    /请选择具体指标字段/,
+  );
+  const payload = buildAlertPayload({ security_id: 1, condition_type: "VALUE", indicator: "MACD", operator: ">=", threshold: "1", parameters: { fast_period: 12, slow_period: 26, signal_period: 9 }, field: "histogram", adjust_type: "qfq" });
+  assert.equal(payload.field, "histogram");
+  assert.deepEqual(payload.parameters, { fast_period: 12, slow_period: 26, signal_period: 9 });
 });
 
 test("notification retry action is available for failed and server-marked recoverable pending rows", () => {

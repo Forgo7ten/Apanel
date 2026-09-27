@@ -3,10 +3,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { Identifier } from "@/api/types";
+import type { CreateAlertInput, Identifier } from "@/api/types";
+import { createAlert } from "@/api/alerts";
 import { createWatchTable, deleteWatchTable, getWatchTable, getWatchTables } from "@/api/watch";
 import { AddStockDialog } from "@/components/table/AddStockDialog";
 import { WatchTable } from "@/components/table/WatchTable";
+import { AlertWizard, type AlertWizardDraft } from "@/components/alerts/AlertWizard";
+import type { DetailSelection } from "@/components/indicators/detail-types";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { LoadingState, QueryErrorState } from "@/components/ui/QueryState";
 import { StateTag } from "@/components/ui/StateTag";
@@ -22,6 +25,7 @@ export default function WatchPage() {
   const queryClient = useQueryClient();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [createName, setCreateName] = useState("");
+  const [alertDraft, setAlertDraft] = useState<AlertWizardDraft | null>(null);
   const addStockTriggerRef = useRef<HTMLButtonElement | null>(null);
   const closeAddStockDialog = useCallback(() => setAddDialogOpen(false), []);
   const { selectedTableId, setSelectedTableId, resetTableView } = useWatchStore();
@@ -67,6 +71,38 @@ export default function WatchPage() {
       await queryClient.invalidateQueries({ queryKey: ["watch-tables"] });
     },
   });
+
+  const alertMutation = useMutation({
+    mutationFn: (input: CreateAlertInput) => createAlert(input),
+    onSuccess: async () => {
+      setAlertDraft(null);
+      await queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+  });
+
+  const openAlertFromDetail = useCallback((selection: DetailSelection) => {
+    const stock = selection.stock;
+    const securityId = stock.security_id ?? stock.security?.security_id ?? stock.security?.id;
+    if (securityId === undefined) return;
+    if (selection.kind === "state") {
+      setAlertDraft({
+        security: { id: securityId, security_id: securityId, symbol: stock.symbol, name: stock.name ?? stock.symbol, market: stock.market ?? "" },
+        condition_type: "STATE",
+        state_id: selection.state.state_code ?? selection.state.state_id,
+        adjust_type: selection.state.adjust_type === "none" ? "none" : "qfq",
+      });
+      return;
+    }
+    const raw = selection.column.parameters ?? {};
+    const numericParameters = Object.fromEntries(Object.entries(raw).filter(([key, value]) => key !== "field" && typeof value === "number")) as Record<string, number>;
+    setAlertDraft({
+      security: { id: securityId, security_id: securityId, symbol: stock.symbol, name: stock.name ?? stock.symbol, market: stock.market ?? "" },
+      condition_type: "VALUE",
+      indicator: selection.column.indicator_type ?? selection.column.type,
+      parameters: numericParameters,
+      field: typeof raw.field === "string" ? raw.field : undefined,
+    });
+  }, []);
 
   useEffect(() => {
     if (tables.length === 0) {
@@ -189,7 +225,7 @@ export default function WatchPage() {
                 <>
                   {detailState === "refreshing" ? <p className="mb-2 rounded-panel border border-line bg-card/50 px-3 py-2 text-xs text-muted" role="status" aria-live="polite">正在刷新监控数据…</p> : null}
                   {detailState === "refresh-error" ? <div className="mb-2 flex items-center justify-between gap-3 rounded-panel border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning" role="alert"><span>刷新失败，当前仍显示上一次数据。</span><button type="button" onClick={() => detailsQuery.refetch()} className="shrink-0 rounded border border-warning/40 px-2 py-1 font-medium hover:bg-warning/10 focus:outline-none focus:ring-2 focus:ring-brand/40">重试</button></div> : null}
-                  <WatchTable key={String(currentDetail.id ?? activeTableId)} table={currentDetail} onAddStock={(trigger) => { addStockTriggerRef.current = trigger ?? null; setAddDialogOpen(true); }} />
+                  <WatchTable key={String(currentDetail.id ?? activeTableId)} table={currentDetail} onAddStock={(trigger) => { addStockTriggerRef.current = trigger ?? null; setAddDialogOpen(true); }} onCreateNotification={openAlertFromDetail} />
                 </>
               ) : null}
             </div>
@@ -222,6 +258,15 @@ export default function WatchPage() {
       ) : null}
 
       {addDialogOpen && activeTableId !== null ? <AddStockDialog tableId={activeTableId} restoreFocusRef={addStockTriggerRef} onClose={closeAddStockDialog} /> : null}
+      <AlertWizard
+        key={alertDraft ? `${alertDraft.security?.symbol ?? "draft"}-${alertDraft.condition_type}` : "closed"}
+        open={alertDraft !== null}
+        initialDraft={alertDraft}
+        isSubmitting={alertMutation.isPending}
+        submitError={alertMutation.error}
+        onClose={() => { if (!alertMutation.isPending) setAlertDraft(null); }}
+        onSubmit={(input) => alertMutation.mutate(input)}
+      />
     </div>
   );
 }

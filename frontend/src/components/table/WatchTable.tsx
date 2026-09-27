@@ -42,6 +42,7 @@ import {
   watchRowLayoutContract,
 } from "@/lib/watch-contract.mjs";
 import { useWatchStore } from "@/stores/watch-store";
+import { useWorkspaceSettings } from "@/lib/use-workspace-settings";
 import { stateToneFromLevel, StateTag } from "@/components/ui/StateTag";
 import {
   IndicatorDetailsDrawer,
@@ -134,6 +135,7 @@ function buildColumnDefs(
   columns: WatchTableColumn[],
   onOpenIndicator: (stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => void,
   onOpenState: (stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => void,
+  showDeltas: boolean,
 ): ColumnDef<WatchTableStock, unknown>[] {
   const dynamicColumns = columns.map((column, index) => {
     const id = columnId(column, index);
@@ -159,7 +161,7 @@ function buildColumnDefs(
           className="rounded-panel text-left focus:outline-none focus:ring-2 focus:ring-brand/40"
           aria-label={`查看${getColumnTitle(column)}详情`}
         >
-          <IndicatorCell mode={column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />
+          <IndicatorCell mode={column.view_mode === "DELTA" && !showDeltas ? "NUMBER" : column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />
         </button>
       ),
       meta: { label: getColumnTitle(column), movable: true, width: column.width },
@@ -188,7 +190,7 @@ function buildColumnDefs(
       accessorFn: (stock) => stock.price,
       header: "当前价",
       sortingFn: (rowA, rowB) => compareRows(rowA.original, rowB.original, "price"),
-      cell: ({ row }) => <IndicatorCell mode="DELTA" value={row.original.price} />,
+      cell: ({ row }) => <IndicatorCell mode={showDeltas ? "DELTA" : "NUMBER"} value={row.original.price} />,
       meta: { label: "当前价", movable: false, toggleable: false },
     },
     ...dynamicColumns,
@@ -279,6 +281,7 @@ export function WatchTable({
   onCreateNotification?: DetailNotificationHandler;
 }) {
   const queryClient = useQueryClient();
+  const { settings: workspaceSettings } = useWorkspaceSettings();
   const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
@@ -372,8 +375,8 @@ export function WatchTable({
   const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
   const removeStock = removeStockMutation.mutate;
   const baseColumnDefs = useMemo(
-    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail),
-    [columns, openIndicatorDetail, openStateDetail],
+    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas),
+    [columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas],
   );
   const columnDefs = useMemo(
     () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId })],
@@ -384,8 +387,8 @@ export function WatchTable({
   const initialVisibility = useMemo(() => toVisibility(columns), [columns]);
   const serverView = useMemo(() => ({
     order: ["security", "price", ...dynamicColumnIds, "states", "actions"],
-    visibility: { security: true, price: true, ...initialVisibility, states: true, actions: true },
-  }), [dynamicColumnIds, initialVisibility]);
+    visibility: { security: true, price: true, ...initialVisibility, states: workspaceSettings.showStates, actions: true },
+  }), [dynamicColumnIds, initialVisibility, workspaceSettings.showStates]);
   const {
     columnOrder,
     columnVisibility,
@@ -524,7 +527,7 @@ export function WatchTable({
   });
 
   return (
-    <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel">
+    <div data-density={workspaceSettings.density} className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
         <div>
           <p className="text-sm font-semibold text-primary">{table.name}</p>

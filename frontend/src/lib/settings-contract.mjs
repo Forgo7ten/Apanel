@@ -1,46 +1,17 @@
-const DEFAULT_PARAMETERS = Object.freeze({
-  MA: Object.freeze({ short: 5, long: 10 }),
-  RSI: Object.freeze({ period: 14 }),
-  KDJ: Object.freeze({ period: 9, k_period: 3, d_period: 3 }),
-  BOLL: Object.freeze({ period: 20, stddev: 2 }),
-  MACD: Object.freeze({ fast: 12, slow: 26, signal: 9 }),
-});
+import { INDICATOR_OPTIONS, getDefaultIndicatorParameters } from "./indicator-metadata.mjs";
 
+const DEFAULT_PARAMETERS = Object.freeze(Object.fromEntries(INDICATOR_OPTIONS.map((item) => [item.id, Object.freeze(getDefaultIndicatorParameters(item.id))])));
 export const DEFAULT_INDICATORS = Object.freeze(["MA", "RSI", "KDJ", "BOLL", "MACD"]);
-
-export const SETTING_INDICATORS = Object.freeze([
-  { id: "MA", title: "MA" },
-  { id: "RSI", title: "RSI" },
-  { id: "KDJ", title: "KDJ" },
-  { id: "BOLL", title: "BOLL" },
-  { id: "MACD", title: "MACD" },
-]);
-
+export const SETTING_INDICATORS = Object.freeze(INDICATOR_OPTIONS.map((item) => ({ id: item.id, title: item.title })));
 const PARAMETER_FIELDS = Object.freeze({
-  MA: Object.freeze([
-    { key: "short", title: "短周期" },
-    { key: "long", title: "长周期" },
-  ]),
+  MA: Object.freeze([{ key: "period", title: "周期" }]),
+  PROJECTED_MA: Object.freeze([{ key: "period", title: "周期" }]),
   RSI: Object.freeze([{ key: "period", title: "周期" }]),
-  KDJ: Object.freeze([
-    { key: "period", title: "周期" },
-    { key: "k_period", title: "K 平滑" },
-    { key: "d_period", title: "D 平滑" },
-  ]),
-  BOLL: Object.freeze([
-    { key: "period", title: "周期" },
-    { key: "stddev", title: "标准差" },
-  ]),
-  MACD: Object.freeze([
-    { key: "fast", title: "快线" },
-    { key: "slow", title: "慢线" },
-    { key: "signal", title: "信号线" },
-  ]),
+  KDJ: Object.freeze([{ key: "period", title: "周期" }, { key: "k_period", title: "K 平滑" }, { key: "d_period", title: "D 平滑" }]),
+  BOLL: Object.freeze([{ key: "period", title: "周期" }, { key: "multiplier", title: "标准差倍数" }]),
+  MACD: Object.freeze([{ key: "fast_period", title: "快线" }, { key: "slow_period", title: "慢线" }, { key: "signal_period", title: "信号线" }]),
 });
-
-export function getParameterFields(indicator) {
-  return PARAMETER_FIELDS[indicator] ?? [];
-}
+export function getParameterFields(indicator) { return PARAMETER_FIELDS[indicator] ?? []; }
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -83,6 +54,7 @@ export function normalizeSettings(input) {
     // return only feishu_webhook_configured; a user can enter a replacement.
     webhook: "",
     webhookConfigured: configured,
+    clearWebhook: false,
   };
 }
 
@@ -91,20 +63,13 @@ export function normalizeSettings(input) {
  * null so users can clear a previously stored secret.
  */
 export function toSettingsPayload(form) {
-  return {
+  const payload = {
     adjust_type: form.adjustType,
-    indicator_settings: {
-      defaults: [...form.defaults],
-      parameters: form.parameters,
-    },
-    display_settings: {
-      density: form.density,
-      show_states: form.showStates,
-      show_deltas: form.showDeltas,
-      show_mini_chart: form.showMiniChart,
-    },
-    notification_settings: {
-      feishu_webhook: typeof form.webhook === "string" && form.webhook.trim() ? form.webhook.trim() : null,
-    },
+    indicator_settings: { defaults: [...form.defaults], parameters: form.parameters },
+    display_settings: { density: form.density, show_states: form.showStates, show_deltas: form.showDeltas, show_mini_chart: form.showMiniChart },
   };
+  const replacement = typeof form.webhook === "string" ? form.webhook.trim() : "";
+  if (replacement) payload.notification_settings = { feishu_webhook: replacement };
+  else if (form.clearWebhook === true) payload.notification_settings = { feishu_webhook: null };
+  return payload;
 }

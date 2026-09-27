@@ -11,6 +11,7 @@ declare module "@/lib/settings-contract.mjs" {
     showMiniChart: boolean;
     webhook: string;
     webhookConfigured: boolean;
+    clearWebhook: boolean;
   };
 
   export const DEFAULT_INDICATORS: readonly string[];
@@ -21,6 +22,6 @@ declare module "@/lib/settings-contract.mjs" {
     adjust_type: "qfq" | "none";
     indicator_settings: { defaults: string[]; parameters: Record<string, Record<string, SettingsParameter>> };
     display_settings: { density: "compact" | "comfortable"; show_states: boolean; show_deltas: boolean; show_mini_chart: boolean };
-    notification_settings: { feishu_webhook: string | null };
+    notification_settings?: { feishu_webhook: string | null };
   };
 }
