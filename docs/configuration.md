@@ -88,20 +88,23 @@ Compose 只把 `APP_SECRETS_KEY*` 注入 `backend` 与 `worker`。`scheduler`、
 
 `ELTDX_POOL_SIZE`、`ELTDX_SERVER_COUNT`、`ELTDX_CONNECTIONS_PER_SERVER` 也是 Hub Settings 支持的可选高级参数，但 Compose 默认不注入；需要调优时再显式增加环境映射。
 
-### 行情服务出站代理
+### 镜像构建网络与 Python 镜像源
 
-行情服务需要访问外部行情 provider 时，可以在根目录 `.env` 中为它单独配置代理：
+Dockerfile 中的 `pip install` 和 `npm ci` 发生在镜像构建阶段。Compose 默认让构建步骤使用宿主机网络；`PYPI_MIRROR_URL` 非空时，Python 依赖使用指定的 PyPI 镜像，留空时使用 pip 默认源：
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `MARKET_DATA_HTTP_PROXY` | 空 | 注入行情服务的 `HTTP_PROXY` |
-| `MARKET_DATA_HTTPS_PROXY` | 空 | 注入行情服务的 `HTTPS_PROXY` |
-| `MARKET_DATA_ALL_PROXY` | 空 | 注入行情服务的 `ALL_PROXY` |
-| `MARKET_DATA_NO_PROXY` | 空 | 额外的 `NO_PROXY` 主机；Compose 会始终追加 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-hub` |
+| `DOCKER_BUILD_NETWORK` | `host` | 构建网络模式；`host` 使用宿主机网络，`default` 使用 Docker 默认构建网络 |
+| `PYPI_MIRROR_URL` | 清华 PyPI 镜像 | Python 包索引地址；非空启用指定镜像，空值不修改 pip index |
 
-这四个变量只会映射到 `market-data-hub`，不会传给 PostgreSQL、Redis、backend 或其他容器。默认空值不会启用代理。若代理运行在 Docker 宿主机，Compose 会为行情服务添加跨 Linux 可用的 `host.docker.internal:host-gateway`；宿主代理必须监听 Docker 可达的接口（不能只监听宿主机的 `127.0.0.1`）。
+如需改回 Docker 默认构建网络，在根目录 `.env` 中配置：
 
-代理 URL 可能包含凭据。`.env` 不纳入版本库，应用日志不会打印这些值；不要把真实代理 URL、用户名或密码写入文档、命令行历史或共享的 `docker compose config` 输出。
+```dotenv
+DOCKER_BUILD_NETWORK=default
+PYPI_MIRROR_URL=
+```
+
+随后照常执行 `docker compose up --build`。`host` 模式是针对 Linux Docker Engine 的开发机配置；构建配置不会向运行时容器注入任何代理环境变量。
 
 行情服务还识别 `INTERNAL_SYNC_TOKEN` 和 `MARKET_DATA_INTERNAL_TOKEN` 作为 `INTERNAL_API_TOKEN` 的别名。生产环境若缺少内部 token，服务启动校验会失败。
 

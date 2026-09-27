@@ -107,7 +107,7 @@ AKShare 只负责 Security Master fallback：
 
 Adapter 保留现有保护：lazy import、完整批次校验、最低记录数、单 in-flight worker、总 timeout、关闭时 drain。eltdx security master 成功时不会 import/call AKShare。
 
-HTTP proxy 环境变量只对 AKShare 等 HTTP Provider 有意义；eltdx 的 TDX 7709 是原生 TCP，本项目不宣称它会通过 `HTTP_PROXY` / `HTTPS_PROXY` 转发。
+eltdx 的 TDX 7709 使用原生 TCP；本项目不通过运行时代理环境变量转发行情请求。
 
 ## 批量与失败隔离
 
@@ -145,19 +145,6 @@ Hub 负责写入共享公共行情事实：
 Future schedule 不能靠 eltdx 历史 K 线猜测。数据库中的 annual seed 负责官方未来休市安排；当前迁移内置 2025/2026 seed。对已经发生的日期，Hub 可调用 eltdx workday capability 写入 `actual_open`。官方预期与实际校验冲突时记录 `UNKNOWN`，Worker 不会退化成 Mon-Fri 猜测。
 
 每个新年度应根据上交所、深交所、北交所官方休市通知更新 seed/导入数据。若三所安排出现差异，应按 market 拆分，而不是强行归并。
-
-## 出站代理
-
-根目录 `.env` 可配置：
-
-```dotenv
-MARKET_DATA_HTTP_PROXY=
-MARKET_DATA_HTTPS_PROXY=
-MARKET_DATA_ALL_PROXY=
-MARKET_DATA_NO_PROXY=
-```
-
-这些值只注入 `market-data-hub`。`NO_PROXY` 始终包含 Compose 内部服务名，避免内部 HTTP 请求绕过容器网络。
 
 ## 可用性与授权
 

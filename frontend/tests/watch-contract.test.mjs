@@ -238,9 +238,10 @@ test("error boundary copy is safe and exposes a retry contract", () => {
   assert.match(globalBoundary, /onRetry=\{reset\}/);
 });
 
-test("watch table renders all rows from the detail payload without cell requests", () => {
+test("watch table filters rows from the detail payload without cell requests", () => {
   const source = readFileSync(new URL("../src/components/table/WatchTable.tsx", import.meta.url), "utf8");
-  assert.match(source, /data: table\.stocks \?\? \[\]/);
+  assert.match(source, /filterWatchStocks\(table\.stocks \?\? \[\]/);
+  assert.match(source, /data: filteredStocks/);
   assert.doesNotMatch(source, /getIndicatorHistory|getStateHistory|fetch\(/);
 });
 

@@ -1,5 +1,10 @@
 name: ${COMPOSE_PROJECT_NAME:-apanel}
 
+x-build-settings: &build-settings
+  network: ${DOCKER_BUILD_NETWORK:-host}
+  args:
+    PYPI_MIRROR_URL: "${PYPI_MIRROR_URL:-}"
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -38,6 +43,7 @@ services:
 
   migrate:
     build:
+      <<: *build-settings
       context: ./backend
       dockerfile: Dockerfile
     restart: "no"
@@ -55,6 +61,7 @@ services:
 
   market-data-hub:
     build:
+      <<: *build-settings
       context: ./market-data-hub
       dockerfile: Dockerfile
     restart: unless-stopped
@@ -80,15 +87,9 @@ services:
       AKSHARE_SECURITY_TIMEOUT_SECONDS: ${AKSHARE_SECURITY_TIMEOUT_SECONDS:-90}
       AKSHARE_MIN_STOCK_COUNT: ${AKSHARE_MIN_STOCK_COUNT:-1000}
       AKSHARE_MIN_ETF_COUNT: ${AKSHARE_MIN_ETF_COUNT:-1}
-      HTTP_PROXY: "${MARKET_DATA_HTTP_PROXY:-}"
-      HTTPS_PROXY: "${MARKET_DATA_HTTPS_PROXY:-}"
-      ALL_PROXY: "${MARKET_DATA_ALL_PROXY:-}"
-      NO_PROXY: "${MARKET_DATA_NO_PROXY:-localhost,127.0.0.1},postgres,redis,backend,market-data-hub"
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
     expose:
       - "8001"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -101,10 +102,6 @@ services:
         - CMD-SHELL
         - >-
           python -c "import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8001/api/v1/health', timeout=2)"
-          || python -c "import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=2)"
-          || python -c "import urllib.request;
           urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"
       interval: 10s
       timeout: 5s
@@ -115,6 +112,7 @@ services:
 
   security-bootstrap:
     build:
+      <<: *build-settings
       context: ./backend
       dockerfile: Dockerfile
     restart: "no"
@@ -142,6 +140,7 @@ services:
 
   backend:
     build:
+      <<: *build-settings
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
@@ -212,6 +211,7 @@ services:
 
   scheduler:
     build:
+      <<: *build-settings
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
@@ -257,6 +257,7 @@ services:
 
   worker:
     build:
+      <<: *build-settings
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
@@ -313,6 +314,7 @@ services:
 
   frontend:
     build:
+      <<: *build-settings
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped

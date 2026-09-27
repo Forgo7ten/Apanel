@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import httpx
+import pytest
 import pytest_asyncio
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -61,7 +62,10 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
             )
             calendar_day += timedelta(days=1)
         for index in range(40):
-            close = Decimal(str(100 + index * 0.2))
+            # Start below the long MA, then reverse upward so edge states have
+            # a provable RESET before becoming ACTIVE. A series that begins
+            # already above the long MA must remain UNKNOWN by design.
+            close = Decimal(120 - index if index < 20 else 100 + (index - 20))
             for adjustment, offset in (("qfq", Decimal("0")), ("none", Decimal("5"))):
                 selected_close = close + offset
                 session.add(
