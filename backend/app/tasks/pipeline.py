@@ -18,6 +18,8 @@ from app.indicators.parameters import (
     merge_indicator_requests,
 )
 from app.models import AlertRule, DailyBar, Security, TableColumn, WatchTableSymbol
+from app.services.data_bootstrap_service import SecurityDataBootstrapService
+from app.services.data_readiness_service import DataReadinessService
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
 
@@ -129,6 +131,24 @@ def build_default_eod_steps(
     async def daily_sync(context: PipelineContext) -> Mapping[str, Any]:
         context.resources.setdefault("market_data_client", market_data_client)
         adjustments = tuple(context.resources.get("analysis_adjustments", (context.adjustment,)))
+        settings = context.resources.get("settings")
+        minimum_bars = int(getattr(settings, "analysis_bootstrap_min_bars", 400))
+        async with session_factory() as session:
+            requests_by_symbol = await collect_indicator_requests(session, context.symbols)
+        readiness = await DataReadinessService(
+            session_factory=session_factory,
+            bootstrap_service=SecurityDataBootstrapService(
+                session_factory=session_factory,
+                market_data_client=market_data_client,
+                minimum_bars=minimum_bars,
+            ),
+            minimum_bars=minimum_bars,
+        ).ensure_minimum_history(
+            context.symbols,
+            adjustments=adjustments,
+            requests_by_symbol=requests_by_symbol,
+        )
+        context.resources["history_readiness"] = readiness
         output: dict[str, Any] = {}
         for adjustment in adjustments:
             output[adjustment] = await _sync_in_chunks(

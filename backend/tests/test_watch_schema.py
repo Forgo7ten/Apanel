@@ -22,20 +22,19 @@ def test_all_alembic_revision_ids_fit_version_table_column() -> None:
         )
 
 
-def test_watch_migration_is_the_single_0005_head() -> None:
-    path = (
-        Path(__file__).parents[1]
-        / "alembic"
-        / "versions"
-        / "0005_sprint4_watch_tables_settings.py"
-    )
-    spec = importlib.util.spec_from_file_location("apanel_0005_watch", path)
+def test_initial_schema_is_the_single_alembic_head() -> None:
+    versions_dir = Path(__file__).parents[1] / "alembic" / "versions"
+    paths = sorted(versions_dir.glob("*.py"))
+    assert [path.name for path in paths] == ["0001_initial_schema.py"]
+
+    path = paths[0]
+    spec = importlib.util.spec_from_file_location("apanel_0001_initial", path)
     assert spec is not None and spec.loader is not None
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
 
-    assert migration.revision == "0005_sprint4_watch_settings"
-    assert migration.down_revision == "0004_sprint3_indicator_state"
+    assert migration.revision == "0001_initial_schema"
+    assert migration.down_revision is None
 
 
 def test_watch_schema_has_owner_bound_relations_and_uniqueness() -> None:

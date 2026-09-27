@@ -172,14 +172,13 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
     client, _, user_one, _ = tab1_context
     app = client._transport.app  # type: ignore[attr-defined]
     _as_user(app, user_one)
+    await client.put("/api/v1/settings", json={"indicator_settings": {"defaults": []}})
 
     created = await client.post("/api/v1/watch-tables", json={"name": "参数观察"})
     assert created.status_code == 201
     table_id = created.json()["data"]["id"]
 
-    added = await client.post(
-        f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1}
-    )
+    added = await client.post(f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1})
     assert added.status_code == 201
 
     ma_column = await client.post(
@@ -229,9 +228,7 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
     assert stock["indicators"]["BOLL"]["delta"]["width"] == -0.01
     ma_column_value = stock["column_values"][str(ma_column.json()["data"]["id"])]
     assert ma_column_value["parameter_key"].startswith("v1_")
-    assert {
-        key: value for key, value in ma_column_value.items() if key != "parameter_key"
-    } == {
+    assert {key: value for key, value in ma_column_value.items() if key != "parameter_key"} == {
         "column_id": ma_column.json()["data"]["id"],
         "view_mode": "DELTA",
         "indicator_type": "MA",
@@ -260,6 +257,7 @@ async def test_composite_number_and_delta_columns_require_a_field_selector(tab1_
     client, _, user_one, _ = tab1_context
     app = client._transport.app  # type: ignore[attr-defined]
     _as_user(app, user_one)
+    await client.put("/api/v1/settings", json={"indicator_settings": {"defaults": []}})
 
     created = await client.post("/api/v1/watch-tables", json={"name": "复合选择器"})
     table_id = created.json()["data"]["id"]
@@ -281,6 +279,7 @@ async def test_tab1_detail_isolated_and_bad_parameters_are_rejected(tab1_context
     client, _, user_one, user_two = tab1_context
     app = client._transport.app  # type: ignore[attr-defined]
     _as_user(app, user_one)
+    await client.put("/api/v1/settings", json={"indicator_settings": {"defaults": []}})
 
     created = await client.post("/api/v1/watch-tables", json={"name": "参数校验"})
     table_id = created.json()["data"]["id"]
