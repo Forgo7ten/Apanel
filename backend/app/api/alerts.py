@@ -5,13 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, get_security_bootstrap_scheduler
 from app.db.session import get_db
 from app.models import User
 from app.schemas.alerts import AlertRuleCreateRequest, AlertRuleData, AlertRuleUpdateRequest
 from app.schemas.common import SuccessResponse
 from app.schemas.watch import DeleteData
 from app.services.alert_service import AlertService
+from app.services.bootstrap_scheduler import SecurityBootstrapScheduler
 
 router = APIRouter()
 
@@ -33,8 +34,13 @@ async def create_alert(
     payload: AlertRuleCreateRequest,
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
+    bootstrap_scheduler: SecurityBootstrapScheduler = Depends(get_security_bootstrap_scheduler),  # noqa: B008
 ) -> SuccessResponse[AlertRuleData]:
-    return SuccessResponse(data=await AlertService(session).create(user.id, payload))
+    return SuccessResponse(
+        data=await AlertService(session, bootstrap_scheduler=bootstrap_scheduler).create(
+            user.id, payload
+        )
+    )
 
 
 @router.put("/alerts/{alert_id}", response_model=SuccessResponse[AlertRuleData])
@@ -43,8 +49,13 @@ async def update_alert(
     payload: AlertRuleUpdateRequest,
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
+    bootstrap_scheduler: SecurityBootstrapScheduler = Depends(get_security_bootstrap_scheduler),  # noqa: B008
 ) -> SuccessResponse[AlertRuleData]:
-    return SuccessResponse(data=await AlertService(session).update(user.id, alert_id, payload))
+    return SuccessResponse(
+        data=await AlertService(session, bootstrap_scheduler=bootstrap_scheduler).update(
+            user.id, alert_id, payload
+        )
+    )
 
 
 @router.delete("/alerts/{alert_id}", response_model=SuccessResponse[DeleteData])

@@ -10,7 +10,7 @@ import httpx
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, get_security_bootstrap_scheduler
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import get_db
@@ -255,6 +255,43 @@ async def test_settings_schema_rejects_invalid_known_display_values(watch_contex
 
     invalid = await client.put("/api/v1/settings", json={"display_settings": {"density": "dense"}})
     assert invalid.status_code == 422
+
+
+async def test_watch_analysis_mutations_use_injected_bootstrap_scheduler(watch_context) -> None:
+    client, _, user_one, _ = watch_context
+    app = client._transport.app  # type: ignore[attr-defined]
+    _as_user(app, user_one)
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def enqueue(self, symbol: str) -> None:
+            self.calls.append(symbol)
+
+    recorder = Recorder()
+    app.dependency_overrides[get_security_bootstrap_scheduler] = lambda: recorder
+    await client.put("/api/v1/settings", json={"indicator_settings": {"defaults": []}})
+    table = await client.post("/api/v1/watch-tables", json={"name": "Bootstrap seam"})
+    table_id = table.json()["data"]["id"]
+    added = await client.post(f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1})
+    assert added.status_code == 201
+    column = await client.post(
+        f"/api/v1/watch-tables/{table_id}/columns",
+        json={
+            "column_type": "INDICATOR",
+            "indicator_type": "RSI",
+            "parameters": {"period": 6},
+            "view_mode": "NUMBER",
+        },
+    )
+    assert column.status_code == 201
+    updated = await client.put(
+        f"/api/v1/columns/{column.json()['data']['id']}",
+        json={"parameters": {"period": 10}},
+    )
+    assert updated.status_code == 200
+    assert recorder.calls == ["600519", "600519", "600519"]
 
 
 async def test_settings_and_public_security_contracts(watch_context) -> None:

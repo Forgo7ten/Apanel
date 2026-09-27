@@ -32,6 +32,10 @@ from app.schemas.watch import (
     WatchTableStockData,
     WatchTableSummaryData,
 )
+from app.services.bootstrap_scheduler import (
+    NoopSecurityBootstrapScheduler,
+    SecurityBootstrapScheduler,
+)
 from app.services.dividend_service import DividendYieldResult, DividendYieldService
 from app.services.state_service import state_parameter_key
 from app.states import DEFAULT_REGISTRY, UnknownStateError
@@ -44,8 +48,14 @@ _DEFAULT_WATCH_INDICATORS = ("MA", "RSI", "KDJ", "BOLL", "MACD")
 class WatchTableService:
     """Own all watch-table business rules outside HTTP controllers."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        bootstrap_scheduler: SecurityBootstrapScheduler | None = None,
+    ) -> None:
         self.session = session
+        self.bootstrap_scheduler = bootstrap_scheduler or NoopSecurityBootstrapScheduler()
         self.repository = WatchTableRepository(session)
         self.security_repository = SecurityRepository(session)
         self.dividend_yield_service = DividendYieldService(self.security_repository)
@@ -358,9 +368,7 @@ class WatchTableService:
                 "WATCH_STOCK_EXISTS", "Security is already in this watch table.", 409
             ) from exc
         await self.session.refresh(security)
-        from app.tasks.jobs import enqueue_security_bootstrap
-
-        enqueue_security_bootstrap(security.symbol)
+        self.bootstrap_scheduler.enqueue(security.symbol)
         return await self._stock_projection(membership, security)
 
     async def remove_stock(self, user_id: int, table_id: int, security_id: int) -> None:
@@ -440,11 +448,9 @@ class WatchTableService:
             await self.session.rollback()
             raise ApiError("WATCH_COLUMN_EXISTS", "This column already exists.", 409) from exc
         await self.session.refresh(column)
-        from app.tasks.jobs import enqueue_security_bootstrap
-
         for membership in await self.repository.list_symbols(table.id):
             if membership.security is not None:
-                enqueue_security_bootstrap(membership.security.symbol)
+                self.bootstrap_scheduler.enqueue(membership.security.symbol)
         return _column_data(column)
 
     async def update_column(
@@ -453,6 +459,10 @@ class WatchTableService:
         column = await self.repository.get_column_owned(column_id, user_id)
         if column is None:
             raise ApiError("WATCH_COLUMN_NOT_FOUND", "Column was not found.", 404)
+        requires_materialization = any(
+            value is not None
+            for value in (request.state_code, request.parameters, request.view_mode)
+        )
         next_parameters = column.parameters
         if request.state_code is not None:
             column.state_code = request.state_code.strip().upper()
@@ -514,6 +524,10 @@ class WatchTableService:
             raise ApiError("WATCH_COLUMN_EXISTS", "This column already exists.", 409)
         await self.session.commit()
         await self.session.refresh(column)
+        if requires_materialization:
+            for membership in await self.repository.list_symbols(column.watch_table_id):
+                if membership.security is not None:
+                    self.bootstrap_scheduler.enqueue(membership.security.symbol)
         return _column_data(column)
 
     async def delete_column(self, user_id: int, column_id: int) -> None:

@@ -51,6 +51,10 @@ from app.schemas.alerts import (
 )
 from app.schemas.security import SecurityData
 from app.services.alert_observation_service import AlertObservationService
+from app.services.bootstrap_scheduler import (
+    NoopSecurityBootstrapScheduler,
+    SecurityBootstrapScheduler,
+)
 from app.services.notification_service import (
     NotificationService,
     ProviderFactory,
@@ -81,8 +85,10 @@ class AlertService:
         provider_factory: ProviderFactory | None = None,
         provider_registry: NotificationProviderRegistry | None = None,
         state_registry: StateRegistry | None = None,
+        bootstrap_scheduler: SecurityBootstrapScheduler | None = None,
     ) -> None:
         self.session = session
+        self.bootstrap_scheduler = bootstrap_scheduler or NoopSecurityBootstrapScheduler()
         self.repository = AlertRepository(session)
         self.notification_repository = NotificationRepository(session)
         self.state_registry = state_registry or DEFAULT_REGISTRY
@@ -130,9 +136,7 @@ class AlertService:
         if refreshed is None:
             raise ApiError("ALERT_NOT_FOUND", "Alert rule was not found.", 404)
         if refreshed.enabled and refreshed.security is not None:
-            from app.tasks.jobs import enqueue_security_bootstrap
-
-            enqueue_security_bootstrap(refreshed.security.symbol)
+            self.bootstrap_scheduler.enqueue(refreshed.security.symbol)
         return _rule_data(refreshed)
 
     async def update(
@@ -199,9 +203,7 @@ class AlertService:
         if refreshed is None:
             raise ApiError("ALERT_NOT_FOUND", "Alert rule was not found.", 404)
         if refreshed.enabled and refreshed.security is not None:
-            from app.tasks.jobs import enqueue_security_bootstrap
-
-            enqueue_security_bootstrap(refreshed.security.symbol)
+            self.bootstrap_scheduler.enqueue(refreshed.security.symbol)
         return _rule_data(refreshed)
 
     async def delete(self, user_id: int, rule_id: int) -> None:

@@ -12,7 +12,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, get_security_bootstrap_scheduler
 from app.core.config import Settings
 from app.core.errors import ApiError
 from app.db.base import Base
@@ -210,6 +210,34 @@ async def test_alert_crud_and_user_isolation(alert_context) -> None:
     assert updated.status_code == 200
     assert updated.json()["data"]["enabled"] is False
     assert (await client.delete(f"/api/v1/alerts/{rule['id']}")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_alert_create_uses_injected_bootstrap_scheduler(alert_context) -> None:
+    client = alert_context["client"]
+    app = alert_context["app"]
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def enqueue(self, symbol: str) -> None:
+            self.calls.append(symbol)
+
+    recorder = Recorder()
+    app.dependency_overrides[get_security_bootstrap_scheduler] = lambda: recorder
+    created = await client.post(
+        "/api/v1/alerts",
+        json={
+            "security_id": alert_context["security"].id,
+            "condition_type": "VALUE",
+            "indicator": "RSI",
+            "operator": ">=",
+            "threshold": 70,
+        },
+    )
+    assert created.status_code == 201
+    assert recorder.calls == ["600519"]
 
 
 @pytest.mark.asyncio
