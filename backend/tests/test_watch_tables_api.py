@@ -155,9 +155,7 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     assert table["stock_count"] == 0
     table_id = table["id"]
 
-    added = await client.post(
-        f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1}
-    )
+    added = await client.post(f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1})
     assert added.status_code == 201
     duplicate = await client.post(
         f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1}
@@ -208,9 +206,7 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     _as_user(app, user_two)
     isolated = await client.get(f"/api/v1/watch-tables/{table_id}")
     assert isolated.status_code == 404
-    isolated_column = await client.put(
-        f"/api/v1/columns/{column_id}", json={"visible": True}
-    )
+    isolated_column = await client.put(f"/api/v1/columns/{column_id}", json={"visible": True})
     assert isolated_column.status_code == 404
 
 
@@ -221,15 +217,22 @@ async def test_settings_and_public_security_contracts(watch_context) -> None:
 
     initial = await client.get("/api/v1/settings")
     assert initial.status_code == 200
-    assert initial.json()["data"]["settings"] == {}
+    assert initial.json()["data"]["settings"] == {
+        "notification_settings": {"feishu_webhook_configured": False}
+    }
     updated = await client.put("/api/v1/settings", json={"adjust_type": "qfq"})
     assert updated.status_code == 200
-    assert updated.json()["data"]["settings"] == {"adjust_type": "qfq"}
+    assert updated.json()["data"]["settings"] == {
+        "adjust_type": "qfq",
+        "notification_settings": {"feishu_webhook_configured": False},
+    }
 
     _as_user(app, user_two)
     other = await client.get("/api/v1/settings")
     assert other.status_code == 200
-    assert other.json()["data"]["settings"] == {}
+    assert other.json()["data"]["settings"] == {
+        "notification_settings": {"feishu_webhook_configured": False}
+    }
 
     search = await client.get("/api/v1/securities/search", params={"q": "茅台"})
     assert search.status_code == 200
@@ -239,8 +242,6 @@ async def test_settings_and_public_security_contracts(watch_context) -> None:
     assert detail.status_code == 200
     quote = await client.get("/api/v1/securities/600519/quote")
     assert quote.status_code == 200
-    bars = await client.get(
-        "/api/v1/securities/600519/daily-bars", params={"adjust_type": "qfq"}
-    )
+    bars = await client.get("/api/v1/securities/600519/daily-bars", params={"adjust_type": "qfq"})
     assert bars.status_code == 200
     assert len(bars.json()["data"]) == 2
