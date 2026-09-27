@@ -35,6 +35,8 @@ from app.models.market_data import (
     TradingCalendarModel,
 )
 
+_ASYNCPG_MAX_BIND_PARAMETERS = 32767
+
 
 class PersistenceRecordError(RuntimeError):
     """A record cannot be persisted without indicating a system outage."""
@@ -239,9 +241,16 @@ class SqlAlchemySecurityRepository:
         if any(not isinstance(record, Security) for record in records):
             raise PersistenceRecordError("security repository received an invalid record")
         records = _unique_records(records, key=lambda record: record.symbol)
+        parameters_per_record = len(_security_values(records[0]))
+        batch_size = max(1, _ASYNCPG_MAX_BIND_PARAMETERS // parameters_per_record)
         async with self._session_factory() as session:
             async with session.begin():
-                await session.execute(self.build_upsert_statement(records))
+                # asyncpg rejects prepared statements with more than 32,767
+                # bind arguments. Keep the full-universe sync atomic while
+                # executing bounded statements inside the same transaction.
+                for offset in range(0, len(records), batch_size):
+                    batch = records[offset : offset + batch_size]
+                    await session.execute(self.build_upsert_statement(batch))
 
     async def get_by_symbol(self, symbol: str) -> Security | None:
         canonical_symbol = normalize_symbol(symbol)
