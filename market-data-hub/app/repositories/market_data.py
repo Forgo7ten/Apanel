@@ -10,7 +10,7 @@ surface connection and transaction failures to its caller.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, date
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 from sqlalchemy import select
@@ -29,8 +29,10 @@ from app.domain.market_data import (
 from app.models.market_data import (
     DailyBarModel,
     DividendEventModel,
+    MarketDataAdjustmentStateModel,
     QuoteSnapshotModel,
     SecurityModel,
+    TradingCalendarModel,
 )
 
 
@@ -87,6 +89,126 @@ class DividendRepository(Protocol):
         start: date | None = None,
         end: date | None = None,
     ) -> tuple[Dividend, ...]: ...
+
+
+class AdjustmentStateRepository(Protocol):
+    async def get(self, symbol: str) -> dict[str, Any] | None: ...
+    async def upsert(
+        self,
+        symbol: str,
+        *,
+        provider_name: str,
+        revision_hash: str,
+        coverage_start: date | None,
+        coverage_end: date | None,
+        rebased: bool,
+    ) -> None: ...
+
+
+class SqlAlchemyAdjustmentStateRepository:
+    """Persist opaque qfq revision metadata owned by the Market Data Hub."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def get(self, symbol: str) -> dict[str, Any] | None:
+        canonical = normalize_symbol(symbol)
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(MarketDataAdjustmentStateModel, SecurityModel.symbol)
+                    .join(
+                        SecurityModel,
+                        MarketDataAdjustmentStateModel.security_id == SecurityModel.id,
+                    )
+                    .where(SecurityModel.symbol == canonical)
+                )
+            ).first()
+        if row is None:
+            return None
+        model = row[0]
+        return {
+            "revision_hash": model.revision_hash,
+            "coverage_start": model.qfq_coverage_start,
+            "coverage_end": model.qfq_coverage_end,
+            "provider_name": model.provider_name,
+        }
+
+    async def upsert(
+        self,
+        symbol: str,
+        *,
+        provider_name: str,
+        revision_hash: str,
+        coverage_start: date | None,
+        coverage_end: date | None,
+        rebased: bool,
+    ) -> None:
+        canonical = normalize_symbol(symbol)
+        async with self._session_factory() as session:
+            async with session.begin():
+                security_ids = await _security_ids(session, (canonical,))
+                values = {
+                    "security_id": security_ids[canonical],
+                    "provider_name": provider_name,
+                    "revision_hash": revision_hash,
+                    "qfq_coverage_start": coverage_start,
+                    "qfq_coverage_end": coverage_end,
+                    "last_rebased_at": datetime.now(UTC) if rebased else None,
+                }
+                statement = postgres_insert(MarketDataAdjustmentStateModel).values(**values)
+                update = {
+                    "provider_name": statement.excluded.provider_name,
+                    "revision_hash": statement.excluded.revision_hash,
+                    "qfq_coverage_start": statement.excluded.qfq_coverage_start,
+                    "qfq_coverage_end": statement.excluded.qfq_coverage_end,
+                }
+                if rebased:
+                    update["last_rebased_at"] = statement.excluded.last_rebased_at
+                await session.execute(
+                    statement.on_conflict_do_update(
+                        index_elements=[MarketDataAdjustmentStateModel.security_id],
+                        set_=update,
+                    )
+                )
+
+
+class SqlAlchemyTradingCalendarRepository:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def validate(self, trade_date: date, *, actual_open: bool, source: str) -> dict[str, Any]:
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = await session.get(
+                    TradingCalendarModel, {"market": "CN", "trade_date": trade_date}
+                )
+                if row is None:
+                    row = TradingCalendarModel(
+                        market="CN",
+                        trade_date=trade_date,
+                        expected_open=None,
+                        actual_open=actual_open,
+                        status="OPEN" if actual_open else "CLOSED",
+                        source=source,
+                        source_metadata={},
+                        validated_at=datetime.now(UTC),
+                    )
+                    session.add(row)
+                else:
+                    row.actual_open = actual_open
+                    row.validated_at = datetime.now(UTC)
+                    if row.expected_open is not None and row.expected_open != actual_open:
+                        row.status = "UNKNOWN"
+                    else:
+                        row.status = "OPEN" if actual_open else "CLOSED"
+                await session.flush()
+                return {
+                    "trade_date": row.trade_date,
+                    "status": row.status,
+                    "expected_open": row.expected_open,
+                    "actual_open": row.actual_open,
+                }
 
 
 class SqlAlchemySecurityRepository:
@@ -430,6 +552,7 @@ def _dividend_from_model(model: DividendEventModel, symbol: str) -> Dividend:
 
 
 __all__ = [
+    "AdjustmentStateRepository",
     "DailyBarRepository",
     "DividendRepository",
     "MissingSecurityError",
@@ -437,6 +560,7 @@ __all__ = [
     "PersistenceSystemError",
     "QuoteRepository",
     "SecurityRepository",
+    "SqlAlchemyAdjustmentStateRepository",
     "SqlAlchemyDailyBarRepository",
     "SqlAlchemyDividendEventRepository",
     "SqlAlchemyQuoteSnapshotRepository",

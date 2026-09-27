@@ -6,7 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from app.domain.market_data import Adjustment
 
@@ -77,25 +77,35 @@ class DailyBarsData(BaseModel):
 class DailySyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    symbols: list[str] = Field(min_length=1)
-    start: date = Field(validation_alias=AliasChoices("start", "start_date"))
-    end: date = Field(validation_alias=AliasChoices("end", "end_date"))
+    symbols: list[str] = Field(min_length=1, max_length=100)
+    start: date | None = Field(default=None, validation_alias=AliasChoices("start", "start_date"))
+    end: date | None = Field(default=None, validation_alias=AliasChoices("end", "end_date"))
+    lookback_bars: int | None = Field(default=None, gt=0, le=10000)
     adjustment: Adjustment = Field(
         default=Adjustment.QFQ,
         validation_alias=AliasChoices("adjustment", "adjust", "adjust_type"),
     )
 
+    @model_validator(mode="after")
+    def validate_mode(self) -> DailySyncRequest:
+        if self.lookback_bars is not None:
+            if self.start is not None or self.end is not None:
+                raise ValueError("lookback_bars is exclusive with start/end")
+        elif self.start is None or self.end is None or self.start > self.end:
+            raise ValueError("start/end are required and must form a valid range")
+        return self
+
 
 class QuoteSyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    symbols: list[str] = Field(min_length=1)
+    symbols: list[str] = Field(min_length=1, max_length=100)
 
 
 class DividendSyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    symbols: list[str] = Field(min_length=1)
+    symbols: list[str] = Field(min_length=1, max_length=100)
 
 
 class SyncItemData(BaseModel):
@@ -106,6 +116,8 @@ class SyncItemData(BaseModel):
     fetched: int
     persisted: int
     error: ErrorResponse | None = None
+    history_rebased: bool = False
+    changed_from: date | None = None
 
 
 class SyncSummaryData(BaseModel):
@@ -117,3 +129,16 @@ class SyncSummaryData(BaseModel):
     failed: int
     ok: bool
     items: list[SyncItemData]
+
+
+class CalendarValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trade_date: date
+
+
+class CalendarValidationData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trade_date: date
+    status: str
+    expected_open: bool | None = None
+    actual_open: bool | None = None

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
@@ -108,27 +110,38 @@ class EltdxProvider:
         return result
 
     async def get_quote(self, symbol: str) -> Quote:
-        canonical = normalize_symbol(symbol)
-        full_code = _full_code(canonical)
+        rows = await self.get_quotes((symbol,))
+        if not rows:
+            raise ProviderUnavailableError("eltdx quote returned no record")
+        return rows[0]
+
+    async def get_quotes(self, symbols: Sequence[str]) -> Sequence[Quote]:
+        canonical_symbols = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
+        if not canonical_symbols:
+            return ()
+        requested = {_full_code(symbol): symbol for symbol in canonical_symbols}
         observed_at = datetime.now(UTC)
         rows = await self._call(
-            "quote",
+            "quotes",
             self._client.quotes.get_snapshots,
-            [full_code],
+            list(requested),
         )
-        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)) or not rows:
-            raise ProviderUnavailableError("eltdx quote returned no record")
-        row = rows[0]
-        row_code = str(getattr(row, "code", "")).strip()
-        if normalize_symbol(row_code) != canonical:
-            raise InvalidMarketDataError("eltdx quote symbol does not match request")
-        return Quote(
-            symbol=canonical,
-            price=row.last_price,
-            change=getattr(row, "change", None),
-            change_percent=getattr(row, "change_pct", None),
-            timestamp=observed_at,
-        )
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+            raise ProviderUnavailableError("eltdx quotes returned an invalid response")
+        result: dict[str, Quote] = {}
+        for row in rows:
+            row_code = str(getattr(row, "code", "")).strip()
+            canonical = normalize_symbol(row_code)
+            if canonical not in canonical_symbols:
+                raise InvalidMarketDataError("eltdx quote symbol does not match request")
+            result[canonical] = Quote(
+                symbol=canonical,
+                price=row.last_price,
+                change=getattr(row, "change", None),
+                change_percent=getattr(row, "change_pct", None),
+                timestamp=observed_at,
+            )
+        return tuple(result[symbol] for symbol in canonical_symbols if symbol in result)
 
     async def get_daily_bars(
         self,
@@ -147,9 +160,7 @@ class EltdxProvider:
             _full_code(canonical),
             period="day",
             adjust=selected.value,
-            all_pages=True,
-            page_size=self._bar_page_size,
-            max_pages=self._bar_max_pages,
+            count=max(8, min(self._bar_page_size, (end - start).days * 2 + 8)),
         )
         adjust_mode = str(getattr(series, "adjust_mode", "")).strip().lower()
         if adjust_mode and adjust_mode != selected.value:
@@ -177,6 +188,113 @@ class EltdxProvider:
             )
         rows.sort(key=lambda item: item.trade_date)
         return tuple(rows)
+
+    async def get_daily_bars_batch(
+        self,
+        symbols: Sequence[str],
+        *,
+        adjustment: Adjustment | str = Adjustment.QFQ,
+        count: int,
+    ) -> dict[str, Sequence[DailyBar]]:
+        selected = normalize_adjustment(adjustment)
+        if count <= 0:
+            raise InvalidMarketDataError("count must be positive")
+        canonical_symbols = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
+        if not canonical_symbols:
+            return {}
+        full_codes = [_full_code(symbol) for symbol in canonical_symbols]
+        response = await self._call(
+            "daily bars",
+            self._client.bars.get,
+            full_codes,
+            period="day",
+            adjust=selected.value,
+            count=count,
+        )
+        # eltdx returns one series for one code and a mapping/sequence for many
+        # depending on minor version. Normalize all supported public shapes.
+        raw_by_symbol: dict[str, Any] = {}
+        if isinstance(response, dict):
+            for key, value in response.items():
+                raw_by_symbol[normalize_symbol(str(key))] = value
+        elif isinstance(response, Sequence) and not isinstance(response, (str, bytes)):
+            for value in response:
+                code = getattr(value, "code", None) or getattr(value, "symbol", None)
+                if code is not None:
+                    raw_by_symbol[normalize_symbol(str(code))] = value
+        elif len(canonical_symbols) == 1:
+            raw_by_symbol[canonical_symbols[0]] = response
+        result: dict[str, Sequence[DailyBar]] = {}
+        for symbol in canonical_symbols:
+            series = raw_by_symbol.get(symbol)
+            if series is None:
+                continue
+            adjust_mode = str(getattr(series, "adjust_mode", "")).strip().lower()
+            if adjust_mode and adjust_mode != selected.value:
+                raise InvalidMarketDataError("eltdx daily-bar adjustment does not match request")
+            bars: list[DailyBar] = []
+            for bar in getattr(series, "bars", ()) or ():
+                timestamp = getattr(bar, "time", None)
+                if not isinstance(timestamp, datetime):
+                    raise InvalidMarketDataError("eltdx daily bar is missing a datetime")
+                bars.append(
+                    DailyBar(
+                        symbol=symbol,
+                        trade_date=timestamp.date(),
+                        open=bar.open,
+                        high=bar.high,
+                        low=bar.low,
+                        close=bar.close,
+                        volume=bar.volume_lots,
+                        amount=getattr(bar, "amount", None),
+                        adjustment=selected,
+                    )
+                )
+            bars.sort(key=lambda item: item.trade_date)
+            result[symbol] = tuple(bars[-count:])
+        return result
+
+    async def is_trading_day(self, trade_date: date) -> bool:
+        """Validate an already-reached date against eltdx workday data."""
+        workdays = getattr(self._client, "workdays", None)
+        if workdays is None:
+            raise ProviderUnavailableError("eltdx workday service is unavailable")
+        refresh = getattr(workdays, "refresh", None)
+        if callable(refresh):
+            await self._call("workdays", refresh)
+        checker = getattr(workdays, "is_workday", None)
+        if not callable(checker):
+            raise ProviderUnavailableError("eltdx workday checker is unavailable")
+        return bool(await self._call("workdays", checker, trade_date))
+
+    async def get_adjustment_revision(self, symbol: str) -> str:
+        canonical = normalize_symbol(symbol)
+        response = await self._call(
+            "adjustment revision",
+            self._client.corporate.capital_changes,
+            _full_code(canonical),
+        )
+        normalized: list[dict[str, Any]] = []
+        for record in getattr(response, "records", ()) or ():
+            if hasattr(record, "_asdict"):
+                raw = record._asdict()
+            elif hasattr(record, "__dict__"):
+                raw = vars(record)
+            else:
+                raw = {
+                    name: getattr(record, name)
+                    for name in dir(record)
+                    if not name.startswith("_") and not callable(getattr(record, name, None))
+                }
+            values = {
+                str(key): _json_scalar(value)
+                for key, value in raw.items()
+                if not str(key).startswith("_")
+            }
+            normalized.append(values)
+        normalized.sort(key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=True))
+        encoded = json.dumps(normalized, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     async def get_dividends(self, symbol: str) -> Sequence[Dividend]:
         canonical = normalize_symbol(symbol)
@@ -214,6 +332,16 @@ class EltdxProvider:
             if isinstance(exc, (InvalidMarketDataError, ProviderUnavailableError)):
                 raise
             raise ProviderUnavailableError(f"eltdx {operation} failed") from exc
+
+
+def _json_scalar(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(value)
 
 
 def _matches_exception(exc: Exception, classes: object) -> bool:

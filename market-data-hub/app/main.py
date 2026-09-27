@@ -23,13 +23,16 @@ from app.providers.registry import (
 from app.providers.routing import build_provider_routing
 from app.repositories.health import DatabaseHealthRepository, RedisHealthRepository
 from app.repositories.market_data import (
+    SqlAlchemyAdjustmentStateRepository,
     SqlAlchemyDailyBarRepository,
     SqlAlchemyDividendEventRepository,
     SqlAlchemyQuoteSnapshotRepository,
     SqlAlchemySecurityRepository,
+    SqlAlchemyTradingCalendarRepository,
 )
 from app.schemas.common import ErrorResponse
 from app.schemas.market_data import ApiEnvelope
+from app.services.calendar import CalendarValidationService
 from app.services.health_service import HealthService
 from app.services.sync import (
     DailyBarSyncService,
@@ -84,6 +87,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             security_repository = SqlAlchemySecurityRepository(session_factory)
             daily_bar_repository = SqlAlchemyDailyBarRepository(session_factory)
+            adjustment_state_repository = SqlAlchemyAdjustmentStateRepository(session_factory)
+            trading_calendar_repository = SqlAlchemyTradingCalendarRepository(session_factory)
             quote_repository = SqlAlchemyQuoteSnapshotRepository(session_factory)
             dividend_repository = SqlAlchemyDividendEventRepository(session_factory)
             app.state.db_engine = database_engine
@@ -103,14 +108,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.daily_sync_service = DailyBarSyncService(
                 provider=routing.daily_bar,
                 repository=daily_bar_repository,
+                adjustment_repository=adjustment_state_repository,
+                batch_size=app_settings.market_data_sync_max_symbols_per_request,
             )
             app.state.quote_sync_service = QuoteSyncService(
                 provider=routing.quote,
                 repository=quote_repository,
+                batch_size=app_settings.eltdx_quote_batch_size,
+            )
+            app.state.calendar_validation_service = CalendarValidationService(
+                provider=routing.daily_bar,
+                repository=trading_calendar_repository,
             )
             app.state.dividend_sync_service = DividendSyncService(
                 provider=routing.dividend,
                 repository=dividend_repository,
+                concurrency=app_settings.market_data_sync_concurrency,
             )
             app.state.health_service = health_service
             yield

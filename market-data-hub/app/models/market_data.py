@@ -13,6 +13,9 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -127,6 +130,43 @@ class DividendEventModel(Base):
     )
 
 
+class MarketDataAdjustmentStateModel(Base):
+    __tablename__ = "market_data_adjustment_state"
+
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    qfq_coverage_start: Mapped[date | None] = mapped_column(Date, nullable=True)
+    qfq_coverage_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_rebased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TradingCalendarModel(Base):
+    __tablename__ = "trading_calendar"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('OPEN', 'CLOSED', 'UNKNOWN')", name="ck_trading_calendar_status"
+        ),
+    )
+
+    market: Mapped[str] = mapped_column(String(8), primary_key=True, default="CN")
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    expected_open: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    actual_open: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="UNKNOWN")
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 # Explicit aliases make the persistence boundary discoverable to callers
 # without colliding with the public domain DTO names.
 SecurityRecord = SecurityModel
@@ -153,4 +193,6 @@ __all__ = [
     "Security",
     "SecurityModel",
     "SecurityRecord",
+    "MarketDataAdjustmentStateModel",
+    "TradingCalendarModel",
 ]

@@ -143,6 +143,32 @@ async def test_eltdx_converts_per_ten_cash_dividend_to_per_share() -> None:
 
 
 @pytest.mark.asyncio
+async def test_eltdx_batches_quote_snapshots_in_one_upstream_call() -> None:
+    client = FakeClient()
+    calls = []
+
+    def snapshots(codes):
+        calls.append(tuple(codes))
+        return [
+            SimpleNamespace(code=code[2:], last_price=10.5, change=0, change_pct=0)
+            for code in codes
+        ]
+
+    client.quotes.get_snapshots = snapshots
+    rows = await EltdxProvider(client).get_quotes(("600519", "000001"))
+    assert [row.symbol for row in rows] == ["600519", "000001"]
+    assert calls == [("sh600519", "sz000001")]
+
+
+@pytest.mark.asyncio
+async def test_eltdx_adjustment_revision_is_stable_for_same_actions() -> None:
+    provider = EltdxProvider(FakeClient())
+    assert await provider.get_adjustment_revision(
+        "600519"
+    ) == await provider.get_adjustment_revision("600519")
+
+
+@pytest.mark.asyncio
 async def test_eltdx_close_is_idempotent() -> None:
     client = FakeClient()
     provider = EltdxProvider(client)
@@ -155,14 +181,11 @@ async def test_eltdx_close_is_idempotent() -> None:
 async def test_eltdx_none_and_qfq_are_forwarded_to_server_api() -> None:
     client = FakeClient()
     provider = EltdxProvider(client)
-    await provider.get_daily_bars(
-        "600519", date(2026, 9, 24), date(2026, 9, 25), Adjustment.NONE
-    )
-    await provider.get_daily_bars(
-        "600519", date(2026, 9, 24), date(2026, 9, 25), Adjustment.QFQ
-    )
+    await provider.get_daily_bars("600519", date(2026, 9, 24), date(2026, 9, 25), Adjustment.NONE)
+    await provider.get_daily_bars("600519", date(2026, 9, 24), date(2026, 9, 25), Adjustment.QFQ)
     assert [call[1]["adjust"] for call in client.bars.calls] == ["none", "qfq"]
-    assert all(call[1]["all_pages"] is True for call in client.bars.calls)
+    assert all(call[1]["count"] > 0 for call in client.bars.calls)
+    assert all("all_pages" not in call[1] for call in client.bars.calls)
 
 
 @pytest.mark.asyncio
@@ -237,6 +260,4 @@ async def test_eltdx_ignores_zero_cash_and_non_dividend_actions() -> None:
     )
     provider = EltdxProvider(client)
     rows = await provider.get_dividends("600519")
-    assert [(row.date, str(row.cash_amount)) for row in rows] == [
-        (date(2026, 3, 1), "1")
-    ]
+    assert [(row.date, str(row.cash_amount)) for row in rows] == [(date(2026, 3, 1), "1")]

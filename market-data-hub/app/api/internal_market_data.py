@@ -29,6 +29,8 @@ from app.repositories.market_data import (
 from app.schemas.common import ErrorResponse
 from app.schemas.market_data import (
     ApiEnvelope,
+    CalendarValidationData,
+    CalendarValidationRequest,
     DailyBarData,
     DailyBarsData,
     DailySyncRequest,
@@ -56,6 +58,10 @@ except ImportError:  # pragma: no cover - SQLAlchemy is a runtime dependency
 
 
 router = APIRouter(prefix="/internal", tags=["internal-market-data"])
+
+
+def get_calendar_validation_service(request: Request):
+    return request.app.state.calendar_validation_service
 
 
 def get_quote_repository(request: Request) -> QuoteRepository:
@@ -263,16 +269,12 @@ async def sync_daily(
 ) -> JSONResponse:
     """Synchronize daily bars with authenticated, idempotent persistence."""
 
-    if request.start > request.end:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "INVALID_DATE_RANGE", "message": "start must not be after end."},
-        )
     try:
         summary = await service.sync(
             symbols=request.symbols,
             start=request.start,
             end=request.end,
+            lookback_bars=request.lookback_bars,
             adjustment=request.adjustment,
         )
     except Exception as exc:
@@ -353,6 +355,21 @@ async def sync_dividends(
 
 
 @router.post(
+    "/calendar/validate",
+    dependencies=[Depends(require_internal_token)],  # noqa: B008
+)
+async def validate_calendar(
+    request: CalendarValidationRequest,
+    service=Depends(get_calendar_validation_service),  # noqa: B008
+) -> JSONResponse:
+    try:
+        data = CalendarValidationData(**(await service.validate(request.trade_date)))
+    except Exception as exc:
+        _raise_public_dependency_error(exc)
+    return _success(data.model_dump(mode="json"))
+
+
+@router.post(
     "/sync/securities",
     dependencies=[Depends(require_internal_token)],  # noqa: B008
 )
@@ -410,6 +427,8 @@ def _summary_data(summary: SyncSummary) -> SyncSummaryData:
                 fetched=item.fetched,
                 persisted=item.persisted,
                 error=error,
+                history_rebased=item.history_rebased,
+                changed_from=item.changed_from,
             )
         )
     return SyncSummaryData(

@@ -58,8 +58,7 @@ class Settings(BaseSettings):
         default=(),
         validation_alias=AliasChoices("ELTDX_HOSTS", "ELTDX_SERVERS"),
         description=(
-            "Optional CSV/JSON list of eltdx host:port endpoints; "
-            "empty uses eltdx defaults."
+            "Optional CSV/JSON list of eltdx host:port endpoints; empty uses eltdx defaults."
         ),
     )
     eltdx_timeout_seconds: float = Field(default=5.0, gt=0)
@@ -70,6 +69,9 @@ class Settings(BaseSettings):
     eltdx_heartbeat_interval_seconds: float | None = Field(default=30.0, gt=0)
     eltdx_bar_page_size: int = Field(default=800, gt=0, le=800)
     eltdx_bar_max_pages: int = Field(default=64, gt=0, le=10000)
+    eltdx_quote_batch_size: int = Field(default=50, gt=0, le=1000)
+    market_data_sync_concurrency: int = Field(default=4, gt=0, le=64)
+    market_data_sync_max_symbols_per_request: int = Field(default=100, gt=0, le=1000)
     security_master_fallback_provider: str = Field(
         default="akshare",
         min_length=1,
@@ -210,7 +212,6 @@ def get_settings() -> Settings:
     """Return the process-wide settings instance."""
 
     return Settings()
-
 
 
 def _validate_host_port(value: str, *, field: str) -> None:

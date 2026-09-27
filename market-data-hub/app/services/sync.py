@@ -32,6 +32,7 @@ from app.providers.errors import (
     ProviderUnavailableError,
 )
 from app.repositories.market_data import (
+    AdjustmentStateRepository,
     DailyBarRepository,
     DividendRepository,
     PersistenceSystemError,
@@ -59,6 +60,8 @@ class SyncItemResult:
     fetched: int = 0
     persisted: int = 0
     error: SyncError | None = None
+    history_rebased: bool = False
+    changed_from: date | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -153,60 +156,145 @@ class SecuritySyncService:
 
 
 class DailyBarSyncService:
-    """Fetch and persist bars while isolating provider/repository failures."""
+    """Fetch and persist bars using native batching plus qfq revision tracking."""
 
-    def __init__(self, *, provider: DailyBarProvider, repository: DailyBarRepository) -> None:
+    def __init__(
+        self,
+        *,
+        provider: DailyBarProvider,
+        repository: DailyBarRepository,
+        adjustment_repository: AdjustmentStateRepository | None = None,
+        batch_size: int = 50,
+    ) -> None:
         self._provider = provider
         self._repository = repository
+        self._adjustment_repository = adjustment_repository
+        self._batch_size = max(1, int(batch_size))
 
     async def sync(
         self,
         *,
         symbols: Iterable[str],
-        start: date,
-        end: date,
+        start: date | None = None,
+        end: date | None = None,
         adjustment: Adjustment | str = Adjustment.QFQ,
+        lookback_bars: int | None = None,
     ) -> SyncSummary:
         selected_adjustment = normalize_adjustment(adjustment)
-        canonical_symbols: list[str] = []
-        results: dict[str, SyncItemResult] = {}
-        for raw_symbol in symbols:
-            try:
-                symbol = normalize_symbol(raw_symbol)
-            except Exception as exc:
-                symbol = _best_effort_symbol(raw_symbol)
-                results.setdefault(
-                    symbol,
-                    SyncItemResult(symbol=symbol, status="failed", error=_sync_error(exc)),
-                )
-                continue
-            if symbol not in results:
-                canonical_symbols.append(symbol)
-
+        if lookback_bars is None:
+            if start is None or end is None or start > end:
+                raise InvalidMarketDataError("start/end are required and must form a valid range")
+            count = max(8, (end - start).days * 2 + 8)
+        else:
+            if start is not None or end is not None or lookback_bars <= 0:
+                raise InvalidMarketDataError("lookback_bars is exclusive with start/end")
+            count = int(lookback_bars)
+        canonical_symbols, results = _canonicalize_symbols(symbols)
         pending: dict[str, tuple[DailyBar, ...]] = {}
-        for symbol in canonical_symbols:
-            try:
-                raw_bars = tuple(
-                    await self._provider.get_daily_bars(
+        revision_by_symbol: dict[str, str] = {}
+        rebase_from: dict[str, date] = {}
+        batch_method = getattr(self._provider, "get_daily_bars_batch", None)
+        revision_method = getattr(self._provider, "get_adjustment_revision", None)
+
+        normal_symbols = list(canonical_symbols)
+        if (
+            selected_adjustment is Adjustment.QFQ
+            and self._adjustment_repository is not None
+            and callable(revision_method)
+            and callable(batch_method)
+        ):
+            normal_symbols = []
+            for symbol in canonical_symbols:
+                try:
+                    revision = await revision_method(symbol)
+                    revision_by_symbol[symbol] = revision
+                    state = await self._adjustment_repository.get(symbol)
+                    if state is not None and state.get("revision_hash") != revision:
+                        existing = await self._repository.list_by_symbol(
+                            symbol, adjustment=selected_adjustment
+                        )
+                        full_count = max(count, len(existing) + 32, 400)
+                        by_symbol = await batch_method(
+                            (symbol,), adjustment=selected_adjustment, count=full_count
+                        )
+                        bars = _validated_bars(
+                            symbol,
+                            tuple(by_symbol.get(symbol, ())),
+                            selected_adjustment,
+                        )
+                        pending[symbol] = bars
+                        changed_from = min(
+                            (item.trade_date for item in existing), default=None
+                        ) or min((item.trade_date for item in bars), default=None)
+                        if changed_from is not None:
+                            rebase_from[symbol] = changed_from
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol,
+                            status="success",
+                            fetched=len(bars),
+                            history_rebased=True,
+                            changed_from=changed_from,
+                        )
+                        continue
+                    normal_symbols.append(symbol)
+                except Exception as exc:
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="failed", error=_sync_error(exc)
+                    )
+
+        if callable(batch_method):
+            for offset in range(0, len(normal_symbols), self._batch_size):
+                chunk = normal_symbols[offset : offset + self._batch_size]
+                try:
+                    by_symbol = await batch_method(
+                        chunk,
+                        adjustment=selected_adjustment,
+                        count=count,
+                    )
+                except Exception as exc:
+                    for symbol in chunk:
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol, status="failed", error=_sync_error(exc)
+                        )
+                    continue
+                for symbol in chunk:
+                    try:
+                        raw = tuple(by_symbol.get(symbol, ()))
+                        if start is not None and end is not None:
+                            raw = tuple(item for item in raw if start <= item.trade_date <= end)
+                        bars = _validated_bars(symbol, raw, selected_adjustment)
+                        pending[symbol] = bars
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol, status="success", fetched=len(bars)
+                        )
+                    except Exception as exc:
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol, status="failed", error=_sync_error(exc)
+                        )
+        else:
+            if start is None or end is None:
+                raise InvalidMarketDataError(
+                    "provider does not support count-based history bootstrap"
+                )
+            for symbol in normal_symbols:
+                try:
+                    bars = _validated_bars(
                         symbol,
-                        start,
-                        end,
+                        tuple(
+                            await self._provider.get_daily_bars(
+                                symbol, start, end, selected_adjustment
+                            )
+                        ),
                         selected_adjustment,
                     )
-                )
-                bars = _validated_bars(symbol, raw_bars, selected_adjustment)
-                pending[symbol] = bars
-                results[symbol] = SyncItemResult(
-                    symbol=symbol,
-                    status="success",
-                    fetched=len(bars),
-                )
-            except Exception as exc:
-                results[symbol] = SyncItemResult(
-                    symbol=symbol,
-                    status="failed",
-                    error=_sync_error(exc),
-                )
+                    pending[symbol] = bars
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="success", fetched=len(bars)
+                    )
+                except Exception as exc:
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="failed", error=_sync_error(exc)
+                    )
 
         records = tuple(bar for bars in pending.values() for bar in bars)
         if records:
@@ -217,121 +305,160 @@ class DailyBarSyncService:
             )
             for symbol, error in persisted.items():
                 previous = results[symbol]
-                results[symbol] = (
-                    SyncItemResult(
-                        symbol=symbol,
-                        status="success",
-                        fetched=previous.fetched,
-                        persisted=previous.fetched,
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="success" if error is None else "failed",
+                    fetched=previous.fetched,
+                    persisted=previous.fetched if error is None else 0,
+                    error=error,
+                    history_rebased=previous.history_rebased,
+                    changed_from=previous.changed_from,
+                )
+
+        if selected_adjustment is Adjustment.QFQ and self._adjustment_repository is not None:
+            for symbol in canonical_symbols:
+                item = results.get(symbol)
+                if item is None or not item.succeeded:
+                    continue
+                revision = revision_by_symbol.get(symbol)
+                if revision is None and callable(revision_method):
+                    try:
+                        revision = await revision_method(symbol)
+                    except Exception:
+                        continue
+                if not revision:
+                    continue
+                try:
+                    coverage = await self._repository.list_by_symbol(
+                        symbol, adjustment=selected_adjustment
                     )
-                    if error is None
-                    else SyncItemResult(
+                    await self._adjustment_repository.upsert(
+                        symbol,
+                        provider_name=str(getattr(self._provider, "name", "provider")),
+                        revision_hash=revision,
+                        coverage_start=min((bar.trade_date for bar in coverage), default=None),
+                        coverage_end=max((bar.trade_date for bar in coverage), default=None),
+                        rebased=symbol in rebase_from,
+                    )
+                except Exception as exc:
+                    previous = results[symbol]
+                    results[symbol] = SyncItemResult(
                         symbol=symbol,
                         status="failed",
                         fetched=previous.fetched,
-                        error=error,
+                        persisted=previous.persisted,
+                        error=SyncError(code="PERSISTENCE_ERROR", message=_safe_message(exc)),
+                        history_rebased=previous.history_rebased,
+                        changed_from=previous.changed_from,
                     )
-                )
         return SyncSummary(operation="daily_bar", items=tuple(results.values()))
 
 
 class QuoteSyncService:
-    """Fetch and persist one latest quote snapshot per requested symbol."""
+    """Fetch and persist latest quote snapshots with provider-native batching."""
 
-    def __init__(self, *, provider: QuoteProvider, repository: QuoteRepository) -> None:
+    def __init__(
+        self, *, provider: QuoteProvider, repository: QuoteRepository, batch_size: int = 50
+    ) -> None:
         self._provider = provider
         self._repository = repository
+        self._batch_size = max(1, int(batch_size))
 
     async def sync(self, *, symbols: Iterable[str]) -> SyncSummary:
         canonical_symbols, results = _canonicalize_symbols(symbols)
         pending: dict[str, Quote] = {}
-        for symbol in canonical_symbols:
-            try:
-                raw_record = await self._provider.get_quote(symbol)
-                record = _validated_quote(symbol, raw_record)
-                pending[symbol] = record
-                results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
-            except Exception as exc:
-                results[symbol] = SyncItemResult(
-                    symbol=symbol,
-                    status="failed",
-                    error=_sync_error(exc),
-                )
-
+        batch_method = getattr(self._provider, "get_quotes", None)
+        if callable(batch_method):
+            for offset in range(0, len(canonical_symbols), self._batch_size):
+                chunk = canonical_symbols[offset : offset + self._batch_size]
+                try:
+                    records = tuple(await batch_method(chunk))
+                    by_symbol = {
+                        record.symbol: _validated_quote(record.symbol, record) for record in records
+                    }
+                    for symbol in chunk:
+                        if symbol not in by_symbol:
+                            raise InvalidMarketDataError(f"provider returned no quote for {symbol}")
+                        pending[symbol] = by_symbol[symbol]
+                        results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
+                except Exception as exc:
+                    for symbol in chunk:
+                        if symbol not in pending:
+                            results[symbol] = SyncItemResult(
+                                symbol=symbol, status="failed", error=_sync_error(exc)
+                            )
+        else:
+            for symbol in canonical_symbols:
+                try:
+                    record = _validated_quote(symbol, await self._provider.get_quote(symbol))
+                    pending[symbol] = record
+                    results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
+                except Exception as exc:
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="failed", error=_sync_error(exc)
+                    )
         if pending:
             persisted = await _persist_with_isolation(
-                tuple(pending.values()),
-                self._repository.upsert_many,
+                tuple(pending.values()), self._repository.upsert_many
             )
             for symbol, error in persisted.items():
                 previous = results[symbol]
-                results[symbol] = (
-                    SyncItemResult(
-                        symbol=symbol,
-                        status="success",
-                        fetched=previous.fetched,
-                        persisted=1,
-                    )
-                    if error is None
-                    else SyncItemResult(
-                        symbol=symbol,
-                        status="failed",
-                        fetched=previous.fetched,
-                        error=error,
-                    )
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="success" if error is None else "failed",
+                    fetched=previous.fetched,
+                    persisted=1 if error is None else 0,
+                    error=error,
                 )
         return SyncSummary(operation="quote", items=tuple(results.values()))
 
 
 class DividendSyncService:
-    """Fetch and persist cash-dividend events with per-symbol isolation."""
+    """Fetch dividends with bounded concurrency and persist per-symbol results."""
 
-    def __init__(self, *, provider: DividendProvider, repository: DividendRepository) -> None:
+    def __init__(
+        self, *, provider: DividendProvider, repository: DividendRepository, concurrency: int = 4
+    ) -> None:
         self._provider = provider
         self._repository = repository
+        self._concurrency = max(1, int(concurrency))
 
     async def sync(self, *, symbols: Iterable[str]) -> SyncSummary:
         canonical_symbols, results = _canonicalize_symbols(symbols)
+        semaphore = asyncio.Semaphore(self._concurrency)
+
+        async def fetch(symbol: str):
+            async with semaphore:
+                try:
+                    records = _validated_dividends(
+                        symbol, tuple(await self._provider.get_dividends(symbol))
+                    )
+                    return symbol, records, None
+                except Exception as exc:
+                    return symbol, (), _sync_error(exc)
+
         pending: dict[str, tuple[Dividend, ...]] = {}
-        for symbol in canonical_symbols:
-            try:
-                raw_records = tuple(await self._provider.get_dividends(symbol))
-                records = _validated_dividends(symbol, raw_records)
+        for symbol, records, error in await asyncio.gather(
+            *(fetch(symbol) for symbol in canonical_symbols)
+        ):
+            if error is not None:
+                results[symbol] = SyncItemResult(symbol=symbol, status="failed", error=error)
+            else:
                 pending[symbol] = records
                 results[symbol] = SyncItemResult(
-                    symbol=symbol,
-                    status="success",
-                    fetched=len(records),
+                    symbol=symbol, status="success", fetched=len(records)
                 )
-            except Exception as exc:
-                results[symbol] = SyncItemResult(
-                    symbol=symbol,
-                    status="failed",
-                    error=_sync_error(exc),
-                )
-
         records = tuple(record for values in pending.values() for record in values)
         if records:
-            persisted = await _persist_with_isolation(
-                records,
-                self._repository.upsert_many,
-            )
+            persisted = await _persist_with_isolation(records, self._repository.upsert_many)
             for symbol, error in persisted.items():
                 previous = results[symbol]
-                results[symbol] = (
-                    SyncItemResult(
-                        symbol=symbol,
-                        status="success",
-                        fetched=previous.fetched,
-                        persisted=previous.fetched,
-                    )
-                    if error is None
-                    else SyncItemResult(
-                        symbol=symbol,
-                        status="failed",
-                        fetched=previous.fetched,
-                        error=error,
-                    )
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="success" if error is None else "failed",
+                    fetched=previous.fetched,
+                    persisted=previous.fetched if error is None else 0,
+                    error=error,
                 )
         return SyncSummary(operation="dividend", items=tuple(results.values()))
 
