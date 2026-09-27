@@ -127,6 +127,15 @@ test("watch detail keeps stale data during refresh and separates initial errors"
   assert.equal(watchDetailViewState({}), "empty");
 });
 
+test("watch density changes the fixed row layout", () => {
+  const compact = watchRowLayoutContract(2, "compact");
+  const comfortable = watchRowLayoutContract(2, "comfortable");
+  assert.equal(compact.density, "compact");
+  assert.equal(comfortable.density, "comfortable");
+  assert.ok(comfortable.rowHeight > compact.rowHeight);
+  assert.ok(comfortable.contentHeight > compact.contentHeight);
+});
+
 test("detail data is reusable only for the active watch table", () => {
   assert.equal(isCurrentWatchDetail({ id: 7 }, 7), true);
   assert.equal(isCurrentWatchDetail({ id: "7" }, 7), true);

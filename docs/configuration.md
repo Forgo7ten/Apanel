@@ -47,6 +47,7 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | --- | --- | --- |
 | `APP_SECRETS_KEY` | 本地可空；生产 Backend/Worker 必填 | URL-safe base64 编码的 32-byte AES-GCM master key，用于加密用户 Webhook |
 | `APP_SECRETS_KEY_VERSION` | `v1` | 写入 `user_secrets.key_version` 的密钥版本标识 |
+| `LEGACY_WEBHOOK_FALLBACK_ENABLED` | `true` | Release A 兼容开关；完成迁移审计后可设为 `false` 禁用 legacy JSON 明文读取 |
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | `open.feishu.cn,open.larksuite.com` | 飞书/Lark Webhook hostname allowlist |
 
 Compose 只把 `APP_SECRETS_KEY*` 注入 `backend` 与 `worker`。`scheduler`、`frontend`、`market-data-hub` 和 `security-bootstrap` 不需要也不应获得该密钥。生产 API 启动时若缺少 master key 会失败。
@@ -160,6 +161,7 @@ JWT_SECRET_KEY=<random-secret-at-least-32-bytes>
 INTERNAL_API_TOKEN=<random-service-token>
 APP_SECRETS_KEY=<urlsafe-base64-32-byte-key>
 APP_SECRETS_KEY_VERSION=v1
+LEGACY_WEBHOOK_FALLBACK_ENABLED=false
 REFRESH_COOKIE_SECURE=true
 ```
 

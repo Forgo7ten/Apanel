@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     feishu_webhook_allowed_hosts: str = "open.feishu.cn,open.larksuite.com"
     app_secrets_key: str | None = None
     app_secrets_key_version: str = "v1"
+    legacy_webhook_fallback_enabled: bool = True
     quote_refresh_interval_minutes: int = Field(
         default=5,
         ge=5,

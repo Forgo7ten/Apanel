@@ -11,6 +11,7 @@ from app.core.security import InvalidAccessToken, decode_access_token
 from app.db.session import get_db
 from app.models import User, UserRole
 from app.services.auth_service import get_active_user
+from app.services.bootstrap_scheduler import SecurityBootstrapScheduler
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -38,3 +39,9 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:  # noqa
     if user.role != UserRole.ADMIN:
         raise ApiError("FORBIDDEN", "Administrator access is required.", 403)
     return user
+
+
+def get_security_bootstrap_scheduler() -> SecurityBootstrapScheduler:
+    from app.tasks.bootstrap_scheduler import CelerySecurityBootstrapScheduler
+
+    return CelerySecurityBootstrapScheduler()

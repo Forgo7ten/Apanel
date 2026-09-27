@@ -143,16 +143,19 @@ export const WATCH_COMPOSITE_LAYOUT = Object.freeze({
  * a layout safety margin for font metrics while preserving contentHeight <=
  * rowHeight as an explicit invariant.
  */
-export function watchRowLayoutContract(fieldCount = 0) {
+export function watchRowLayoutContract(fieldCount = 0, density = "compact") {
   const layout = WATCH_COMPOSITE_LAYOUT;
   const normalizedFieldCount = Math.max(0, Math.floor(Number(fieldCount) || 0));
   const effectiveFieldCount = Math.max(1, normalizedFieldCount);
   const fieldHeight = effectiveFieldCount * layout.fieldBlockHeight
     + (effectiveFieldCount - 1) * layout.fieldGap;
   const stateHeight = layout.stateGap + layout.stateBlockHeight;
-  const contentHeight = layout.verticalPadding + fieldHeight + stateHeight;
+  const normalizedDensity = density === "comfortable" ? "comfortable" : "compact";
+  const densityPadding = normalizedDensity === "comfortable" ? 16 : 0;
+  const contentHeight = layout.verticalPadding + densityPadding + fieldHeight + stateHeight;
   return {
-    rowHeight: Math.max(WATCH_DEFAULT_ROW_HEIGHT, Math.ceil(contentHeight / 8) * 8),
+    rowHeight: Math.max(WATCH_DEFAULT_ROW_HEIGHT + densityPadding, Math.ceil(contentHeight / 8) * 8),
+    density: normalizedDensity,
     contentHeight,
     fieldCount: normalizedFieldCount,
     effectiveFieldCount,

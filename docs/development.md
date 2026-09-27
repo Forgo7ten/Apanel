@@ -116,6 +116,7 @@ cd backend && alembic heads
 ## 修改边界
 
 - HTTP controller 只做解析、依赖注入和响应映射；业务规则放在 service/domain 层。
+- Watch/Alert Service 若需要启动历史数据准备，只依赖 `SecurityBootstrapScheduler` 协议；Celery adapter 位于 task 层，测试可注入 recorder/no-op scheduler，禁止 Service 直接 import task object。
 - Backend 只调用 `MarketDataHubClient`；外部行情 Provider 只能存在于 `market-data-hub/app/providers/`，API controller 不直接调用 eltdx/AKShare。
 - 指标只接收标准化输入并返回 `IndicatorResult`；状态只接收 `IndicatorSnapshot`，不要在前端复制计算逻辑。
 - 用户身份来自后端当前会话和数据库角色，不接受前端提交的 `user_id` 作为权限依据。

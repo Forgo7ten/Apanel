@@ -23,7 +23,7 @@ from app.db.session import create_engine, dispose_engine
 from app.models import UserSetting
 from app.security.webhook_url import validate_feishu_webhook_url
 from app.services.auth_service import bootstrap_admin
-from app.services.user_secret_service import UserSecretService
+from app.services.user_secret_service import UserSecretService, audit_user_secrets
 
 
 def _positive_float(value: str) -> float:
@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "migrate-user-secrets",
         help="Encrypt legacy notification secrets and remove plaintext settings",
+    )
+    commands.add_parser(
+        "audit-user-secrets",
+        help="Verify whether legacy plaintext notification secrets remain",
     )
     return parser
 
@@ -317,6 +321,26 @@ async def _migrate_user_secrets() -> int:
     return 0 if invalid == 0 else 2
 
 
+async def _audit_user_secrets() -> int:
+    settings = get_settings()
+    settings.validate_database_credentials()
+    engine = create_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            audit = await audit_user_secrets(session)
+    finally:
+        await dispose_engine(engine)
+    print(
+        "User secret audit completed: "
+        f"legacy_plaintext={audit.legacy_plaintext_count} "
+        f"encrypted={audit.encrypted_count} "
+        f"legacy_without_encrypted={audit.legacy_without_encrypted_count} "
+        f"release_b_ready={'yes' if audit.release_b_ready else 'no'}."
+    )
+    return 0 if audit.release_b_ready else 2
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -330,6 +354,8 @@ def main(
             return asyncio.run(_bootstrap_admin(args))
         if args.command == "migrate-user-secrets":
             return asyncio.run(_migrate_user_secrets())
+        if args.command == "audit-user-secrets":
+            return asyncio.run(_audit_user_secrets())
         if args.command == "bootstrap-securities":
             return asyncio.run(
                 run_security_bootstrap(

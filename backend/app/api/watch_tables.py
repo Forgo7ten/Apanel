@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, get_security_bootstrap_scheduler
 from app.db.session import get_db
 from app.models import User
 from app.schemas.common import SuccessResponse
@@ -26,6 +26,7 @@ from app.schemas.watch import (
     WatchTableStockData,
     WatchTableSummaryData,
 )
+from app.services.bootstrap_scheduler import SecurityBootstrapScheduler
 from app.services.watch_table_service import WatchTableService
 
 router = APIRouter()
@@ -55,9 +56,7 @@ async def create_watch_table(
     return SuccessResponse(data=result)
 
 
-@router.get(
-    "/watch-tables/{table_id}", response_model=SuccessResponse[WatchTableDetailsData]
-)
+@router.get("/watch-tables/{table_id}", response_model=SuccessResponse[WatchTableDetailsData])
 async def get_watch_table(
     table_id: int,
     user: User = Depends(get_current_user),  # noqa: B008
@@ -89,8 +88,11 @@ async def add_stock(
     payload: AddStockRequest,
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
+    bootstrap_scheduler: SecurityBootstrapScheduler = Depends(get_security_bootstrap_scheduler),  # noqa: B008
 ) -> SuccessResponse[WatchTableStockData]:
-    result = await WatchTableService(session).add_stock(user.id, table_id, payload.security_id)
+    result = await WatchTableService(session, bootstrap_scheduler=bootstrap_scheduler).add_stock(
+        user.id, table_id, payload.security_id
+    )
     return SuccessResponse(data=result)
 
 
@@ -146,8 +148,11 @@ async def add_column(
     payload: ColumnCreateRequest,
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
+    bootstrap_scheduler: SecurityBootstrapScheduler = Depends(get_security_bootstrap_scheduler),  # noqa: B008
 ) -> SuccessResponse[TableColumnData]:
-    result = await WatchTableService(session).add_column(user.id, table_id, payload)
+    result = await WatchTableService(session, bootstrap_scheduler=bootstrap_scheduler).add_column(
+        user.id, table_id, payload
+    )
     return SuccessResponse(data=result)
 
 
@@ -161,9 +166,7 @@ async def reorder_columns_for_table(
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[list[TableColumnData]]:
-    result = await WatchTableService(session).reorder_columns(
-        user.id, table_id, payload.column_ids
-    )
+    result = await WatchTableService(session).reorder_columns(user.id, table_id, payload.column_ids)
     return SuccessResponse(data=result)
 
 
@@ -180,8 +183,11 @@ async def update_column(
     payload: ColumnUpdateRequest,
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
+    bootstrap_scheduler: SecurityBootstrapScheduler = Depends(get_security_bootstrap_scheduler),  # noqa: B008
 ) -> SuccessResponse[TableColumnData]:
-    result = await WatchTableService(session).update_column(user.id, column_id, payload)
+    result = await WatchTableService(
+        session, bootstrap_scheduler=bootstrap_scheduler
+    ).update_column(user.id, column_id, payload)
     return SuccessResponse(data=result)
 
 

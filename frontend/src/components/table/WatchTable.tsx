@@ -439,7 +439,11 @@ export function WatchTable({
     }
     return maximum;
   }, [columns, table.stocks]);
-  const rowLayout = useMemo(() => watchRowLayoutContract(maxCompositeFields), [maxCompositeFields]);
+  const comfortableDensity = workspaceSettings.density === "comfortable";
+  const rowLayout = useMemo(
+    () => watchRowLayoutContract(maxCompositeFields, workspaceSettings.density),
+    [maxCompositeFields, workspaceSettings.density],
+  );
   const rowHeight = rowLayout.rowHeight;
   const virtualRange = useMemo(
     () => calculateVirtualRange({
@@ -528,7 +532,7 @@ export function WatchTable({
 
   return (
     <div data-density={workspaceSettings.density} className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
+      <div className={`flex flex-wrap items-center justify-between gap-3 border-b border-line ${comfortableDensity ? "px-5 py-4" : "px-4 py-3"}`}>
         <div>
           <p className="text-sm font-semibold text-primary">{table.name}</p>
           <p className="mt-1 text-xs text-muted">{table.stocks.length} 支股票 · 指标由后端提供</p>
@@ -569,11 +573,11 @@ export function WatchTable({
       >
         <p id={`watch-table-keyboard-help-${String(tableId)}`} className="sr-only">聚焦此区域后，使用上下方向键按行移动，PageUp/PageDown 按页移动，Home/End 跳转首尾；移动后按 Tab 访问当前区域内的操作。</p>
         <table className="w-full min-w-[860px] border-collapse text-left" aria-label={`${table.name}股票监控表`} aria-rowcount={tableRows.length + 1}>
-          <thead className="sticky top-0 z-10 h-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary">
+          <thead className={`sticky top-0 z-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary ${comfortableDensity ? "h-12" : "h-10"}`}>
             {tableInstance.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id} aria-rowindex={1}>
                 {headerGroup.headers.map((header) => (
-                  <th key={header.id} style={columnWidthStyle(columns, header.column.id)} className="whitespace-nowrap px-4 font-medium first:pl-5 last:pr-5">
+                  <th key={header.id} style={columnWidthStyle(columns, header.column.id)} className={`whitespace-nowrap font-medium ${comfortableDensity ? "px-5 first:pl-6 last:pr-6" : "px-4 first:pl-5 last:pr-5"}`}>
                     {header.isPlaceholder ? null : <SortableHeader header={header} />}
                   </th>
                 ))}
@@ -602,7 +606,7 @@ export function WatchTable({
                 {visibleRows.map((row, visibleIndex) => (
               <tr key={row.id} aria-rowindex={virtualRange.start + visibleIndex + 2} style={{ height: rowHeight }} className="align-middle transition-colors hover:bg-card/40">
                 {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id} style={{ ...(columnWidthStyle(columns, cell.column.id) ?? {}), height: rowHeight }} className="whitespace-nowrap px-4 py-0 first:pl-5 last:pr-5">
+                  <td key={cell.id} style={{ ...(columnWidthStyle(columns, cell.column.id) ?? {}), height: rowHeight }} className={`whitespace-nowrap py-0 ${comfortableDensity ? "px-5 first:pl-6 last:pr-6" : "px-4 first:pl-5 last:pr-5"}`}>
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
                 ))}
