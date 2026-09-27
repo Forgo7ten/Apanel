@@ -11,11 +11,18 @@ from app.tasks.contracts import (
     EOD_STEP_ORDER,
     PipelineConfigurationError,
     PipelineContext,
+    PipelineIssue,
+    PipelineRetryableDataError,
     PipelineStep,
     PipelineStepError,
 )
 from app.tasks.jobs import _retry_or_raise, execute_eod_pipeline
-from app.tasks.pipeline import EODPipeline, build_default_eod_steps, resolve_alert_runner
+from app.tasks.pipeline import (
+    EODPipeline,
+    _sync_in_chunks,
+    build_default_eod_steps,
+    resolve_alert_runner,
+)
 from app.tasks.schedule import build_beat_schedule
 
 
@@ -88,6 +95,101 @@ async def test_eod_pipeline_stops_after_the_first_failure() -> None:
         "delta",
     ]
     assert "secret.example" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_eod_pipeline_reports_permanent_partial_failure_after_all_steps() -> None:
+    calls: list[str] = []
+
+    async def handler(context: PipelineContext, name: str) -> None:
+        calls.append(name)
+        if name == "daily_sync":
+            context.resources["pipeline_issues"] = [
+                PipelineIssue(
+                    step="daily_sync",
+                    symbol="600519",
+                    adjustment="qfq",
+                    code="INVALID_MARKET_DATA",
+                    retryable=False,
+                )
+            ]
+
+    steps = tuple(
+        PipelineStep(name, lambda context, name=name: handler(context, name))
+        for name in EOD_STEP_ORDER
+    )
+    result = await EODPipeline(steps).run(
+        PipelineContext(date(2026, 9, 24), "qfq", ("600519", "000001"))
+    )
+
+    assert tuple(calls) == EOD_STEP_ORDER
+    assert result.status == "completed_with_errors"
+    assert result.issues[0].code == "INVALID_MARKET_DATA"
+    assert result.to_dict()["issues"][0]["symbol"] == "600519"
+
+
+@pytest.mark.asyncio
+async def test_execute_eod_retries_only_after_healthy_steps_finish() -> None:
+    calls: list[str] = []
+
+    async def handler(context: PipelineContext, name: str) -> None:
+        calls.append(name)
+        if name == "daily_sync":
+            context.resources["pipeline_issues"] = [
+                PipelineIssue(
+                    step="daily_sync",
+                    symbol="600519",
+                    adjustment="qfq",
+                    code="PROVIDER_TIMEOUT",
+                    retryable=True,
+                )
+            ]
+
+    steps = tuple(
+        PipelineStep(name, lambda context, name=name: handler(context, name))
+        for name in EOD_STEP_ORDER
+    )
+
+    with pytest.raises(PipelineRetryableDataError):
+        await execute_eod_pipeline(
+            trade_date=date(2026, 9, 24),
+            symbols=["600519", "000001"],
+            lock=SimpleNamespace(acquire=lambda: _true_async(), release=lambda: _noop_async()),
+            steps=steps,
+            settings=Settings(),
+        )
+
+    assert tuple(calls) == EOD_STEP_ORDER
+
+
+@pytest.mark.asyncio
+async def test_sync_in_chunks_never_reports_failed_items_as_ok() -> None:
+    from app.clients.market_data_hub import SyncItem, SyncResult
+
+    class Client:
+        async def sync_daily(self, **_kwargs):
+            return SyncResult(
+                operation="daily",
+                items=(
+                    SyncItem("600519", "success"),
+                    SyncItem("000001", "failed", error_code="PROVIDER_TIMEOUT"),
+                    SyncItem("300750", "failed", error_code="INVALID_MARKET_DATA"),
+                    SyncItem("601318", "failed", error_code="PERSISTENCE_ERROR"),
+                ),
+            )
+
+    context = PipelineContext(
+        date(2026, 9, 24), "qfq", ("600519", "000001", "300750", "601318")
+    )
+    context.resources["market_data_client"] = Client()
+    context.resources["settings"] = Settings(market_data_sync_batch_size=50)
+
+    result = await _sync_in_chunks(context, "daily", adjustment="qfq")
+
+    assert result["ok"] is False
+    assert result["failed"] == 3
+    assert result["retryable_symbols"] == ("000001", "601318")
+    assert result["permanent_failures"] == ("300750",)
 
 
 @pytest.mark.asyncio

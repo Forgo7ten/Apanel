@@ -23,7 +23,12 @@ from app.services.notification_service import dispatch_pending_notifications
 from app.services.trading_calendar_service import TradingCalendarService
 
 from .celery_app import celery_app
-from .contracts import PipelineConfigurationError, PipelineContext, PipelineError
+from .contracts import (
+    PipelineConfigurationError,
+    PipelineContext,
+    PipelineError,
+    PipelineRetryableDataError,
+)
 from .locks import RedisTaskLock
 from .pipeline import (
     EODPipeline,
@@ -335,6 +340,9 @@ async def execute_eod_pipeline(
             },
         )
         result = await EODPipeline(steps).run(context)
+        retryable_issues = tuple(issue for issue in result.issues if issue.retryable)
+        if retryable_issues:
+            raise PipelineRetryableDataError(retryable_issues)
         return result.to_dict()
     finally:
         if task_lock is not None:

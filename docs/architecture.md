@@ -124,7 +124,7 @@ Alert Edge evaluation + PENDING Notification（同事务）
 notification dispatcher → Feishu
 ```
 
-停牌/无目标日 bar 的证券不会拿上一交易日 observation 冒充当天数据；交易日日历缺失或 expected/actual 冲突时 EOD fail closed。
+停牌/无目标日 bar 的证券不会拿上一交易日 observation 冒充当天数据；交易日日历缺失或 expected/actual 冲突时 EOD fail closed。逐证券同步失败不会阻塞已经健康的证券继续完成指标、状态、Alert 和通知：永久失败在最终结果中标记为 `completed_with_errors`；provider timeout/unavailable、持久化失败或目标日 bar 尚未就绪等可重试问题会在健康链路完成后触发 Celery retry。Pipeline issue 只保留 symbol、adjustment 和稳定错误码，不记录 provider 原始异常文本。
 
 ## 读取与写入职责
 
