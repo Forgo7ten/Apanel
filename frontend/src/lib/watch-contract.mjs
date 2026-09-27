@@ -98,6 +98,24 @@ export function toColumnOrderPayload(columnOrder) {
 
 export const WATCH_DETAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
+export function filterWatchStocks(stocks, { query = "", state = "ALL" } = {}) {
+  const items = Array.isArray(stocks) ? stocks : [];
+  const normalizedQuery = String(query ?? "").trim().toLocaleLowerCase("zh-CN");
+  const normalizedState = String(state ?? "ALL").trim();
+  return items.filter((stock) => {
+    const name = stock?.name ?? stock?.security?.name ?? "";
+    const symbol = stock?.symbol ?? "";
+    const matchesQuery = !normalizedQuery
+      || String(name).toLocaleLowerCase("zh-CN").includes(normalizedQuery)
+      || String(symbol).toLocaleLowerCase("zh-CN").includes(normalizedQuery);
+    if (!matchesQuery) return false;
+    const states = Array.isArray(stock?.states) ? stock.states : [];
+    if (normalizedState === "ALL") return true;
+    if (normalizedState === "HAS_STATE") return states.length > 0;
+    return states.some((item) => String(item?.state_code ?? item?.state_id ?? "") === normalizedState);
+  });
+}
+
 /**
  * Keep stale detail data visible while a background request is in flight.
  * The UI uses these states to distinguish the first load from a refresh and

@@ -10,6 +10,7 @@ import {
   toCreateColumnPayload,
   toColumnOrderPayload,
   errorBoundaryCopy,
+  filterWatchStocks,
   calculateVirtualRange,
   dialogFocusTargetIndex,
   isCurrentWatchDetail,
@@ -117,6 +118,18 @@ test("column order payload only contains persisted dynamic column ids", () => {
     column_ids: [14, 7],
   });
   assert.deepEqual(toColumnOrderPayload(["security", "price", "states"]), { column_ids: [] });
+});
+
+test("watch filters match stock identity and active state without calculating indicators", () => {
+  const stocks = [
+    { symbol: "600519", name: "贵州茅台", states: [{ state_code: "BOLL_WIDTH_NARROWING", title: "带口收窄" }] },
+    { symbol: "000001", name: "平安银行", states: [] },
+    { symbol: "300750", name: "宁德时代", states: [{ state_id: "MA_CROSS_UP", title: "MA 上穿" }] },
+  ];
+  assert.deepEqual(filterWatchStocks(stocks, { query: "6005" }).map((item) => item.symbol), ["600519"]);
+  assert.deepEqual(filterWatchStocks(stocks, { query: "平安" }).map((item) => item.symbol), ["000001"]);
+  assert.deepEqual(filterWatchStocks(stocks, { state: "HAS_STATE" }).map((item) => item.symbol), ["600519", "300750"]);
+  assert.deepEqual(filterWatchStocks(stocks, { state: "MA_CROSS_UP" }).map((item) => item.symbol), ["300750"]);
 });
 
 test("watch detail polling interval is five minutes", () => {

@@ -36,6 +36,7 @@ import { isDetailActivationKey } from "@/lib/detail-contract.mjs";
 import { getColumnFields } from "@/lib/indicator-contract.mjs";
 import {
   calculateVirtualRange,
+  filterWatchStocks,
   toColumnOrderPayload,
   virtualScrollTopForKey,
   WATCH_COMPOSITE_LAYOUT,
@@ -290,6 +291,8 @@ export function WatchTable({
   const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
+  const [filterQuery, setFilterQuery] = useState("");
+  const [stateFilter, setStateFilter] = useState("ALL");
   const [viewportHeight, setViewportHeight] = useState(DEFAULT_VIEWPORT_HEIGHT);
   const tableId = table.id;
 
@@ -403,10 +406,25 @@ export function WatchTable({
     setColumnVisibility(serverView.visibility);
   }, [serverView, setColumnOrder, setColumnVisibility]);
 
+  const stateFilterOptions = useMemo(() => {
+    const options = new Map<string, string>();
+    for (const stock of table.stocks ?? []) {
+      for (const state of stock.states ?? []) {
+        const code = String(state.state_code ?? state.state_id ?? "").trim();
+        if (code && !options.has(code)) options.set(code, state.title ?? code);
+      }
+    }
+    return [...options.entries()].sort((left, right) => left[1].localeCompare(right[1], "zh-CN"));
+  }, [table.stocks]);
+  const filteredStocks = useMemo(
+    () => filterWatchStocks(table.stocks ?? [], { query: filterQuery, state: stateFilter }) as WatchTableStock[],
+    [filterQuery, stateFilter, table.stocks],
+  );
+
   // TanStack Table owns a mutable instance by design; React Compiler cannot safely memoize it.
   // eslint-disable-next-line react-hooks/incompatible-library
   const tableInstance = useReactTable({
-    data: table.stocks ?? [],
+    data: filteredStocks,
     columns: columnDefs,
     state: {
       columnOrder: columnOrder.length > 0 ? columnOrder : allColumnIds,
@@ -433,12 +451,12 @@ export function WatchTable({
     let maximum = 0;
     for (const column of columns) {
       if (String(column.view_mode ?? "").toUpperCase() !== "COMPOSITE") continue;
-      for (const stock of table.stocks ?? []) {
+      for (const stock of filteredStocks) {
         maximum = Math.max(maximum, getColumnFields(getIndicatorValue(stock, column)).length);
       }
     }
     return maximum;
-  }, [columns, table.stocks]);
+  }, [columns, filteredStocks]);
   const comfortableDensity = workspaceSettings.density === "comfortable";
   const rowLayout = useMemo(
     () => watchRowLayoutContract(maxCompositeFields, workspaceSettings.density),
@@ -481,7 +499,7 @@ export function WatchTable({
   useEffect(() => {
     setScrollTop(0);
     if (viewportRef.current) viewportRef.current.scrollTop = 0;
-  }, [tableId]);
+  }, [filterQuery, stateFilter, tableId]);
 
   useEffect(() => {
     updateViewportHeight();
@@ -535,9 +553,35 @@ export function WatchTable({
       <div className={`flex flex-wrap items-center justify-between gap-3 border-b border-line ${comfortableDensity ? "px-5 py-4" : "px-4 py-3"}`}>
         <div>
           <p className="text-sm font-semibold text-primary">{table.name}</p>
-          <p className="mt-1 text-xs text-muted">{table.stocks.length} 支股票 · 指标由后端提供</p>
+          <p className="mt-1 text-xs text-muted">{filteredStocks.length === table.stocks.length ? `${table.stocks.length} 支股票` : `${filteredStocks.length} / ${table.stocks.length} 支股票`} · 指标由后端提供</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
+          <input
+            type="search"
+            value={filterQuery}
+            onChange={(event) => setFilterQuery(event.target.value)}
+            placeholder="筛选股票名称/代码"
+            aria-label="筛选股票名称或代码"
+            className="h-8 w-44 rounded-panel border border-line bg-card px-2.5 text-xs text-primary outline-none placeholder:text-muted focus:border-brand focus:ring-2 focus:ring-brand/30"
+          />
+          <select
+            value={stateFilter}
+            onChange={(event) => setStateFilter(event.target.value)}
+            aria-label="筛选股票状态"
+            className="h-8 max-w-48 rounded-panel border border-line bg-card px-2 text-xs text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
+          >
+            <option value="ALL">全部状态</option>
+            <option value="HAS_STATE">有活跃状态</option>
+            {stateFilter !== "ALL"
+              && stateFilter !== "HAS_STATE"
+              && !stateFilterOptions.some(([code]) => code === stateFilter)
+              ? <option value={stateFilter}>{stateFilter}（当前无匹配）</option>
+              : null}
+            {stateFilterOptions.map(([code, title]) => <option key={code} value={code}>{title}</option>)}
+          </select>
+          {(filterQuery || stateFilter !== "ALL") ? (
+            <button type="button" onClick={() => { setFilterQuery(""); setStateFilter("ALL"); }} className="h-8 rounded-panel border border-line bg-card px-2.5 text-xs text-secondary hover:text-primary">清除筛选</button>
+          ) : null}
           {columns.length === 0 ? <span className="text-[11px] text-muted">暂无指标列</span> : null}
           <button type="button" onClick={(event) => { addColumnTriggerRef.current = event.currentTarget; setActionError(null); setAddColumnOpen(true); }} className="inline-flex h-8 items-center gap-1.5 rounded-panel bg-brand px-2.5 text-xs font-medium text-white transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
             <span className="text-base leading-none">+</span>
@@ -589,9 +633,9 @@ export function WatchTable({
               <tr>
                 <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)}>
                   <div className="flex min-h-44 flex-col items-center justify-center px-6 py-10 text-center">
-                    <p className="text-sm font-medium text-primary">还没有监控股票</p>
-                    <p className="mt-1.5 text-xs text-muted">添加第一只股票后，后端行情和指标会出现在这里。</p>
-                    {onAddStock ? <button type="button" onClick={(event) => onAddStock(event.currentTarget)} className="mt-4 rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">添加股票</button> : null}
+                    <p className="text-sm font-medium text-primary">{table.stocks.length === 0 ? "还没有监控股票" : "没有符合筛选条件的股票"}</p>
+                    <p className="mt-1.5 text-xs text-muted">{table.stocks.length === 0 ? "添加第一只股票后，后端行情和指标会出现在这里。" : "调整名称、代码或状态筛选条件后重试。"}</p>
+                    {table.stocks.length === 0 && onAddStock ? <button type="button" onClick={(event) => onAddStock(event.currentTarget)} className="mt-4 rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">添加股票</button> : null}
                   </div>
                 </td>
               </tr>
