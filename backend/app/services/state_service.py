@@ -228,6 +228,13 @@ class StateService:
                             "transition": result.transition,
                             "reason": result.reason,
                             "values": dict(result.values),
+                            "value_context": _state_value_context(
+                                definition,
+                                current,
+                                previous,
+                                current_price=close_by_date.get(trade_date),
+                                previous_price=close_by_date.get(expected_previous_date),
+                            ),
                             "definition": _json_value(result.metadata),
                         },
                     )
@@ -488,6 +495,50 @@ def _to_domain_snapshot(
             if isinstance(value, (int, float)) and not isinstance(value, bool)
         },
     )
+
+
+def _state_value_context(
+    definition: Any,
+    current: IndicatorSnapshot,
+    previous: IndicatorSnapshot,
+    *,
+    current_price: float | None,
+    previous_price: float | None,
+) -> dict[str, dict[str, float | None]]:
+    raw_fields = definition.metadata.get("fields", ())
+    fields = tuple(str(field).strip().lower() for field in raw_fields if str(field).strip())
+    result: dict[str, dict[str, float | None]] = {}
+    for field in fields:
+        label = field
+        if current.indicator == "MA" and field in {"short", "long"}:
+            period_key = f"{field}_period"
+            period = current.parameters.get(period_key)
+            if period is None:
+                continue
+            label = f"MA{int(period)}"
+            value_key = label.lower()
+            current_value = current.values.get(value_key)
+            previous_value = previous.values.get(value_key)
+        elif field == "price":
+            label = "price"
+            current_value = current_price
+            previous_value = previous_price
+        else:
+            current_value = current.values.get(field)
+            previous_value = previous.values.get(field)
+        if current_value is None and previous_value is None:
+            continue
+        change = (
+            float(current_value) - float(previous_value)
+            if current_value is not None and previous_value is not None
+            else None
+        )
+        result[label] = {
+            "current_value": None if current_value is None else float(current_value),
+            "previous_value": None if previous_value is None else float(previous_value),
+            "change": change,
+        }
+    return result
 
 
 def _json_value(value: Any) -> Any:

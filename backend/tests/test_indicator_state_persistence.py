@@ -150,6 +150,40 @@ async def test_state_history_survives_a_new_service_instance(indicator_context) 
         assert any(item.status == "ACTIVE" for item in second)
 
 
+async def test_state_persistence_keeps_notification_value_context(indicator_context) -> None:
+    async with indicator_context() as session:
+        await IndicatorService(session).calculate("600519")
+        await StateService(session).calculate("600519")
+        state = (
+            await session.execute(
+                select(IndicatorState)
+                .where(IndicatorState.state_code == "MA_CROSS_UP")
+                .order_by(IndicatorState.trade_date.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+
+        context = state.metadata["value_context"]
+        assert set(context) == {"MA5", "MA10"}
+        for values in context.values():
+            assert values["current_value"] is not None
+            assert values["previous_value"] is not None
+            assert values["change"] == pytest.approx(
+                values["current_value"] - values["previous_value"]
+            )
+
+        boll_break = (
+            await session.execute(
+                select(IndicatorState)
+                .where(IndicatorState.state_code == "BOLL_BREAK_UPPER")
+                .order_by(IndicatorState.trade_date.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+        assert set(boll_break.metadata["value_context"]) == {"upper", "price"}
+        assert boll_break.metadata["value_context"]["price"]["current_value"] is not None
+
+
 async def test_state_calculation_marks_missing_previous_trading_day_unknown(
     indicator_context,
 ) -> None:

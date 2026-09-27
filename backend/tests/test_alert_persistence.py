@@ -51,9 +51,11 @@ class FakeProvider:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.calls = 0
+        self.messages: list[NotificationMessage] = []
 
     async def send(self, _user, _message) -> None:
         self.calls += 1
+        self.messages.append(_message)
         if self.error is not None:
             raise self.error
 
@@ -125,7 +127,17 @@ async def alert_context(tmp_path) -> AsyncIterator[dict[str, object]]:
                 state_code="BOLL_WIDTH_NARROWING",
                 indicator_type="BOLL",
                 status="ACTIVE",
-                metadata={"name": "带口收窄", "active": True},
+                metadata={
+                    "name": "带口收窄",
+                    "active": True,
+                    "value_context": {
+                        "width": {
+                            "current_value": 0.08,
+                            "previous_value": 0.10,
+                            "change": -0.02,
+                        }
+                    },
+                },
             )
         )
         await session.commit()
@@ -306,7 +318,28 @@ async def test_state_trigger_and_provider_failure_are_persisted(alert_context) -
         notification = (await session.execute(select(Notification))).scalar_one()
         assert notification.status == "FAILED"
         assert notification.error_code == "FEISHU_ERROR"
+        expected_details = {
+            "width": {
+                "current_value": 0.08,
+                "previous_value": 0.10,
+                "change": -0.02,
+            }
+        }
+        assert notification.content["value_details"] == expected_details
+        assert provider.messages[0].value_details == expected_details
+        assert (
+            "width · 当前 0.08 · 前值 0.1 · 变化 -0.02"
+            in provider.messages[0].render_text()
+        )
         assert "webhook" not in (notification.error_message or "").lower()
+
+        replacement = FakeProvider()
+        retried = await AlertService(
+            session, notification_provider=replacement
+        ).retry_notification(user.id, notification.id)
+        assert retried.status == "SENT"
+        assert replacement.messages[0].value_details == expected_details
+
         held = await AlertService(session, notification_provider=provider).evaluate_user(user.id)
         assert held[0].triggered is False
 

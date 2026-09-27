@@ -230,6 +230,8 @@ Edge Trigger 只在 RESET → ACTIVE 时创建通知事件。状态切回 RESET 
 }
 ```
 
+STATE 通知会在 `content.value_details` 中保留触发该状态时实际参与判断的指标字段，每个字段包含 `current_value`、`previous_value` 和 `change`。MA 状态使用具体周期名（例如 `MA5` / `MA10`）；BOLL 突破状态还会包含用于判断突破的 `price`。这些值在状态计算时落库，通知失败后重试沿用原通知上下文，不会重新按最新行情计算。
+
 `error_code`、`error_message` 和 `retryable` 可以为 `null`/缺省。错误字段只包含脱敏后的
 业务诊断，不返回 Feishu webhook URL、token 或原始 transport 异常。`retryable=true` 表示
 可以调用 retry 接口；FAILED 始终可重试，PENDING 只有在安全恢复窗口过期后才可重试。

@@ -33,6 +33,7 @@ class StateObservation:
     active: bool
     observation_date: date
     state: IndicatorState
+    value_context: dict[str, dict[str, float | None]]
 
 
 class AlertObservationService:
@@ -111,7 +112,34 @@ class AlertObservationService:
             active=state.status == StateStatus.ACTIVE.value,
             observation_date=state.trade_date,
             state=state,
+            value_context=_state_value_context(state.metadata),
         )
+
+
+def _state_value_context(metadata: Any) -> dict[str, dict[str, float | None]]:
+    if not isinstance(metadata, dict):
+        return {}
+    raw = metadata.get("value_context")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, float | None]] = {}
+    for raw_label, raw_values in raw.items():
+        if (
+            not isinstance(raw_label, str)
+            or not raw_label.strip()
+            or not isinstance(raw_values, dict)
+        ):
+            continue
+        values: dict[str, float | None] = {}
+        for key in ("current_value", "previous_value", "change"):
+            value = raw_values.get(key)
+            values[key] = (
+                float(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else None
+            )
+        result[raw_label.strip()] = values
+    return result
 
 
 def _field(values: Any, field: str) -> float | None:
