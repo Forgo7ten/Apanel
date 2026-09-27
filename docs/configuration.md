@@ -11,7 +11,7 @@ Compose 从仓库根目录的 `.env` 读取变量。`.env.example` 是本地模�
 | `HTTP_PORT` | `8080` | Nginx 宿主机端口，映射到容器 `80` |
 | `NODE_ENV` | 必填；模板为 `production` | 前端容器运行环境 |
 
-Compose 对 `APP_ENV`、`POSTGRES_PASSWORD`、`JWT_SECRET_KEY`、`INTERNAL_API_TOKEN` 和 `NODE_ENV` 使用必填插值；缺少任一变量时，Compose 不会启动完整栈。
+Compose 对 `APP_ENV`、`POSTGRES_PASSWORD`、`JWT_SECRET_KEY`、`INTERNAL_API_TOKEN` 和 `NODE_ENV` 使用必填插值；缺少任一变量时，Compose 不会启动完整栈。`APP_SECRETS_KEY` 在模板中允许本地留空；`APP_ENV=production` 时 Backend API 会在启动校验中强制要求。Worker 在实际读取/发送用户 Webhook 时同样需要该 key，因此生产 Compose 应同时提供给 `backend` 与 `worker`。
 
 ## PostgreSQL
 
@@ -41,6 +41,16 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 
 后端也识别 `JWT_SECRET` 作为 `JWT_SECRET_KEY` 的别名，识别 `ENVIRONMENT` 作为 `APP_ENV` 的别名。Compose 使用上表中的规范变量名。
 
+## 用户密钥与飞书
+
+| 变量 | 默认值/要求 | 作用 |
+| --- | --- | --- |
+| `APP_SECRETS_KEY` | 本地可空；生产 Backend/Worker 必填 | URL-safe base64 编码的 32-byte AES-GCM master key，用于加密用户 Webhook |
+| `APP_SECRETS_KEY_VERSION` | `v1` | 写入 `user_secrets.key_version` 的密钥版本标识 |
+| `FEISHU_WEBHOOK_ALLOWED_HOSTS` | `open.feishu.cn,open.larksuite.com` | 飞书/Lark Webhook hostname allowlist |
+
+Compose 只把 `APP_SECRETS_KEY*` 注入 `backend` 与 `worker`。`scheduler`、`frontend`、`market-data-hub` 和 `security-bootstrap` 不需要也不应获得该密钥。生产 API 启动时若缺少 master key 会失败。
+
 ## 基础设施超时
 
 | 变量 | 默认值 | 使用服务 |
@@ -63,7 +73,10 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | `ELTDX_PROBE_HOSTS` | `true` | 启动时是否对候选主站做延迟探测与排序 |
 | `ELTDX_HEARTBEAT_INTERVAL_SECONDS` | `30` | eltdx 连接心跳间隔 |
 | `ELTDX_BAR_PAGE_SIZE` | `800` | 日线自动分页单页数量，范围 `1..800` |
-| `ELTDX_BAR_MAX_PAGES` | `64` | 日线自动分页最大页数 |
+| `ELTDX_BAR_MAX_PAGES` | `64` | 极长历史 fallback 的最大页数；正常 EOD 不使用固定全量分页 |
+| `ELTDX_QUOTE_BATCH_SIZE` | `50` | 单次 eltdx 批量快照证券数 |
+| `MARKET_DATA_SYNC_CONCURRENCY` | `4` | 无原生 batch capability 的 Hub 同步有界并发数 |
+| `MARKET_DATA_SYNC_MAX_SYMBOLS_PER_REQUEST` | `100` | Hub 单次同步请求允许的最大证券数/内部 batch 上限 |
 | `SECURITY_MASTER_FALLBACK_PROVIDER` | `akshare` | Security Master fallback；`none`/`disabled` 可关闭 |
 | `AKSHARE_SECURITY_TIMEOUT_SECONDS` | `90` | AKShare 股票 + ETF 完整批次总超时 |
 | `AKSHARE_MIN_STOCK_COUNT` | `1000` | AKShare 股票源最低完整批次数 |
@@ -91,6 +104,36 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 
 行情服务还识别 `INTERNAL_SYNC_TOKEN` 和 `MARKET_DATA_INTERNAL_TOKEN` 作为 `INTERNAL_API_TOKEN` 的别名。生产环境若缺少内部 token，服务启动校验会失败。
 
+## Scheduler 与交易时段
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `QUOTE_REFRESH_INTERVAL_MINUTES` | `5` | 候选交易时段内的 Quote 刷新步长，限制为 5–10 分钟 |
+| `EOD_PIPELINE_HOUR` | `15` | EOD 任务候选小时（Asia/Shanghai） |
+| `EOD_PIPELINE_MINUTE` | `20` | EOD 任务候选分钟 |
+| `SCHEDULER_LOCK_TTL_SECONDS` | `3600` | Redis 分布式任务锁 TTL |
+| `SCHEDULER_RETRY_MAX_ATTEMPTS` | `3` | Celery 任务最大重试次数 |
+| `SCHEDULER_RETRY_BACKOFF_SECONDS` | `60` | 指数退避基数 |
+
+Beat 只在 09:30–11:30、13:00–15:00 的候选区间投递 Quote 任务，并在 15:00 额外刷新一次；worker 仍会检查持久化 `trading_calendar`，因此周一到周五 cron 不是最终交易日判断。EOD 同样先过交易日历和 Hub actual validation；未知/冲突状态 fail closed。
+
+### 任务队列
+
+Compose 的 Celery worker 监听 `default`、`market-data`、`pipeline` 队列。Beat 的职责只是按候选时间投递任务：Quote 使用 `market-data`，EOD 使用 `pipeline`，pending notification recovery 使用 `default`。真正的交易日判断、锁、重试和业务执行都在 worker 内完成。
+
+## Backend 行情同步与分析 bootstrap
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MARKET_DATA_SYNC_BATCH_SIZE` | `50` | Backend/Worker 调 Hub 时的证券 chunk 大小 |
+| `MARKET_DATA_QUOTE_TIMEOUT_SECONDS` | `15` | Quote 批次请求超时 |
+| `MARKET_DATA_DAILY_TIMEOUT_SECONDS` | `60` | 日线/分红增量请求超时 |
+| `MARKET_DATA_BOOTSTRAP_TIMEOUT_SECONDS` | `120` | 单证券历史 bootstrap 请求超时 |
+| `ANALYSIS_BOOTSTRAP_MIN_BARS` | `400` | 首次监控的最小历史 bar 预算；实际值还会取指标需求上界 |
+| `ENABLE_NONE_ANALYSIS` | `true` | 是否同时物化 `none` 指标/状态序列；qfq 始终支持 |
+
+新增股票、启用提醒或新增参数需求会 best-effort enqueue `bootstrap_security_data`；Redis 锁按 symbol 去重。EOD 正常路径只同步目标交易日并物化最新 snapshot/state；若 Hub 报告 qfq revision 变化，则从 `changed_from` 重建受影响历史。
+
 ## 证券主数据 bootstrap
 
 | 变量 | 默认值 | 作用 |
@@ -115,6 +158,8 @@ APP_ENV=production
 POSTGRES_PASSWORD=<unique-url-safe-password>
 JWT_SECRET_KEY=<random-secret-at-least-32-bytes>
 INTERNAL_API_TOKEN=<random-service-token>
+APP_SECRETS_KEY=<urlsafe-base64-32-byte-key>
+APP_SECRETS_KEY_VERSION=v1
 REFRESH_COOKIE_SECURE=true
 ```
 

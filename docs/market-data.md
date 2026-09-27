@@ -2,6 +2,13 @@
 
 `market-data-hub` 是 Apanel 唯一的外部行情数据边界。Backend、Worker 和 Scheduler 不直接依赖 TDX、eltdx、AKShare 或其他公开数据源；它们只通过 Hub 的内部 HTTP API 触发同步，并从共享 PostgreSQL 读取规范化后的公共行情事实。
 
+## Backend 与 Hub 的职责分界
+
+- Hub 负责外部 Provider、格式归一化、共享行情事实持久化与 provider revision/交易日 actual validation。
+- Backend 负责 Watch/Alert 需求汇总、指标/状态计算、用户设置、通知语义与调度策略。
+- 两者共享 PostgreSQL 表，但 **只有 Backend Alembic** 负责 schema migration；Hub 不能维护第二套迁移历史。
+- Hub sync response 保留 item 级成功/失败；Backend 负责 chunk、Celery retry policy 和是否继续后续指标/提醒步骤。
+
 ## v1 Provider 范围
 
 第一版只包含两个 Provider：
@@ -58,18 +65,20 @@ eltdx 基础快照公开的是 `time_raw`，Hub 不把它猜测成完整交易�
 
 ```python
 client.bars.get(
-    full_code,
+    ["sh600519", "sz000001", ...],
     period="day",
     adjust="qfq" or "none",
-    all_pages=True,
+    count=target_count,
 )
 ```
 
 因此 QFQ 使用 TDX `0x052d` 主站服务端复权结果。Apanel 已删除旧的本地 `apply_qfq` 近似算法，不再用 `0x000f` corporate-action records 自行重建默认 QFQ。
 
-`KlineBar.volume_lots` 写入 Apanel `DailyBar.volume`，`amount` 写入成交额。Hub 会校验返回的 `adjust_mode` 与请求一致，并按交易日排序、过滤请求日期范围。
+`KlineBar.volume_lots` 写入 Apanel `DailyBar.volume`，`amount` 写入成交额。Hub 会校验返回的 `adjust_mode` 与请求一致。Quote 使用 `get_snapshots([...])` 原生批量能力；Daily Bar 正常 EOD 使用小 `count`，历史 bootstrap 使用需求驱动的 `lookback_bars`，不再为单日同步遍历固定 64 页。
 
-技术指标仍属于 Backend。MA、RSI、KDJ、BOLL、MACD 等继续基于最近完成交易日的统一日线口径计算，盘中 Quote 不参与日线指标重算。
+Hub 还保存每只证券的 qfq corporate-action revision hash。revision 变化时会重新获取已有 coverage 对应的 qfq 历史，并在同步 item 中返回 `history_rebased/changed_from`，Backend 从变化起点重建指标/状态。
+
+技术指标仍属于 Backend。MA、Projected MA、RSI、KDJ、BOLL、MACD 都按 `qfq` / `none` 独立物化；盘中 Quote 不参与日线指标重算。正常 EOD 按目标日期请求一个受限 count，再在 Hub 端过滤目标范围；首次 bootstrap 按 `lookback_bars` 拉取需求驱动的历史长度。
 
 ## 现金分红
 
@@ -100,6 +109,12 @@ Adapter 保留现有保护：lazy import、完整批次校验、最低记录数�
 
 HTTP proxy 环境变量只对 AKShare 等 HTTP Provider 有意义；eltdx 的 TDX 7709 是原生 TCP，本项目不宣称它会通过 `HTTP_PROXY` / `HTTPS_PROXY` 转发。
 
+## 批量与失败隔离
+
+Quote 通过 eltdx `get_snapshots([...])` 原生批量获取；Daily Bar 通过批量 codes + `count` 获取；Dividend 等无原生批量能力的路径使用有界并发。Backend 在调用 Hub 前再按 `MARKET_DATA_SYNC_BATCH_SIZE` chunk，因此不会把用户监控 universe 直接塞进一个无限大请求。
+
+同步结果保留逐证券 `SyncItemResult`。单只证券停牌、无目标 bar 或业务校验失败不会抹掉同批其他证券的成功结果；transport/provider 不可用等 retryable failure 才会驱动 Celery 重试策略。
+
 ## 同步与持久化
 
 Hub 负责写入共享公共行情事实：
@@ -115,6 +130,7 @@ Hub 负责写入共享公共行情事实：
 - `POST /internal/sync/daily`
 - `POST /internal/sync/quotes`
 - `POST /internal/sync/dividends`
+- `POST /internal/calendar/validate`
 
 读取接口：
 
@@ -122,7 +138,13 @@ Hub 负责写入共享公共行情事实：
 - `GET /internal/daily-bars/{symbol}`
 - `GET /internal/dividends/{symbol}`
 
-第一版架构重构不增加 provenance schema，也不改变指标/状态/提醒表。后续如果需要记录 provider provenance，应独立设计 DB migration，而不是把 Provider SDK model 直接写入公共表。
+共享 DB 还包含 `market_data_adjustment_state` 与 `trading_calendar`。前者保存 opaque provider revision；后者保存官方年度 expected open/close 与实际 validation。共享 schema 仍只有 `backend/alembic` 一套 migration owner，Hub ORM 必须与其保持一致。
+
+## 交易日历
+
+Future schedule 不能靠 eltdx 历史 K 线猜测。数据库中的 annual seed 负责官方未来休市安排；当前迁移内置 2025/2026 seed。对已经发生的日期，Hub 可调用 eltdx workday capability 写入 `actual_open`。官方预期与实际校验冲突时记录 `UNKNOWN`，Worker 不会退化成 Mon-Fri 猜测。
+
+每个新年度应根据上交所、深交所、北交所官方休市通知更新 seed/导入数据。若三所安排出现差异，应按 market 拆分，而不是强行归并。
 
 ## 出站代理
 

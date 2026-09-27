@@ -33,6 +33,13 @@ http://localhost:8080/api/v1
 
 行情数据中枢也返回 `success`、`data` 和 `error`。一般请求错误时 `data` 为 `null`；健康检查降级和部分同步失败会保留 `data`，分别返回依赖状态或逐项结果。后端请求校验错误还会带 `error.details`，其中只包含字段位置、错误类型和消息。
 
+## 当前 API 边界
+
+- 浏览器只访问 Nginx 暴露的 `/api/v1` 与 Next.js 页面；不会直接访问 `market-data-hub:8001`。
+- 证券/行情/指标/状态读取是共享公共数据；Watch、Settings、Alert、Notification 都要求当前用户认证并做 ownership 检查。
+- Hub 的同步与日历校验端点使用内部 token；读取端点依赖 Compose 私有网络隔离。
+- HTTP API 不提供“立即计算指标”的写接口；计算由后台 bootstrap/EOD 负责。
+
 ## 网关与健康检查
 
 | 方法 | 路径 | 说明 | 状态 |
@@ -102,23 +109,100 @@ http://localhost:8080/api/v1
 
 需要 `Authorization: Bearer <access_token>`，返回当前数据库中的激活用户。每次请求都会重新读取用户状态和角色；禁用用户不会因为 JWT 尚未过期而继续访问。
 
+## 证券与行情 API
+
+证券基础读取接口不要求用户登录，读取的是共享市场数据：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/securities/search?q=...` | 按代码/名称搜索已同步证券 |
+| `GET` | `/securities/{symbol}` | 读取证券元数据 |
+| `GET` | `/securities/{symbol}/quote` | 读取最新持久化 Quote |
+| `GET` | `/securities/{symbol}/daily-bars` | 读取日线；支持 `start_date`、`end_date`、`adjust_type` |
+| `GET` | `/securities/{symbol}/dividend-yield` | 返回 TTM 现金股息率及计算输入 |
+
+`daily-bars` 的 `adjust_type` 可使用 `qfq` 或 `none`。Dividend Yield 使用过去 12 个月已落库的每股现金分红总额除以当前价格；优先使用最新 Quote，缺少 Quote 时由后端使用可用的未复权收盘价 fallback，并在响应中返回 `price_source` 与 `as_of`。
+
+## Watch Table API
+
+以下接口都要求当前用户 Bearer access token；所有 ownership 检查在后端完成，不接受客户端提交 `user_id`：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` / `POST` | `/watch-tables` | 列出/创建监控表 |
+| `GET` / `DELETE` | `/watch-tables/{table_id}` | 读取聚合详情/删除监控表 |
+| `POST` / `DELETE` | `/watch-tables/{table_id}/stocks` / `.../stocks/{security_id}` | 添加/移除股票 |
+| `PUT` | `/watch-tables/{table_id}/stocks/reorder` | 持久化股票顺序 |
+| `GET` / `POST` | `/watch-tables/{table_id}/columns` | 列出/创建动态列 |
+| `PUT` | `/watch-tables/{table_id}/columns/reorder` | 持久化动态列顺序 |
+| `PUT` / `PATCH` / `DELETE` | `/columns/{column_id}` | 修改/删除动态列 |
+
+新增股票会 best-effort enqueue `bootstrap_security_data`，无需等待未来交易日即可准备历史日线、分红、指标和状态。相同股票可以出现在多个 Watch Table；共享市场/分析数据不会因从某个表移除而删除。
+
+动态指标列支持 `NUMBER`、`DELTA`、`COMPOSITE`、`STATUS`。`NUMBER/DELTA` 对多值指标必须通过 `parameters.field` 明确具体 scalar；`STATUS` 必须提交 `state_code`，并把该状态需要的参数一并持久化，例如：
+
+```json
+{
+  "column_type": "INDICATOR",
+  "indicator_type": "MA",
+  "state_code": "MA_CROSS_UP",
+  "view_mode": "STATUS",
+  "parameters": {"short_period": 20, "long_period": 60}
+}
+```
+
+Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、按 column id 键控的 `column_values` 和当前可见 states。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列。
+
+## Settings API
+
+`GET /settings` 与 `PUT /settings` 需要登录。当前实际消费的设置包括：
+
+- `adjust_type`：`qfq` 或 `none`，决定 Watch/详情默认读取的分析序列；不会修改已保存 AlertRule 的 adjustment。
+- `indicator_settings.defaults` / `indicator_settings.parameters`：影响之后新建监控表的默认指标列与参数，不追溯修改已有列。
+- `display_settings`：由前端工作台应用密度、状态、变化和 mini-chart 等展示偏好。
+- `notification_settings.feishu_webhook`：省略表示 KEEP；字符串表示 REPLACE；显式 `null` 表示 CLEAR。
+
+Settings 响应不会返回 Webhook 明文，只返回 `notification_settings.feishu_webhook_configured`。新写入的 Webhook 存在 `user_secrets` 加密表而不是设置 JSON。
+
 ## 指标与状态历史 API
 
-以下后端接口的指标计算、状态识别和持久化统一使用前复权 `qfq`：
+以下接口读取已经由 bootstrap/EOD/rebase 流程物化的分析结果：
 
 - `GET /securities/{symbol}/indicators`
 - `GET /securities/{symbol}/indicators/history`
 - `GET /securities/{symbol}/states`
 - `GET /securities/{symbol}/states/history`
 
-省略 `adjust` 时默认使用 `qfq`；显式传入 `adjust=none` 会返回 `400`，并使用稳定错误码
-`UNSUPPORTED_INDICATOR_ADJUSTMENT`（当前值）或 `UNSUPPORTED_HISTORY_ADJUSTMENT`（历史值）。
-其中两个 `history` GET 只读取已经持久化的快照/状态，不会因为查看历史而重算或写入数据库；
-当前值接口按既有服务语义刷新并持久化 qfq 结果。EOD pipeline 同样只接受 `qfq`，因此行情数据中枢
-仍可独立保存和读取 `none` 原始日线，但它不会进入指标或状态持久化计算，也不会覆盖已有的 qfq
-快照/状态。
+四个接口都使用查询参数 `adjust=qfq|none`（注意参数名是 `adjust`，不是 `adjust_type`），省略时默认 `qfq`。两种 adjustment 使用独立的 snapshot/state identity，不会互相覆盖。GET 接口只读持久化结果，不再隐式触发重算或数据库写入。指标/状态 history 还支持 `start`、`end`；指标 history 支持 `parameter_key`，状态 history 支持 `state_code` 与 `parameter_key`。
+
+指标历史 item 包含 `indicator_type`、`parameter_key`、`parameters`、`adjust_type`、`values`、`previous_values` 和 `delta`。状态历史 item 还包含 `state_code`、`parameter_key`、`parameters`、`adjust_type` 与 metadata。状态 history 支持按 `state_code` / `parameter_key` 精确筛选。
 
 ## 告警通知 API
+
+### `/alerts` 提醒规则
+
+接口为 `GET /alerts`、`POST /alerts`、`PUT /alerts/{alert_id}`、`DELETE /alerts/{alert_id}`，均要求当前用户认证。提醒规则支持 `STATE` 与 `VALUE` 两种 condition。所有规则固定记录创建时的 adjustment/参数 identity；修改用户默认设置不会改变已有规则语义。
+
+VALUE 规则必须最终解析到一个 scalar field，例如：
+
+```json
+{
+  "security_id": 1,
+  "condition_type": "VALUE",
+  "indicator": "MACD",
+  "parameters": {"fast_period": 12, "slow_period": 26, "signal_period": 9},
+  "field": "histogram",
+  "adjust_type": "qfq",
+  "operator": ">=",
+  "threshold": 1.5
+}
+```
+
+RSI / Projected MA 等单值指标可省略 `field`，服务端会规范化为 `value`；MA、KDJ、BOLL、MACD 等多值指标必须明确具体 field。`DIVIDEND_YIELD` 固定为 `field=value` 且 `adjust_type=none`。
+
+STATE 规则提交 `state_id`/`state_code` 与可选参数；MA 状态可指定 `short_period` / `long_period`。服务端会规范化参数并自行生成稳定 `parameter_key`，客户端不能把 hash 当作可信输入，因此不同周期组合可以并存。Alert response 会返回规范化后的 `parameters`、`parameter_key`、`field`、`adjust_type` 与 `needs_review`。
+
+Edge Trigger 只在 RESET → ACTIVE 时创建通知事件。状态切回 RESET 后再次进入 ACTIVE 才会重新触发。
 
 ### `GET /notifications`
 
@@ -227,18 +311,27 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 Authorization: Bearer <INTERNAL_API_TOKEN>
 ```
 
-请求体：
+请求支持两种互斥模式：
 
 ```json
-{
-  "symbols": ["600519", "000001"],
-  "start": "2026-09-01",
-  "end": "2026-09-24",
-  "adjustment": "none"
-}
+{"symbols":["600519","000001"],"start":"2026-09-24","end":"2026-09-24","adjustment":"qfq"}
 ```
 
-`symbols` 至少包含一个值；`start` 不得晚于 `end`。服务会规范化代码、调用 provider、校验返回记录并按证券隔离持久化失败。`data` 返回 `operation`、`total`、`succeeded`、`failed`、`ok` 和逐证券 `items`；部分失败时响应包的 `success` 为 `false`，错误码为 `PARTIAL_SYNC_FAILURE`。
+或 bootstrap count 模式：
+
+```json
+{"symbols":["600519"],"lookback_bars":400,"adjustment":"qfq"}
+```
+
+`symbols` 每批最多 100 个；`start/end` 与 `lookback_bars` 不能混用。正常 EOD 使用小范围 recent count，bootstrap 使用所需历史 bar 数。`data.items` 除 fetched/persisted/error 外还可返回 `history_rebased` 与 `changed_from`，表示 corporate-action revision 导致 qfq 历史需要重新物化。
+
+### `POST /internal/sync/quotes` / `POST /internal/sync/dividends`
+
+两者都使用内部 token，接收 `{"symbols":[...]}`。Quote 使用 provider 原生批量快照；Dividend 使用有界并发并逐证券返回同步结果。Hub 同时保留 `/internal/sync/quote` 与 `/internal/sync/dividend` 单数别名用于兼容，Backend 使用复数规范路径。
+
+### `POST /internal/calendar/validate`
+
+内部 token 保护。请求 `{"trade_date":"YYYY-MM-DD"}`，使用 eltdx workday 数据校验已经发生的真实交易日，并与数据库中的官方年度预期日历合并。若 official expected 与 actual validation 冲突，状态为 `UNKNOWN`，EOD fail closed。
 
 ### `POST /internal/sync/securities`
 
@@ -252,4 +345,4 @@ token 返回 `503`。
 
 - `/api/v1` 是后端当前实际挂载的 API 路径；行情数据中枢不使用该前缀。
 - 通知历史和失败/遗留投递恢复端点见“告警通知 API”；告警规则由 `/alerts` 端点管理。
-- 行情读取只读持久化结果；报价写入由 provider/repository 边界提供，但当前没有公开的报价同步 HTTP 路由。
+- 行情读取只读持久化结果；Quote/Daily/Dividend 写入都通过受内部 token 保护的同步端点触发。
