@@ -26,6 +26,7 @@ from app.models import (
     Notification,
     Security,
     User,
+    UserSecret,
     UserSetting,
     UserStatus,
 )
@@ -244,9 +245,9 @@ async def test_value_edge_trigger_survives_service_restart_and_reset(alert_conte
         snapshot.previous_values = {"value": 60.0}
         snapshot.delta = {"value": 12.0}
         await session.commit()
-        reentered = await AlertService(
-            session, notification_provider=provider
-        ).evaluate_user(user.id)
+        reentered = await AlertService(session, notification_provider=provider).evaluate_user(
+            user.id
+        )
         assert reentered[0].triggered is True
         assert provider.calls == 2
         instance = (await session.execute(select(AlertInstance))).scalar_one()
@@ -850,13 +851,16 @@ async def test_settings_mask_and_clear_webhook(alert_context) -> None:
         service = UserSettingsService(session)
         updated = await service.update(
             user.id,
-            {"notification_settings": {"feishu_webhook": "https://example.test/hook/secret"}},
+            {
+                "notification_settings": {
+                    "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/secret"
+                }
+            },
         )
         assert "secret" not in str(updated.settings)
         assert updated.settings["notification_settings"]["feishu_webhook_configured"] is True
-        cleared = await service.update(
-            user.id, {"notification_settings": {"feishu_webhook": None}}
-        )
+        cleared = await service.update(user.id, {"notification_settings": {"feishu_webhook": None}})
         assert cleared.settings["notification_settings"]["feishu_webhook_configured"] is False
         stored = (await session.execute(select(UserSetting))).scalar_one()
-        assert stored.settings["notification_settings"]["feishu_webhook"] is None
+        assert "feishu_webhook" not in stored.settings.get("notification_settings", {})
+        assert (await session.execute(select(UserSecret))).scalar_one_or_none() is None
