@@ -46,6 +46,7 @@
 - 新 Webhook 只接受 HTTPS，并默认 allowlist `open.feishu.cn` / `open.larksuite.com` 的 `/open-apis/bot/v2/hook/<token>` 路径；拒绝 userinfo、query、fragment 和非 443 显式端口，避免把通知出口变成任意 SSRF。
 - Webhook 使用 AES-GCM 存入 `user_secrets`，AAD 绑定 user/secret type，数据库不再把新 token 明文写进 `user_settings.settings`。
 - `python -m app.cli migrate-user-secrets` 可把遗留 JSON 明文迁移到加密表；迁移前 NotificationService 保留只读 legacy fallback，迁移完成后应审计并清除所有旧值。
+- 迁移后运行 `python -m app.cli audit-user-secrets`；只有输出 `legacy_plaintext=0` 且 `release_b_ready=yes` 时，才把 `LEGACY_WEBHOOK_FALLBACK_ENABLED=false` 部署到 Backend/Worker，进入 Release B。审计只输出计数，不输出 URL/token。
 - `APP_SECRETS_KEY_VERSION` 用于记录密钥版本；轮换时先部署可读取旧/新版本的代码，再重加密数据，不能直接替换 key 导致历史 ciphertext 无法解密。
 
 ## 内部行情接口

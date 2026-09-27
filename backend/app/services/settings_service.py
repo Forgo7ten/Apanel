@@ -30,9 +30,12 @@ class UserSettingsService:
     async def get(self, user_id: int) -> UserSettingsData:
         setting = await self.repository.get_for_user(user_id)
         settings = _public_settings(setting.settings if setting is not None else {})
+        legacy_configured = (
+            get_settings().legacy_webhook_fallback_enabled
+            and _legacy_webhook(setting.settings if setting is not None else {}) is not None
+        )
         settings.setdefault("notification_settings", {})["feishu_webhook_configured"] = (
-            await self.secret_service.configured(user_id)
-            or _legacy_webhook(setting.settings if setting is not None else {}) is not None
+            await self.secret_service.configured(user_id) or legacy_configured
         )
         return UserSettingsData(
             settings=settings,

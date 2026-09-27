@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import get_settings
 from app.core.errors import ApiError
 from app.models import Notification, NotificationChannel, NotificationStatus, UserSetting
 from app.providers.notification import (
@@ -449,6 +450,8 @@ class NotificationService:
         encrypted = await UserSecretService(self.session).get_feishu_webhook(user_id)
         if encrypted:
             return encrypted
+        if not get_settings().legacy_webhook_fallback_enabled:
+            return None
         # Release-A compatibility only: read a legacy plaintext value until
         # the migration CLI has removed every such JSON key.
         setting = (
