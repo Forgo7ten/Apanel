@@ -52,8 +52,9 @@ declare module "@/lib/watch-contract.mjs" {
     stateGap: number;
     verticalPadding: number;
   }>;
-  export function watchRowLayoutContract(fieldCount?: number): {
+  export function watchRowLayoutContract(fieldCount?: number, density?: "compact" | "comfortable"): {
     rowHeight: number;
+    density: "compact" | "comfortable";
     contentHeight: number;
     fieldCount: number;
     effectiveFieldCount: number;
