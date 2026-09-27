@@ -14,6 +14,7 @@ import {
   dialogFocusTargetIndex,
   isCurrentWatchDetail,
   virtualScrollTopForKey,
+  WATCH_DETAIL_REFRESH_INTERVAL_MS,
   watchRowLayoutContract,
   watchDetailViewState,
 } from "../src/lib/watch-contract.mjs";
@@ -116,6 +117,13 @@ test("column order payload only contains persisted dynamic column ids", () => {
     column_ids: [14, 7],
   });
   assert.deepEqual(toColumnOrderPayload(["security", "price", "states"]), { column_ids: [] });
+});
+
+test("watch detail polling interval is five minutes", () => {
+  assert.equal(WATCH_DETAIL_REFRESH_INTERVAL_MS, 300_000);
+  const source = readFileSync(new URL("../src/app/(workspace)/watch/page.tsx", import.meta.url), "utf8");
+  assert.match(source, /refetchInterval: WATCH_DETAIL_REFRESH_INTERVAL_MS/);
+  assert.match(source, /refetchIntervalInBackground: false/);
 });
 
 test("watch detail keeps stale data during refresh and separates initial errors", () => {

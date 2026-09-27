@@ -17,6 +17,7 @@ declare module "@/lib/watch-contract.mjs" {
     view_mode: "NUMBER" | "DELTA" | "STATUS" | "COMPOSITE";
   };
   export function toColumnOrderPayload(columnOrder: unknown): { column_ids: number[] };
+  export const WATCH_DETAIL_REFRESH_INTERVAL_MS: number;
   export function watchDetailViewState(input?: {
     isPending?: boolean;
     isFetching?: boolean;

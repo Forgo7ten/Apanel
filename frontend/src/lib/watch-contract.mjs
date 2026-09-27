@@ -96,6 +96,8 @@ export function toColumnOrderPayload(columnOrder) {
   return { column_ids: columnIds };
 }
 
+export const WATCH_DETAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
 /**
  * Keep stale detail data visible while a background request is in flight.
  * The UI uses these states to distinguish the first load from a refresh and
