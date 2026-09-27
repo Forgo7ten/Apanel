@@ -1,6 +1,6 @@
 # 指标与状态
 
-指标和状态代码位于 `backend/app/indicators` 与 `backend/app/states`。它们是纯 Python 计算边界，当前没有对应的 HTTP API，也没有直接写入数据库；应用服务可以在取得日线后调用它们，再决定如何保存或展示结果。
+指标和状态的纯计算代码位于 `backend/app/indicators` 与 `backend/app/states`；持久化和 API 编排位于 `IndicatorService`、`StateService`。计算内核不依赖 ORM，但服务层会把结果写入 `indicator_snapshots` / `indicator_states`，并通过证券指标/状态 API 与 Watch 工作台读取。
 
 ## 指标输入
 
@@ -57,7 +57,9 @@
 }
 ```
 
-`IndicatorRegistry` 通过名称解析实现，不需要在 dispatch 代码中添加分支。自定义指标只需提供非空 `name` 和 `calculate(series, **parameters)`，并返回 `IndicatorResult`；注册表会再次执行结果合同校验。
+`IndicatorRegistry` 通过名称解析实现，不需要在 dispatch 代码中添加分支。内置指标同时实现 `calculate_series()`，历史重建时按单次线性扫描计算整段序列，避免逐日重复计算前缀。自定义指标仍可只实现 `calculate(series, **parameters)`；注册表会保留兼容 fallback 并执行结果合同校验。
+
+持久化按 `qfq` / `none` 分开保存，同一指标类型的多个参数 variant 共用一条交易日 snapshot，通过稳定 `parameter_key` 区分。读取 API 不再隐式重算；数据生成由 bootstrap/EOD/rebase 流程负责。
 
 ## 状态输入与引擎
 
@@ -71,7 +73,7 @@
 - `reason`：缺少上一快照、指标不匹配或输入无效时的安全原因。
 - `values`、状态 code、level、metadata：供 UI/提醒层复用。
 
-状态需要上一快照才能确认变化；缺少上一快照时返回非激活且不产生 transition。引擎可按 `stream_id`、`security_id` 或 `symbol` 保留进程内的上一次 active 值，也可以由调用方传入 `previous_active`。进程内历史不是持久化；重启后若要保持提醒语义，调用方必须保存状态。
+状态需要上一快照才能确认变化；缺少上一快照时返回非激活且不产生 transition。生产路径由 `StateService` 从数据库读取上一日状态并传入 `previous_active`，因此重启不会丢失 Edge 语义。状态记录包含 adjustment 与 parameter identity；例如不同 MA 周期组合可同时存在而不会互相覆盖。
 
 ## 内置状态
 
@@ -100,6 +102,18 @@
 
 BOLL 突破状态还需要当前和上一交易日价格；缺少价格时返回 `missing_price`，不会产生提醒。比较使用默认 `tolerance=1e-9`，可在构造 `StateEngine` 或调用时覆盖。
 
+## 计算需求与持久化边界
+
+实际计算需求不是一套全局固定参数，而是 Watch Table 列、enabled VALUE Alert 和 enabled STATE Alert 的并集。新增自定义 RSI/BOLL/MACD 参数或 MA state 周期组合后，bootstrap/EOD 会把对应 variant 纳入计算；`parameter_key` 用于稳定区分同一 indicator type 的多个参数组合。
+
+内置指标使用 `calculate_series()` 线性遍历历史序列；StateService 直接消费已物化 snapshot，不再重复触发 IndicatorService 全历史重算。GET `/indicators*` 与 `/states*` 都是只读读取，缺数据应由后台 bootstrap/EOD 修复，而不是由 HTTP GET 隐式写库。
+
+## Watch / Alert 对同一状态的引用
+
+`STATUS` 列和 STATE Alert 都不会只按“指标类型”模糊匹配。两者都持久化明确的 `state_code` 与参数集合，服务端再生成/使用稳定的 `parameter_key`。例如 `MA5/10` 与 `MA20/60` 的 `MA_CROSS_UP` 是两个独立 state instance，可以同时展示、查询和监听。
+
+Frontend 从指标/状态详情创建 Alert 时会把当前状态的参数与 `adjust_type` 一并带入；已有规则不会因为用户后来修改全局 indicator defaults 或 adjustment 设置而漂移。
+
 ## 与产品层的关系
 
-状态定义是 UI 和提醒层共用的领域对象，避免两处重复判断。但当前仓库还没有把日线、指标结果、状态引擎和前端监控表串成完整业务流程；调用方需要自行提供快照历史和持久化策略。
+Watch 表格、指标详情和提醒共用同一套持久化快照/状态。用户选择的 qfq/none 只决定当前工作台读取哪条分析序列；已有提醒规则把 adjustment、参数和具体 scalar field 固化在规则上，不会随着用户后续修改默认设置而漂移。

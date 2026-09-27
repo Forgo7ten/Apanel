@@ -53,6 +53,9 @@ export function buildAlertPayload(form) {
       throw new Error("请选择状态条件。");
     }
     payload.state_id = form.state_id.trim();
+    if (form.parameters && typeof form.parameters === "object" && Object.keys(form.parameters).length > 0) {
+      payload.parameters = { ...form.parameters };
+    }
     payload.adjust_type = form.adjust_type === "none" ? "none" : "qfq";
     return payload;
   }

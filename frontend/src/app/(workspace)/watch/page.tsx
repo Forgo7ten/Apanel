@@ -85,10 +85,14 @@ export default function WatchPage() {
     const securityId = stock.security_id ?? stock.security?.security_id ?? stock.security?.id;
     if (securityId === undefined) return;
     if (selection.kind === "state") {
+      const stateParameters = Object.fromEntries(
+        Object.entries(selection.state.parameters ?? {}).filter(([, value]) => typeof value === "number"),
+      ) as Record<string, number>;
       setAlertDraft({
         security: { id: securityId, security_id: securityId, symbol: stock.symbol, name: stock.name ?? stock.symbol, market: stock.market ?? "" },
         condition_type: "STATE",
         state_id: selection.state.state_code ?? selection.state.state_id,
+        parameters: stateParameters,
         adjust_type: selection.state.adjust_type === "none" ? "none" : "qfq",
       });
       return;

@@ -81,7 +81,10 @@ export function AlertWizard({
   const initialIndicator = initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator ?? "RSI";
   const [parameters, setParameters] = useState<Record<string, number>>(() => ({
     ...getDefaultIndicatorParameters(initialIndicator),
-    ...((initialRule?.parameters ?? initialDraft?.parameters ?? {}) as Record<string, number>),
+    ...((initialRule?.condition_type?.toUpperCase() === "VALUE" ? initialRule.parameters : initialDraft?.condition_type === "VALUE" ? initialDraft.parameters : {}) as Record<string, number>),
+  }));
+  const [stateParameters, setStateParameters] = useState<Record<string, number>>(() => ({
+    ...((initialRule?.condition_type?.toUpperCase() === "STATE" ? initialRule.parameters : initialDraft?.condition_type === "STATE" ? initialDraft.parameters : {}) as Record<string, number>),
   }));
   const [field, setField] = useState(initialRule?.field ?? initialDraft?.field ?? "");
   const [adjustType, setAdjustType] = useState<"qfq" | "none">(
@@ -133,7 +136,7 @@ export function AlertWizard({
         indicator,
         operator,
         threshold,
-        parameters,
+        parameters: conditionType === "STATE" ? stateParameters : parameters,
         field,
         adjust_type: adjustType,
       });
@@ -231,7 +234,7 @@ export function AlertWizard({
             {conditionType === "STATE" ? (
               <div className="space-y-3">
                 <label htmlFor="alert-state" className="text-xs font-medium text-secondary">状态
-                  <select id="alert-state" value={stateId} onChange={(event) => setStateId(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30">
+                  <select id="alert-state" value={stateId} onChange={(event) => { setStateId(event.target.value); setStateParameters({}); }} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30">
                     {ALERT_STATE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.title} · {option.id}</option>)}
                   </select>
                 </label>
@@ -241,7 +244,12 @@ export function AlertWizard({
                   </select>
                 </label>
                 {selectedState ? <div><StateTag tone={stateToneFromLevel(selectedState.level)}>{selectedState.title}</StateTag></div> : null}
-                <p className="text-[11px] leading-5 text-muted">状态由后端按参数和复权口径识别；已有规则不会随全局默认设置改变。</p>
+                {Object.keys(stateParameters).length > 0 ? (
+                  <p className="rounded-panel border border-line bg-card px-3 py-2 font-mono text-[11px] text-muted">
+                    参数：{Object.entries(stateParameters).map(([key, value]) => `${key}=${value}`).join(" · ")}
+                  </p>
+                ) : null}
+                <p className="text-[11px] leading-5 text-muted">状态由后端按参数和复权口径识别；从详情创建时会保留该状态的精确参数，手工选择状态则使用服务端默认参数。</p>
               </div>
             ) : (
               <div className="space-y-4">

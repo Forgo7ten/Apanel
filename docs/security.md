@@ -6,9 +6,20 @@
 
 - 根目录 `.env` 被 `.gitignore` 忽略；只提交 `.env.example` 模板。
 - `POSTGRES_PASSWORD` 会拼接到数据库 URL，应使用 URL-safe 字符，避免连接 URL 解析错误。
-- `JWT_SECRET_KEY`、`INTERNAL_API_TOKEN` 和生产数据库密码必须是每个环境独立生成的随机值。
+- `JWT_SECRET_KEY`、`INTERNAL_API_TOKEN`、`APP_SECRETS_KEY` 和生产数据库密码必须是每个环境独立生成的随机值。
 - 不要把 `INTERNAL_API_TOKEN` 传给前端；Compose 只将它注入后端内部服务（包括行情服务和一次性的 `security-bootstrap`），不会注入 frontend 或暴露给浏览器。
-- `APP_ENV=production` 时，后端拒绝已知默认数据库密码、已知默认或少于 32 字节的 JWT secret，并拒绝显式的 `REFRESH_COOKIE_SECURE=false`。行情服务要求配置内部 token。
+- `APP_ENV=production` 时，Backend API 还要求 `APP_SECRETS_KEY`，用于应用层加密用户 Webhook；worker 同样需要该 key 才能解密发送。Compose 不把该 key 注入 scheduler、frontend、Hub 或 security-bootstrap。
+
+## 进程最小权限
+
+不同容器只获得自己需要的 secret：
+
+- `frontend` 不接收 JWT signing secret、内部行情 token 或用户 secret master key。
+- `market-data-hub` 需要 `INTERNAL_API_TOKEN`，但不需要 `APP_SECRETS_KEY`。
+- `backend` 需要 JWT 与 `APP_SECRETS_KEY`；`worker` 需要内部行情 token 与 `APP_SECRETS_KEY` 才能完成 bootstrap/通知。
+- `scheduler` 只负责 Beat 调度，不需要解密用户 Webhook。
+
+这也是配置校验按进程拆分的原因：migration/Beat 不应仅因为缺少与其职责无关的 JWT 或用户 secret 而无法启动。
 
 ## 用户密码与邀请
 
@@ -28,9 +39,18 @@
 - `/auth/me` 每次从数据库读取当前激活用户；管理员权限由数据库中的 `role` 检查，不信任 JWT 中的角色字段。
 - 创建邀请需要激活的管理员；注册、登录和刷新不接受客户端提供的 `user_id` 作为权限依据。
 
+## 飞书 Webhook 与用户密钥
+
+- 设置 API 不回传 Webhook 明文，只返回 `feishu_webhook_configured`。
+- 空输入表示“保持”；只有显式 `null`/清除动作才删除已保存 Webhook。
+- 新 Webhook 只接受 HTTPS，并默认 allowlist `open.feishu.cn` / `open.larksuite.com` 的 `/open-apis/bot/v2/hook/<token>` 路径；拒绝 userinfo、query、fragment 和非 443 显式端口，避免把通知出口变成任意 SSRF。
+- Webhook 使用 AES-GCM 存入 `user_secrets`，AAD 绑定 user/secret type，数据库不再把新 token 明文写进 `user_settings.settings`。
+- `python -m app.cli migrate-user-secrets` 可把遗留 JSON 明文迁移到加密表；迁移前 NotificationService 保留只读 legacy fallback，迁移完成后应审计并清除所有旧值。
+- `APP_SECRETS_KEY_VERSION` 用于记录密钥版本；轮换时先部署可读取旧/新版本的代码，再重加密数据，不能直接替换 key 导致历史 ciphertext 无法解密。
+
 ## 内部行情接口
 
-- `/internal/sync/daily` 和 `/internal/sync/securities` 必须提供 `X-Internal-Token`，或使用 Bearer 形式提供相同 token。
+- `/internal/sync/daily`、`/internal/sync/quotes`、`/internal/sync/dividends`、`/internal/sync/securities` 和 `/internal/calendar/validate` 必须提供 `X-Internal-Token`，或使用 Bearer 形式提供相同 token。
 - token 比较使用常量时间比较函数；缺少 token、错误 token 和未配置 token 分别映射为稳定错误。
 - Compose 的 `security-bootstrap` 只在行情服务健康后运行一次，使用同一个 `INTERNAL_API_TOKEN` 同步证券主数据；它是内部一次性任务，不对外发布端口，也不把 token 传给 frontend。
 - Compose 不发布行情服务 `8001`，Nginx 也不代理 `/internal`，降低外部直接访问面。

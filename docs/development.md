@@ -85,6 +85,34 @@ docker compose exec backend alembic upgrade head
 
 迁移使用容器内的 `DATABASE_URL`，不要把 `alembic.ini` 中的占位 URL 当作真实连接地址。新增迁移时在 `backend` 目录执行 Alembic 命令，并确保模型元数据和迁移脚本同步。
 
+## CI
+
+`.github/workflows/ci.yml` 在 push 到 `main` 和 pull request 时运行四个 job：
+
+- Backend：Python 3.12、PostgreSQL 16、pytest、Ruff、`alembic upgrade head`。
+- Market Data Hub：Python 3.12、pytest、Ruff。
+- Frontend：Node 20、`npm test`、lint、typecheck、production build。
+- Compose：使用测试凭据执行 `docker compose config -q`。
+
+CI 不访问真实行情 provider；真实 eltdx/AKShare smoke test 应放在 staging/manual gate，避免把第三方网络可用性当成代码单元测试。
+
+## 提交前建议检查
+
+```bash
+# 根目录
+git diff --check
+docker compose config -q
+
+# 确认 Alembic 只有一个 head
+cd backend && alembic heads
+```
+
+涉及 schema 的变更还应在 PostgreSQL 上执行 `alembic upgrade head`；涉及 Hub shared ORM 的变更必须同时更新/验证 Backend migration owner 与 Hub persistence contract。
+
+## 文档维护
+
+`README.md` 与 `docs/` 描述当前可运行实现，应随代码一起更新并进入版本控制。`plan_docs/` 是需求/设计来源与历史规划材料，不应把其中旧的 `market-data-service`、Provider 或 Sprint 状态直接当作当前运行事实；实现状态以当前代码、migration、Compose 和 `docs/` 为准。若产品约束发生变化，应先更新正式 PRD/设计来源，再同步运行文档。
+
 ## 修改边界
 
 - HTTP controller 只做解析、依赖注入和响应映射；业务规则放在 service/domain 层。
@@ -96,7 +124,7 @@ docker compose exec backend alembic upgrade head
 ## 测试目录
 
 ```text
-backend/tests/                    认证、健康、指标和状态
-market-data-hub/tests/        provider、domain、同步、持久化和 API
-frontend/tests/                   健康路由、认证逻辑和跨标签页协调
+backend/tests/                 认证、Watch、指标/状态、Alert/Notification、Settings、任务与迁移契约
+market-data-hub/tests/         Provider、domain、批量同步、持久化、日历和内部 API
+frontend/tests/                认证协调、Watch/详情、Alert、Settings、Notification 与浏览器契约
 ```
