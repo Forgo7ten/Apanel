@@ -99,9 +99,7 @@ class SecurityRepository:
             )
         ).scalar_one_or_none()
 
-    async def latest_quotes_batch(
-        self, security_ids: Iterable[int]
-    ) -> dict[int, QuoteSnapshot]:
+    async def latest_quotes_batch(self, security_ids: Iterable[int]) -> dict[int, QuoteSnapshot]:
         """Return one newest quote per requested security in one query."""
 
         ids = _unique_ids(security_ids)
@@ -150,9 +148,7 @@ class SecurityRepository:
             )
         ).scalar_one_or_none()
 
-    async def latest_daily_bars_batch(
-        self, security_ids: Iterable[int]
-    ) -> dict[int, DailyBar]:
+    async def latest_daily_bars_batch(self, security_ids: Iterable[int]) -> dict[int, DailyBar]:
         """Return one newest close per requested security in one query."""
 
         ids = _unique_ids(security_ids)
@@ -281,11 +277,16 @@ class SecurityRepository:
         statement = statement.order_by(DailyBar.trade_date.asc(), DailyBar.id.asc())
         return list((await self.session.execute(statement)).scalars())
 
-    async def latest_indicators(self, security_id: int) -> list[IndicatorSnapshot]:
+    async def latest_indicators(
+        self, security_id: int, *, adjustment: str = "qfq"
+    ) -> list[IndicatorSnapshot]:
         latest_date = (
             await self.session.execute(
                 select(IndicatorSnapshot.trade_date)
-                .where(IndicatorSnapshot.security_id == security_id)
+                .where(
+                    IndicatorSnapshot.security_id == security_id,
+                    IndicatorSnapshot.adjust_type == adjustment,
+                )
                 .order_by(IndicatorSnapshot.trade_date.desc())
                 .limit(1)
             )
@@ -299,6 +300,7 @@ class SecurityRepository:
                     .where(
                         IndicatorSnapshot.security_id == security_id,
                         IndicatorSnapshot.trade_date == latest_date,
+                        IndicatorSnapshot.adjust_type == adjustment,
                     )
                     .order_by(IndicatorSnapshot.indicator_type.asc())
                 )
@@ -306,7 +308,7 @@ class SecurityRepository:
         )
 
     async def latest_indicators_batch(
-        self, security_ids: Iterable[int]
+        self, security_ids: Iterable[int], *, adjustment: str = "qfq"
     ) -> dict[int, list[IndicatorSnapshot]]:
         """Return all snapshots from each requested security's newest date."""
 
@@ -319,7 +321,10 @@ class SecurityRepository:
                 IndicatorSnapshot.security_id,
                 func.max(IndicatorSnapshot.trade_date).label("latest_date"),
             )
-            .where(IndicatorSnapshot.security_id.in_(ids))
+            .where(
+                IndicatorSnapshot.security_id.in_(ids),
+                IndicatorSnapshot.adjust_type == adjustment,
+            )
             .group_by(IndicatorSnapshot.security_id)
             .subquery()
         )
@@ -331,6 +336,7 @@ class SecurityRepository:
                     and_(
                         IndicatorSnapshot.security_id == latest_dates.c.security_id,
                         IndicatorSnapshot.trade_date == latest_dates.c.latest_date,
+                        IndicatorSnapshot.adjust_type == adjustment,
                     ),
                 )
                 .order_by(
@@ -344,11 +350,16 @@ class SecurityRepository:
             result[row.security_id].append(row)
         return result
 
-    async def current_states(self, security_id: int) -> list[IndicatorState]:
+    async def current_states(
+        self, security_id: int, *, adjustment: str = "qfq"
+    ) -> list[IndicatorState]:
         latest_date = (
             await self.session.execute(
                 select(IndicatorState.trade_date)
-                .where(IndicatorState.security_id == security_id)
+                .where(
+                    IndicatorState.security_id == security_id,
+                    IndicatorState.adjust_type == adjustment,
+                )
                 .order_by(IndicatorState.trade_date.desc())
                 .limit(1)
             )
@@ -363,6 +374,7 @@ class SecurityRepository:
                         IndicatorState.security_id == security_id,
                         IndicatorState.trade_date == latest_date,
                         IndicatorState.status == "ACTIVE",
+                        IndicatorState.adjust_type == adjustment,
                     )
                     .order_by(IndicatorState.id.asc())
                 )
@@ -370,7 +382,7 @@ class SecurityRepository:
         )
 
     async def current_states_batch(
-        self, security_ids: Iterable[int]
+        self, security_ids: Iterable[int], *, adjustment: str = "qfq"
     ) -> dict[int, list[IndicatorState]]:
         """Return active states from each requested security's newest date."""
 
@@ -383,7 +395,10 @@ class SecurityRepository:
                 IndicatorState.security_id,
                 func.max(IndicatorState.trade_date).label("latest_date"),
             )
-            .where(IndicatorState.security_id.in_(ids))
+            .where(
+                IndicatorState.security_id.in_(ids),
+                IndicatorState.adjust_type == adjustment,
+            )
             .group_by(IndicatorState.security_id)
             .subquery()
         )
@@ -397,7 +412,10 @@ class SecurityRepository:
                         IndicatorState.trade_date == latest_dates.c.latest_date,
                     ),
                 )
-                .where(IndicatorState.status == "ACTIVE")
+                .where(
+                    IndicatorState.status == "ACTIVE",
+                    IndicatorState.adjust_type == adjustment,
+                )
                 .order_by(IndicatorState.security_id.asc(), IndicatorState.id.asc())
             )
         ).scalars()

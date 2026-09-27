@@ -56,6 +56,7 @@ class IndicatorStateRepository:
         security_id: int,
         trade_date: date,
         indicator_type: str,
+        adjust_type: str = "qfq",
         parameters: dict[str, Any],
         values: dict[str, Any],
         previous_values: dict[str, Any] | None,
@@ -65,6 +66,7 @@ class IndicatorStateRepository:
             "security_id": security_id,
             "trade_date": trade_date,
             "indicator_type": indicator_type,
+            "adjust_type": adjust_type,
             "parameters": parameters,
             "values": values,
             "previous_values": previous_values,
@@ -73,7 +75,7 @@ class IndicatorStateRepository:
         await self._upsert(
             IndicatorSnapshot,
             payload,
-            conflict_columns=("security_id", "trade_date", "indicator_type"),
+            conflict_columns=("security_id", "trade_date", "indicator_type", "adjust_type"),
             update_columns=("parameters", "values", "previous_values", "delta"),
         )
         return (
@@ -82,6 +84,7 @@ class IndicatorStateRepository:
                     IndicatorSnapshot.security_id == security_id,
                     IndicatorSnapshot.trade_date == trade_date,
                     IndicatorSnapshot.indicator_type == indicator_type,
+                    IndicatorSnapshot.adjust_type == adjust_type,
                 )
             )
         ).scalar_one()
@@ -91,6 +94,7 @@ class IndicatorStateRepository:
         security_id: int,
         *,
         indicator_type: str | None = None,
+        adjustment: str | None = None,
         start: date | None = None,
         end: date | None = None,
     ) -> list[IndicatorSnapshot]:
@@ -99,6 +103,8 @@ class IndicatorStateRepository:
         )
         if indicator_type is not None:
             statement = statement.where(IndicatorSnapshot.indicator_type == indicator_type)
+        if adjustment is not None:
+            statement = statement.where(IndicatorSnapshot.adjust_type == adjustment)
         if start is not None:
             statement = statement.where(IndicatorSnapshot.trade_date >= start)
         if end is not None:
@@ -108,11 +114,14 @@ class IndicatorStateRepository:
         )
         return list((await self.session.execute(statement)).scalars())
 
-    async def latest_snapshots(self, security_id: int) -> list[IndicatorSnapshot]:
+    async def latest_snapshots(
+        self, security_id: int, *, adjustment: str | None = None
+    ) -> list[IndicatorSnapshot]:
         latest_date = (
             await self.session.execute(
                 select(func.max(IndicatorSnapshot.trade_date)).where(
-                    IndicatorSnapshot.security_id == security_id
+                    IndicatorSnapshot.security_id == security_id,
+                    *(() if adjustment is None else (IndicatorSnapshot.adjust_type == adjustment,)),
                 )
             )
         ).scalar_one_or_none()
@@ -125,6 +134,11 @@ class IndicatorStateRepository:
                     .where(
                         IndicatorSnapshot.security_id == security_id,
                         IndicatorSnapshot.trade_date == latest_date,
+                        *(
+                            ()
+                            if adjustment is None
+                            else (IndicatorSnapshot.adjust_type == adjustment,)
+                        ),
                     )
                     .order_by(IndicatorSnapshot.indicator_type.asc())
                 )
@@ -186,6 +200,9 @@ class IndicatorStateRepository:
         indicator_type: str,
         status: str,
         metadata: dict[str, Any],
+        parameters: dict[str, Any] | None = None,
+        parameter_key: str = "default",
+        adjust_type: str = "qfq",
     ) -> IndicatorState:
         payload = {
             "security_id": security_id,
@@ -194,12 +211,21 @@ class IndicatorStateRepository:
             "indicator_type": indicator_type,
             "status": status,
             "metadata": metadata,
+            "parameters": dict(parameters or {}),
+            "parameter_key": parameter_key,
+            "adjust_type": adjust_type,
         }
         await self._upsert(
             IndicatorState,
             payload,
-            conflict_columns=("security_id", "trade_date", "state_code"),
-            update_columns=("indicator_type", "status", "metadata"),
+            conflict_columns=(
+                "security_id",
+                "trade_date",
+                "state_code",
+                "parameter_key",
+                "adjust_type",
+            ),
+            update_columns=("indicator_type", "status", "metadata", "parameters"),
         )
         return (
             await self.session.execute(
@@ -207,6 +233,8 @@ class IndicatorStateRepository:
                     IndicatorState.security_id == security_id,
                     IndicatorState.trade_date == trade_date,
                     IndicatorState.state_code == state_code,
+                    IndicatorState.parameter_key == parameter_key,
+                    IndicatorState.adjust_type == adjust_type,
                 )
             )
         ).scalar_one()
@@ -218,6 +246,9 @@ class IndicatorStateRepository:
         start: date | None = None,
         end: date | None = None,
         active_only: bool = False,
+        adjustment: str | None = None,
+        state_code: str | None = None,
+        parameter_key: str | None = None,
     ) -> list[IndicatorState]:
         statement: Select[tuple[IndicatorState]] = select(IndicatorState).where(
             IndicatorState.security_id == security_id
@@ -228,14 +259,23 @@ class IndicatorStateRepository:
             statement = statement.where(IndicatorState.trade_date <= end)
         if active_only:
             statement = statement.where(IndicatorState.status == "ACTIVE")
+        if adjustment is not None:
+            statement = statement.where(IndicatorState.adjust_type == adjustment)
+        if state_code is not None:
+            statement = statement.where(IndicatorState.state_code == state_code)
+        if parameter_key is not None:
+            statement = statement.where(IndicatorState.parameter_key == parameter_key)
         statement = statement.order_by(IndicatorState.trade_date.asc(), IndicatorState.id.asc())
         return list((await self.session.execute(statement)).scalars())
 
-    async def latest_state_date(self, security_id: int) -> date | None:
+    async def latest_state_date(
+        self, security_id: int, *, adjustment: str | None = None
+    ) -> date | None:
         return (
             await self.session.execute(
                 select(func.max(IndicatorState.trade_date)).where(
-                    IndicatorState.security_id == security_id
+                    IndicatorState.security_id == security_id,
+                    *(() if adjustment is None else (IndicatorState.adjust_type == adjustment,)),
                 )
             )
         ).scalar_one_or_none()
@@ -245,6 +285,9 @@ class IndicatorStateRepository:
         security_id: int,
         state_code: str,
         trade_date: date,
+        *,
+        parameter_key: str = "default",
+        adjustment: str = "qfq",
     ) -> IndicatorState | None:
         return (
             await self.session.execute(
@@ -252,6 +295,8 @@ class IndicatorStateRepository:
                 .where(
                     IndicatorState.security_id == security_id,
                     IndicatorState.state_code == state_code,
+                    IndicatorState.parameter_key == parameter_key,
+                    IndicatorState.adjust_type == adjustment,
                     IndicatorState.trade_date < trade_date,
                 )
                 .order_by(IndicatorState.trade_date.desc())

@@ -87,6 +87,15 @@ class Settings(BaseSettings):
         description="Shared secret for backend-to-market-data internal writes.",
     )
     market_data_request_timeout_seconds: float = Field(default=10.0, gt=0)
+    market_data_sync_batch_size: int = Field(default=50, gt=0, le=100)
+    market_data_quote_timeout_seconds: float = Field(default=15.0, gt=0)
+    market_data_daily_timeout_seconds: float = Field(default=60.0, gt=0)
+    market_data_bootstrap_timeout_seconds: float = Field(default=120.0, gt=0)
+    analysis_bootstrap_min_bars: int = Field(default=400, gt=0, le=10000)
+    enable_none_analysis: bool = True
+    feishu_webhook_allowed_hosts: str = "open.feishu.cn,open.larksuite.com"
+    app_secrets_key: str | None = None
+    app_secrets_key_version: str = "v1"
     quote_refresh_interval_minutes: int = Field(
         default=5,
         ge=5,
@@ -185,6 +194,12 @@ class Settings(BaseSettings):
                 "Production requires a secure refresh cookie; "
                 "set REFRESH_COOKIE_SECURE=true or leave it unset."
             )
+
+    def validate_notification_credentials(self) -> None:
+        """Require the user-secret master key only in processes that handle secrets."""
+
+        if self.app_env.casefold() == "production" and not self.app_secrets_key:
+            raise ValueError("Production requires APP_SECRETS_KEY for encrypted user secrets.")
 
     def validate_runtime_credentials(self) -> None:
         """Validate all credentials required by the backend API process."""

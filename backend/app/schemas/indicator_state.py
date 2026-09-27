@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class IndicatorSnapshotData(BaseModel):
@@ -18,6 +18,7 @@ class IndicatorSnapshotData(BaseModel):
     # can contain RSI6/RSI14 or multiple BOLL configurations on the same day.
     parameter_key: str
     parameters: dict[str, Any]
+    adjust_type: str = "qfq"
     values: dict[str, float]
     previous_values: dict[str, float] | None = None
     delta: dict[str, float] | None = None
@@ -41,6 +42,9 @@ class StateData(BaseModel):
     active: bool
     transition: bool
     trade_date: date
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    parameter_key: str = "default"
+    adjust_type: str = "qfq"
     metadata: dict[str, Any]
 
 

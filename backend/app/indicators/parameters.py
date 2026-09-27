@@ -231,11 +231,43 @@ def merge_indicator_requests(
         normalized = IndicatorRequest(indicator_type, parameters)
         others[(indicator_type, normalized.key)] = normalized
 
-    merged: list[IndicatorRequest] = [
-        IndicatorRequest("MA", {"periods": sorted(ma_periods)})
-    ] if ma_periods else []
+    merged: list[IndicatorRequest] = (
+        [IndicatorRequest("MA", {"periods": sorted(ma_periods)})] if ma_periods else []
+    )
     merged.extend(sorted(others.values(), key=lambda item: (item.indicator_type, item.key)))
     return tuple(merged)
+
+
+def required_history_bars(
+    requests: Iterable[IndicatorRequest | tuple[str, Mapping[str, Any]] | Mapping[str, Any]] | None,
+) -> int:
+    """Return the minimum completed daily-bar count needed by requested indicators."""
+
+    required = 1
+    for request in merge_indicator_requests(requests):
+        indicator_type = normalize_indicator_type(request.indicator_type)
+        parameters = canonicalize_parameters(indicator_type, request.parameters, fill_defaults=True)
+        if indicator_type == "MA":
+            periods = parameters.get("periods") or [parameters.get("period", 1)]
+            required = max(required, *(int(period) for period in periods if period is not None))
+        elif indicator_type == "PROJECTED_MA":
+            required = max(required, int(parameters.get("period", DEFAULT_PROJECTED_MA_PERIOD)))
+        elif indicator_type == "RSI":
+            required = max(required, int(parameters.get("period", DEFAULT_RSI_PERIOD)) + 1)
+        elif indicator_type == "KDJ":
+            required = max(required, int(parameters.get("period", DEFAULT_KDJ_PERIODS["period"])))
+        elif indicator_type == "BOLL":
+            required = max(
+                required, int(parameters.get("period", DEFAULT_BOLL_PARAMETERS["period"]))
+            )
+        elif indicator_type == "MACD":
+            required = max(
+                required,
+                int(parameters.get("slow_period", DEFAULT_MACD_PARAMETERS["slow_period"]))
+                + int(parameters.get("signal_period", DEFAULT_MACD_PARAMETERS["signal_period"]))
+                - 1,
+            )
+    return required
 
 
 def snapshot_variants(snapshot: Any) -> tuple[IndicatorVariant, ...]:
@@ -245,9 +277,7 @@ def snapshot_variants(snapshot: Any) -> tuple[IndicatorVariant, ...]:
     parameters = snapshot.parameters if isinstance(snapshot.parameters, Mapping) else {}
     values = snapshot.values if isinstance(snapshot.values, Mapping) else {}
     previous_values = (
-        snapshot.previous_values
-        if isinstance(snapshot.previous_values, Mapping)
-        else None
+        snapshot.previous_values if isinstance(snapshot.previous_values, Mapping) else None
     )
     delta = snapshot.delta if isinstance(snapshot.delta, Mapping) else None
     if parameters.get("_format") == 2 and isinstance(parameters.get("variants"), Mapping):
@@ -260,9 +290,7 @@ def snapshot_variants(snapshot: Any) -> tuple[IndicatorVariant, ...]:
             key = parameter_key(indicator_type, normalized_parameters)
             value_map = values.get(raw_key, values.get(key, {}))
             prior_map = (
-                previous_values.get(raw_key, previous_values.get(key))
-                if previous_values
-                else None
+                previous_values.get(raw_key, previous_values.get(key)) if previous_values else None
             )
             delta_map = delta.get(raw_key, delta.get(key)) if delta else None
             result.append(
@@ -332,9 +360,7 @@ def parameters_match(
 
 def _project_ma_variant(variant: IndicatorVariant, periods: set[int]) -> IndicatorVariant:
     values = {
-        key: value
-        for key, value in variant.values.items()
-        if _ma_value_period(key) in periods
+        key: value for key, value in variant.values.items() if _ma_value_period(key) in periods
     }
     previous = (
         {
@@ -346,11 +372,7 @@ def _project_ma_variant(variant: IndicatorVariant, periods: set[int]) -> Indicat
         else None
     )
     delta = (
-        {
-            key: value
-            for key, value in variant.delta.items()
-            if _ma_value_period(key) in periods
-        }
+        {key: value for key, value in variant.delta.items() if _ma_value_period(key) in periods}
         if variant.delta is not None
         else None
     )
@@ -409,8 +431,7 @@ def _coerce_requests(
                     isinstance(item, Mapping) for item in parameters
                 ):
                     result.extend(
-                        IndicatorRequest(str(indicator_type), dict(item))
-                        for item in parameters
+                        IndicatorRequest(str(indicator_type), dict(item)) for item in parameters
                     )
                 else:
                     result.append(IndicatorRequest(str(indicator_type), dict(parameters or {})))

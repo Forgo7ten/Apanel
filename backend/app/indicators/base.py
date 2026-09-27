@@ -9,6 +9,16 @@ from .results import IndicatorResult
 
 
 @runtime_checkable
+class SeriesIndicator(Protocol):
+    """Optional optimized contract for one-pass historical calculation."""
+
+    name: ClassVar[str]
+
+    def calculate_series(
+        self, series: Iterable[Any], **parameters: Any
+    ) -> tuple[IndicatorResult | None, ...]: ...
+
+
 class Indicator(Protocol):
     """Minimal contract required for registration of a new indicator."""
 

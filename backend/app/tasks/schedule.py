@@ -16,15 +16,32 @@ def build_beat_schedule(settings: Any) -> dict[str, dict[str, Any]]:
     """
 
     refresh_minutes = int(settings.quote_refresh_interval_minutes)
+    quote_task = {"task": "apanel.tasks.refresh_quotes", "options": {"queue": "market-data"}}
     return {
-        "refresh-intraday-quotes": {
-            "task": "apanel.tasks.refresh_quotes",
-            "schedule": crontab(
-                minute=f"*/{refresh_minutes}",
-                hour="9-11,13-14",
-                day_of_week="mon-fri",
-            ),
-            "options": {"queue": "market-data"},
+        "refresh-quotes-open": {
+            **quote_task,
+            "schedule": crontab(minute=f"30-55/{refresh_minutes}", hour="9", day_of_week="mon-fri"),
+        },
+        "refresh-quotes-morning": {
+            **quote_task,
+            "schedule": crontab(minute=f"*/{refresh_minutes}", hour="10", day_of_week="mon-fri"),
+        },
+        "refresh-quotes-before-lunch": {
+            **quote_task,
+            "schedule": crontab(minute=f"0-30/{refresh_minutes}", hour="11", day_of_week="mon-fri"),
+        },
+        "refresh-quotes-afternoon": {
+            **quote_task,
+            "schedule": crontab(minute=f"*/{refresh_minutes}", hour="13-14", day_of_week="mon-fri"),
+        },
+        "refresh-quotes-close": {
+            **quote_task,
+            "schedule": crontab(minute="0", hour="15", day_of_week="mon-fri"),
+        },
+        "dispatch-pending-notifications": {
+            "task": "apanel.tasks.dispatch_pending_notifications",
+            "schedule": crontab(minute="*/5"),
+            "options": {"queue": "default"},
         },
         "run-end-of-day-pipeline": {
             "task": "apanel.tasks.run_eod_pipeline",

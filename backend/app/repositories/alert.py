@@ -59,9 +59,7 @@ class AlertRepository:
         )
         return list((await self.session.execute(statement)).scalars())
 
-    async def get_instance(
-        self, alert_rule_id: int, security_id: int
-    ) -> AlertInstance | None:
+    async def get_instance(self, alert_rule_id: int, security_id: int) -> AlertInstance | None:
         return (
             await self.session.execute(
                 select(AlertInstance).where(
@@ -72,7 +70,7 @@ class AlertRepository:
         ).scalar_one_or_none()
 
     async def latest_snapshot(
-        self, security_id: int, indicator_type: str
+        self, security_id: int, indicator_type: str, *, adjustment: str = "qfq"
     ) -> IndicatorSnapshot | None:
         return (
             await self.session.execute(
@@ -80,17 +78,21 @@ class AlertRepository:
                 .where(
                     IndicatorSnapshot.security_id == security_id,
                     IndicatorSnapshot.indicator_type == indicator_type,
+                    IndicatorSnapshot.adjust_type == adjustment,
                 )
                 .order_by(IndicatorSnapshot.trade_date.desc(), IndicatorSnapshot.id.desc())
                 .limit(1)
             )
         ).scalar_one_or_none()
 
-    async def latest_snapshots(self, security_id: int) -> list[IndicatorSnapshot]:
+    async def latest_snapshots(
+        self, security_id: int, *, adjustment: str | None = None
+    ) -> list[IndicatorSnapshot]:
         latest_date = (
             await self.session.execute(
                 select(func.max(IndicatorSnapshot.trade_date)).where(
-                    IndicatorSnapshot.security_id == security_id
+                    IndicatorSnapshot.security_id == security_id,
+                    *(() if adjustment is None else (IndicatorSnapshot.adjust_type == adjustment,)),
                 )
             )
         ).scalar_one_or_none()
@@ -101,16 +103,31 @@ class AlertRepository:
             .where(
                 IndicatorSnapshot.security_id == security_id,
                 IndicatorSnapshot.trade_date == latest_date,
+                *(() if adjustment is None else (IndicatorSnapshot.adjust_type == adjustment,)),
             )
             .order_by(IndicatorSnapshot.indicator_type.asc())
         )
         return list((await self.session.execute(statement)).scalars())
 
-    async def latest_states(self, security_id: int) -> list[IndicatorState]:
+    async def latest_states(
+        self,
+        security_id: int,
+        *,
+        adjustment: str | None = None,
+        state_code: str | None = None,
+        parameter_key: str | None = None,
+    ) -> list[IndicatorState]:
         latest_date = (
             await self.session.execute(
                 select(func.max(IndicatorState.trade_date)).where(
-                    IndicatorState.security_id == security_id
+                    IndicatorState.security_id == security_id,
+                    *(() if adjustment is None else (IndicatorState.adjust_type == adjustment,)),
+                    *(() if state_code is None else (IndicatorState.state_code == state_code,)),
+                    *(
+                        ()
+                        if parameter_key is None
+                        else (IndicatorState.parameter_key == parameter_key,)
+                    ),
                 )
             )
         ).scalar_one_or_none()
@@ -119,6 +136,9 @@ class AlertRepository:
         statement: Select[tuple[IndicatorState]] = select(IndicatorState).where(
             IndicatorState.security_id == security_id,
             IndicatorState.trade_date == latest_date,
+            *(() if adjustment is None else (IndicatorState.adjust_type == adjustment,)),
+            *(() if state_code is None else (IndicatorState.state_code == state_code,)),
+            *(() if parameter_key is None else (IndicatorState.parameter_key == parameter_key,)),
         )
         return list((await self.session.execute(statement)).scalars())
 

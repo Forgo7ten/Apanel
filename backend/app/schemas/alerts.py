@@ -34,6 +34,9 @@ class AlertRuleCreateRequest(BaseModel):
     )
     operator: str | None = Field(default=None, min_length=1, max_length=4)
     threshold: float | None = None
+    parameters: dict[str, Any] | None = None
+    field: str | None = Field(default=None, min_length=1, max_length=64)
+    adjust_type: Literal["qfq", "none"] | None = None
     enabled: bool = True
 
     @field_validator("condition_type", mode="before")
@@ -69,6 +72,9 @@ class AlertRuleUpdateRequest(BaseModel):
     )
     operator: str | None = Field(default=None, min_length=1, max_length=4)
     threshold: float | None = None
+    parameters: dict[str, Any] | None = None
+    field: str | None = Field(default=None, min_length=1, max_length=64)
+    adjust_type: Literal["qfq", "none"] | None = None
     enabled: bool | None = None
 
     @field_validator("condition_type", mode="before")
@@ -101,6 +107,11 @@ class AlertRuleData(BaseModel):
     indicator_type: str | None = None
     operator: str | None = None
     threshold: float | None = None
+    parameters: dict[str, Any] | None = None
+    parameter_key: str | None = None
+    field: str | None = None
+    adjust_type: str = "qfq"
+    needs_review: bool = False
     enabled: bool
     symbol: str | None = None
     name: str | None = None

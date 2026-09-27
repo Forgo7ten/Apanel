@@ -24,6 +24,7 @@ from app.providers.notification import (
     NotificationProviderError,
     NotificationProviderRegistry,
 )
+from app.services.user_secret_service import UserSecretService
 
 
 class ProviderFactory(Protocol):
@@ -115,6 +116,57 @@ class NotificationService:
         self.pending_recovery_window = validate_pending_recovery_window(pending_recovery_window)
         self.clock = clock or (lambda: datetime.now(UTC))
 
+    async def enqueue(
+        self,
+        *,
+        user_id: int,
+        alert_rule_id: int,
+        security_id: int,
+        title: str,
+        message: NotificationMessage,
+        trigger_sequence: int | None,
+        observation_date: date,
+        created_at: datetime | None = None,
+    ) -> Notification:
+        """Add one PENDING outbox row without committing or sending."""
+
+        content = message.to_dict()
+        content["title"] = title
+        if trigger_sequence is not None:
+            content["event_id"] = f"alert:{alert_rule_id}:{security_id}:{trigger_sequence}"
+        notification = Notification(
+            user_id=user_id,
+            alert_rule_id=alert_rule_id,
+            security_id=security_id,
+            channel=NotificationChannel.FEISHU,
+            title=title,
+            content=content,
+            status=NotificationStatus.PENDING,
+            trigger_sequence=trigger_sequence,
+            observation_date=observation_date,
+            created_at=created_at or datetime.now(UTC),
+        )
+        self.session.add(notification)
+        await self.session.flush()
+        return notification
+
+    async def dispatch(
+        self,
+        notification_id: int,
+        *,
+        provider: NotificationProvider | None = None,
+    ) -> Notification:
+        """Deliver an already committed PENDING outbox row."""
+
+        async with _retry_lock(notification_id):
+            notification = await self._locked_notification(notification_id)
+            if notification is None:
+                raise ApiError("NOTIFICATION_NOT_FOUND", "Notification was not found.", 404)
+            if notification.status != NotificationStatus.PENDING:
+                return notification
+            message = _message_from_content(notification.content)
+            return await self._deliver_existing(notification, message, provider=provider)
+
     async def deliver(
         self,
         *,
@@ -126,30 +178,20 @@ class NotificationService:
         provider: NotificationProvider | None = None,
         created_at: datetime | None = None,
     ) -> Notification:
-        """Record and deliver one alert notification.
+        """Backward-compatible create-and-deliver helper for non-alert callers."""
 
-        The durable row is committed before the network call, so a provider
-        failure is represented as a diagnosable notification rather than
-        rolling back the alert's edge claim.  Webhook plaintext never enters
-        the returned notification or an exception message.
-        """
-
-        content = message.to_dict()
-        content["title"] = title
-        notification = Notification(
+        notification = await self.enqueue(
             user_id=user_id,
             alert_rule_id=alert_rule_id,
             security_id=security_id,
-            channel=NotificationChannel.FEISHU,
             title=title,
-            content=content,
-            status=NotificationStatus.PENDING,
-            created_at=created_at or datetime.now(UTC),
+            message=message,
+            trigger_sequence=None,
+            observation_date=message.date,
+            created_at=created_at,
         )
-        self.session.add(notification)
         await self.session.commit()
-
-        return await self._deliver_new(notification.id, message, provider=provider)
+        return await self.dispatch(notification.id, provider=provider)
 
     async def retry(
         self,
@@ -378,13 +420,7 @@ class NotificationService:
         self,
         notification_ids: Sequence[int],
     ) -> dict[str, int]:
-        """Return a verifiable delivery summary for one pipeline batch.
-
-        Alert evaluation already persists and delivers the notification before
-        returning its edge-trigger result.  The EOD pipeline's final stage
-        therefore verifies those durable outcomes instead of sending the same
-        notification a second time.
-        """
+        """Return a verifiable delivery summary for one pipeline batch."""
 
         unique_ids = tuple(dict.fromkeys(int(item) for item in notification_ids))
         if not unique_ids:
@@ -410,6 +446,11 @@ class NotificationService:
         }
 
     async def _user_webhook(self, user_id: int) -> str | None:
+        encrypted = await UserSecretService(self.session).get_feishu_webhook(user_id)
+        if encrypted:
+            return encrypted
+        # Release-A compatibility only: read a legacy plaintext value until
+        # the migration CLI has removed every such JSON key.
         setting = (
             await self.session.execute(select(UserSetting).where(UserSetting.user_id == user_id))
         ).scalar_one_or_none()
@@ -420,6 +461,42 @@ class NotificationService:
             nested = setting.settings.get("notification")
         webhook = nested.get("feishu_webhook") if isinstance(nested, dict) else None
         return webhook.strip() if isinstance(webhook, str) and webhook.strip() else None
+
+
+async def dispatch_notifications(
+    session: AsyncSession,
+    notification_ids: Sequence[int],
+    *,
+    provider: NotificationProvider | None = None,
+) -> dict[str, int]:
+    """Deliver committed outbox rows and summarize terminal outcomes."""
+
+    service = NotificationService(session, provider=provider)
+    for notification_id in tuple(dict.fromkeys(int(item) for item in notification_ids)):
+        await service.dispatch(notification_id, provider=provider)
+    return await service.summarize_deliveries(notification_ids)
+
+
+async def dispatch_pending_notifications(
+    session: AsyncSession,
+    *,
+    provider: NotificationProvider | None = None,
+    limit: int = 100,
+) -> dict[str, int]:
+    """Recover committed PENDING outbox rows in bounded batches."""
+
+    ids = tuple(
+        int(item)
+        for item in (
+            await session.execute(
+                select(Notification.id)
+                .where(Notification.status == NotificationStatus.PENDING)
+                .order_by(Notification.created_at.asc(), Notification.id.asc())
+                .limit(limit)
+            )
+        ).scalars()
+    )
+    return await dispatch_notifications(session, ids, provider=provider)
 
 
 async def summarize_deliveries(
@@ -480,6 +557,8 @@ __all__ = [
     "NOTIFICATION_PERSISTENCE_ERROR_MESSAGE",
     "NOTIFICATION_PROVIDER_TIMEOUT",
     "NotificationService",
+    "dispatch_notifications",
+    "dispatch_pending_notifications",
     "ProviderFactory",
     "is_notification_retryable",
     "summarize_deliveries",
