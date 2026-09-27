@@ -82,6 +82,15 @@ async def watch_context(
                 timestamp=now,
             )
         )
+        session.add(
+            QuoteSnapshot(
+                security_id=second.id,
+                price=Decimal("12.00"),
+                change=Decimal("-0.10"),
+                change_percent=Decimal("-0.83"),
+                timestamp=datetime(2026, 9, 22, 7, 0, tzinfo=UTC),
+            )
+        )
         for offset in range(2):
             trade_date = date(2026, 9, 22) + timedelta(days=offset)
             close = Decimal(str(100 + offset))
@@ -98,6 +107,19 @@ async def watch_context(
                     adjust_type="qfq",
                 )
             )
+        session.add(
+            DailyBar(
+                security_id=second.id,
+                trade_date=date(2026, 9, 23),
+                open=Decimal("12.20"),
+                high=Decimal("12.40"),
+                low=Decimal("12.10"),
+                close=Decimal("12.30"),
+                volume=100,
+                amount=1230,
+                adjust_type="none",
+            )
+        )
         session.add(
             IndicatorSnapshot(
                 security_id=first.id,
@@ -206,6 +228,17 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     assert stock["price"]["value"] == 1680.0
     assert stock["indicators"]["RSI"]["value"] == 71.0
     assert stock["states"][0]["state_id"] == "RSI_OVERBOUGHT"
+
+    added_second = await client.post(
+        f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 2}
+    )
+    assert added_second.status_code == 201
+    refreshed = await client.get(f"/api/v1/watch-tables/{table_id}")
+    second_stock = next(
+        item for item in refreshed.json()["data"]["stocks"] if item["security_id"] == 2
+    )
+    assert second_stock["price"]["value"] == 12.3
+    assert second_stock["price"]["change"] is None
 
     _as_user(app, user_two)
     isolated = await client.get(f"/api/v1/watch-tables/{table_id}")

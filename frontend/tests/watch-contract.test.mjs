@@ -139,6 +139,13 @@ test("watch detail polling interval is five minutes", () => {
   assert.match(source, /refetchIntervalInBackground: false/);
 });
 
+test("add-stock dialog bounds long search results and refreshes after async bootstrap", () => {
+  const source = readFileSync(new URL("../src/components/table/AddStockDialog.tsx", import.meta.url), "utf8");
+  assert.match(source, /max-h-\[15rem\].*overflow-y-auto/);
+  assert.match(source, /BOOTSTRAP_REFRESH_DELAYS_MS = \[2_000, 5_000, 10_000, 20_000, 40_000\]/);
+  assert.match(source, /title=\{security\.name\}/);
+});
+
 test("watch detail keeps stale data during refresh and separates initial errors", () => {
   assert.equal(watchDetailViewState({ isPending: true }), "loading");
   assert.equal(watchDetailViewState({ isError: true }), "error");

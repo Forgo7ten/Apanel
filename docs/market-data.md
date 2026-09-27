@@ -31,7 +31,7 @@ Hub 不再要求每个 Provider 实现一个“大而全”的 `MarketDataProvid
 
 `ProviderRouting` 在应用启动时解析并校验每个 capability 的实际 Provider。v1 中 Quote、Daily Bar、Dividend 都固定到 `eltdx`；Security Master 使用 eltdx 主源 + AKShare 整批 fallback。
 
-证券 fallback 采用 `FIRST_SUCCESS_WHOLE_BATCH` 语义：eltdx 成功返回完整批次时不会调用 AKShare；eltdx 失败或返回空批次时才尝试 AKShare。两者的部分结果不会拼接。
+证券 universe 仍以 eltdx 为主：eltdx 失败或返回空批次时才使用 AKShare 完整批次 fallback。对于疑似受到 TDX 代码表字段宽度截断的 ETF 名称，Hub 会 best-effort 读取 AKShare 完整批次，并且只在 market/type 都一致的同一 symbol 上采用更长的显示名称；不会借此增加、删除或替换 eltdx 的证券 universe。名称补全失败时仍返回 eltdx 批次。
 
 ## eltdx 生命周期
 

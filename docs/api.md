@@ -151,7 +151,7 @@ http://localhost:8080/api/v1
 }
 ```
 
-Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、按 column id 键控的 `column_values` 和当前可见 states。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列。
+Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、按 column id 键控的 `column_values` 和当前可见 states。当前交易日存在更新的 Quote 时价格使用 Quote；未开盘或 Quote 仍停留在上一交易日时，价格回退到最近未复权日线收盘价。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列。
 
 ## Settings API
 

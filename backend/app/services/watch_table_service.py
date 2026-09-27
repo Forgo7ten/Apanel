@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -43,6 +45,7 @@ from app.states import DEFAULT_REGISTRY, UnknownStateError
 _COLUMN_TYPES = {"PRICE", "INDICATOR", "STATE"}
 _VIEW_MODES = {"NUMBER", "DELTA", "STATUS", "COMPOSITE"}
 _DEFAULT_WATCH_INDICATORS = ("MA", "RSI", "KDJ", "BOLL", "MACD")
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class WatchTableService:
@@ -145,6 +148,7 @@ class WatchTableService:
         security_ids = [membership.security_id for membership in table.symbols]
         adjustment = await self._user_adjustment(user_id)
         quotes = await self.security_repository.latest_quotes_batch(security_ids)
+        daily_bars = await self.security_repository.latest_daily_bars_batch(security_ids)
         snapshots_by_security = await self.security_repository.latest_indicators_batch(
             security_ids, adjustment=adjustment
         )
@@ -170,7 +174,7 @@ class WatchTableService:
                 security.id,
                 dividend_results=dividend_results,
             )
-            price = _price_data(quotes.get(security.id))
+            price = _price_data(quotes.get(security.id), daily_bars.get(security.id))
             all_states = states_by_security.get(security.id, ())
             for column in table.columns:
                 if column.view_mode.upper() != "STATUS" or not column.state_code:
@@ -1090,7 +1094,20 @@ def _security_data(security) -> Any:
     )
 
 
-def _price_data(quote) -> PriceData | None:
+def _price_data(quote, daily_bar=None) -> PriceData | None:
+    if daily_bar is not None and (
+        quote is None
+        or _quote_trade_date(quote.timestamp) <= daily_bar.trade_date
+    ):
+        return PriceData(
+            value=_number(daily_bar.close),
+            price=_number(daily_bar.close),
+            change=None,
+            delta=None,
+            change_percent=None,
+            direction="FLAT",
+            timestamp=datetime.combine(daily_bar.trade_date, time.min, tzinfo=_SHANGHAI_TZ),
+        )
     if quote is None:
         return None
     change = _number(quote.change)
@@ -1109,6 +1126,11 @@ def _price_data(quote) -> PriceData | None:
         ),
         timestamp=quote.timestamp,
     )
+
+
+def _quote_trade_date(timestamp: datetime) -> date:
+    aware = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
+    return aware.astimezone(_SHANGHAI_TZ).date()
 
 
 def _state_data(state) -> CurrentStateData:

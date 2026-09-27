@@ -53,7 +53,7 @@ def test_security_master_protocol_is_runtime_checkable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tdx_success_never_calls_akshare_fallback() -> None:
+async def test_ordinary_tdx_success_never_calls_akshare_fallback() -> None:
     primary = FakePrimary((security(),))
     fallback = FakeFallback((security(),))
     provider = SecurityMasterFallbackProvider(primary=primary, fallback=fallback)
@@ -63,6 +63,32 @@ async def test_tdx_success_never_calls_akshare_fallback() -> None:
     assert records == (security(),)
     assert primary.calls == 1
     assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_tdx_truncated_etf_name_is_enriched_from_exact_akshare_symbol() -> None:
+    primary_security = Security(
+        symbol="513530",
+        name="港股通红利ETF华",
+        market="SH",
+        security_type="ETF",
+    )
+    fallback_security = Security(
+        symbol="513530",
+        name="港股通红利ETF华泰柏瑞",
+        market="SH",
+        security_type="ETF",
+    )
+    fallback = FakeFallback((fallback_security,))
+    provider = SecurityMasterFallbackProvider(
+        primary=FakePrimary((primary_security,)),
+        fallback=fallback,
+    )
+
+    records = await provider.get_symbols()
+
+    assert records[0].name == "港股通红利ETF华泰柏瑞"
+    assert fallback.calls == 1
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,8 @@ import { isApiError } from "@/lib/api-errors";
 import { getSecurityIdentifier, toAddStockPayload } from "@/lib/watch-contract.mjs";
 import { trapDialogTab } from "../ui/dialog-focus";
 
+const BOOTSTRAP_REFRESH_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000] as const;
+
 function securityId(security: Security): Identifier | null {
   return getSecurityIdentifier(security);
 }
@@ -48,6 +50,11 @@ export function AddStockDialog({
         queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
       ]);
       onClose();
+      for (const delay of BOOTSTRAP_REFRESH_DELAYS_MS) {
+        window.setTimeout(() => {
+          void queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] });
+        }, delay);
+      }
     },
   });
   const pendingRef = useRef(false);
@@ -115,7 +122,7 @@ export function AddStockDialog({
           ) : searchQuery.isPending ? (
             <p className="grid min-h-24 place-items-center text-xs text-muted" aria-live="polite">正在搜索证券…</p>
           ) : searchQuery.data?.length ? (
-            <div className="space-y-1" role="listbox" aria-label="证券搜索结果">
+            <div className="max-h-[15rem] space-y-1 overflow-y-auto pr-1" role="listbox" aria-label="证券搜索结果">
               {searchQuery.data.map((security) => {
                 const id = securityId(security);
                 const active = selected?.symbol === security.symbol;
@@ -128,8 +135,8 @@ export function AddStockDialog({
                     role="option"
                     aria-selected={active}
                   >
-                    <span>
-                      <span className="block text-sm font-medium text-primary">{security.name}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block break-words text-sm font-medium text-primary" title={security.name}>{security.name}</span>
                       <span className="mt-0.5 block font-mono text-[11px] text-muted">{security.symbol} · {security.market}</span>
                     </span>
                     {id === null ? <span className="text-[10px] text-warning">缺少 ID</span> : null}
