@@ -38,6 +38,7 @@ from app.states import DEFAULT_REGISTRY, UnknownStateError
 
 _COLUMN_TYPES = {"PRICE", "INDICATOR", "STATE"}
 _VIEW_MODES = {"NUMBER", "DELTA", "STATUS", "COMPOSITE"}
+_DEFAULT_WATCH_INDICATORS = ("MA", "RSI", "KDJ", "BOLL", "MACD")
 
 
 class WatchTableService:
@@ -80,7 +81,7 @@ class WatchTableService:
         default_types = (
             indicator_settings.get("defaults")
             if isinstance(indicator_settings.get("defaults"), list)
-            else []
+            else list(_DEFAULT_WATCH_INDICATORS)
         )
         default_parameters = (
             indicator_settings.get("parameters")

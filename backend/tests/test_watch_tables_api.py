@@ -148,6 +148,10 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     client, _, user_one, user_two = watch_context
     app = client._transport.app  # type: ignore[attr-defined]
     _as_user(app, user_one)
+    cleared_defaults = await client.put(
+        "/api/v1/settings", json={"indicator_settings": {"defaults": []}}
+    )
+    assert cleared_defaults.status_code == 200
 
     created = await client.post("/api/v1/watch-tables", json={"name": "核心观察"})
     assert created.status_code == 201
@@ -208,6 +212,49 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     assert isolated.status_code == 404
     isolated_column = await client.put(f"/api/v1/columns/{column_id}", json={"visible": True})
     assert isolated_column.status_code == 404
+
+
+async def test_new_watch_table_uses_product_and_user_indicator_defaults(watch_context) -> None:
+    client, _, user_one, user_two = watch_context
+    app = client._transport.app  # type: ignore[attr-defined]
+
+    _as_user(app, user_one)
+    created = await client.post("/api/v1/watch-tables", json={"name": "产品默认"})
+    assert created.status_code == 201
+    details = await client.get(f"/api/v1/watch-tables/{created.json()['data']['id']}")
+    assert [column["indicator_type"] for column in details.json()["data"]["columns"]] == [
+        "MA",
+        "RSI",
+        "KDJ",
+        "BOLL",
+        "MACD",
+    ]
+
+    _as_user(app, user_two)
+    settings = await client.put(
+        "/api/v1/settings",
+        json={
+            "indicator_settings": {
+                "defaults": ["RSI", "DIVIDEND_YIELD"],
+                "parameters": {"RSI": {"period": 6}},
+            }
+        },
+    )
+    assert settings.status_code == 200
+    custom = await client.post("/api/v1/watch-tables", json={"name": "用户默认"})
+    custom_details = await client.get(f"/api/v1/watch-tables/{custom.json()['data']['id']}")
+    columns = custom_details.json()["data"]["columns"]
+    assert [column["indicator_type"] for column in columns] == ["RSI", "DIVIDEND_YIELD"]
+    assert columns[0]["parameters"] == {"period": 6}
+
+
+async def test_settings_schema_rejects_invalid_known_display_values(watch_context) -> None:
+    client, _, user_one, _ = watch_context
+    app = client._transport.app  # type: ignore[attr-defined]
+    _as_user(app, user_one)
+
+    invalid = await client.put("/api/v1/settings", json={"display_settings": {"density": "dense"}})
+    assert invalid.status_code == 422
 
 
 async def test_settings_and_public_security_contracts(watch_context) -> None:
