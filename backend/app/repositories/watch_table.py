@@ -109,12 +109,14 @@ class WatchTableRepository:
         column_type: str,
         indicator_type: str | None,
         parameters: dict[str, Any],
+        state_code: str | None = None,
         exclude_id: int | None = None,
     ) -> TableColumn | None:
         statement = select(TableColumn).where(
             TableColumn.watch_table_id == table_id,
             TableColumn.column_type == column_type,
             TableColumn.indicator_type == indicator_type,
+            TableColumn.state_code == state_code,
         )
         if exclude_id is not None:
             statement = statement.where(TableColumn.id != exclude_id)
@@ -132,9 +134,7 @@ class WatchTableRepository:
         ).scalar_one()
         return int(current) + 1 if current is not None else 0
 
-    async def reorder_columns(
-        self, table_id: int, column_ids: Sequence[int]
-    ) -> list[TableColumn]:
+    async def reorder_columns(self, table_id: int, column_ids: Sequence[int]) -> list[TableColumn]:
         rows = list(
             (
                 await self.session.execute(

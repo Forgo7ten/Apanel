@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from app.security.webhook_url import validate_feishu_webhook_url
+
 from .base import NotificationProvider
 from .message import NotificationMessage
 
@@ -55,16 +57,10 @@ def _redacted_endpoint(url: str) -> str:
 
 
 def _validate_webhook_url(url: Any) -> str:
-    if not isinstance(url, str) or not url.strip():
-        raise FeishuWebhookError("Feishu webhook URL is required")
-    normalized = url.strip()
     try:
-        parsed = urlsplit(normalized)
+        return validate_feishu_webhook_url(url)
     except ValueError as exc:
         raise FeishuWebhookError("Feishu webhook URL is invalid") from exc
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise FeishuWebhookError("Feishu webhook URL is invalid")
-    return normalized
 
 
 def _message_text(message: NotificationMessage | str) -> str:
@@ -126,7 +122,9 @@ class FeishuWebhookProvider(NotificationProvider):
 
     def _get_client(self) -> Any:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_seconds))
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_seconds), trust_env=False
+            )
         return self._client
 
     def _resolve_webhook_url(self, user: Mapping[str, Any] | str | None) -> str:

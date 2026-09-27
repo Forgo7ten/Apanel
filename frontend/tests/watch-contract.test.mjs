@@ -82,7 +82,7 @@ test("column payload preserves selected mode and strict indicator parameters", (
 });
 
 test("composite indicator field options use the canonical backend vocabulary", () => {
-  assert.deepEqual(getIndicatorFieldOptions("BOLL").map((option) => option.value), ["upper", "middle", "lower"]);
+  assert.deepEqual(getIndicatorFieldOptions("BOLL").map((option) => option.value), ["upper", "middle", "lower", "width"]);
   assert.deepEqual(getIndicatorFieldOptions("KDJ").map((option) => option.value), ["k", "d", "j"]);
   assert.deepEqual(getIndicatorFieldOptions("MACD").map((option) => option.value), ["diff", "dea", "histogram"]);
   assert.deepEqual(getIndicatorFieldOptions("MA"), []);

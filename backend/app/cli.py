@@ -13,13 +13,17 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.clients.market_data_hub import MarketDataHubClient, MarketDataHubClientError
 from app.core.config import get_settings
 from app.core.errors import ApiError
 from app.db.session import create_engine, dispose_engine
+from app.models import UserSetting
+from app.security.webhook_url import validate_feishu_webhook_url
 from app.services.auth_service import bootstrap_admin
+from app.services.user_secret_service import UserSecretService
 
 
 def _positive_float(value: str) -> float:
@@ -45,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     securities.add_argument("--retry-until-success", action="store_true")
     securities.add_argument("--retry-interval-seconds", type=_positive_float, default=30.0)
     securities.add_argument("--timeout-seconds", type=_positive_float, default=10.0)
+    commands.add_parser(
+        "migrate-user-secrets",
+        help="Encrypt legacy notification secrets and remove plaintext settings",
+    )
     return parser
 
 
@@ -225,9 +233,7 @@ async def run_security_bootstrap(
                 result = _failure_result("market data client failed", retryable=False)
 
             if result.status is BootstrapAttemptStatus.SUCCESS:
-                print(
-                    f"Security bootstrap completed: {result.count} securities synchronized."
-                )
+                print(f"Security bootstrap completed: {result.count} securities synchronized.")
                 exit_code = 0
                 break
 
@@ -265,6 +271,52 @@ async def run_security_bootstrap(
     return exit_code
 
 
+async def _migrate_user_secrets() -> int:
+    settings = get_settings()
+    settings.validate_database_credentials()
+    engine = create_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    migrated = 0
+    invalid = 0
+    try:
+        async with session_factory() as session:
+            rows = list((await session.execute(select(UserSetting))).scalars())
+            secret_service = UserSecretService(session)
+            allowed = tuple(
+                host.strip()
+                for host in settings.feishu_webhook_allowed_hosts.split(",")
+                if host.strip()
+            )
+            for row in rows:
+                payload = dict(row.settings or {})
+                nested = payload.get("notification_settings")
+                if not isinstance(nested, dict):
+                    nested = payload.get("notification")
+                raw = nested.get("feishu_webhook") if isinstance(nested, dict) else None
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                try:
+                    webhook = validate_feishu_webhook_url(raw, allowed_hosts=allowed)
+                except ValueError:
+                    invalid += 1
+                    continue
+                await secret_service.set_feishu_webhook(row.user_id, webhook)
+                for key in ("notification_settings", "notification"):
+                    value = payload.get(key)
+                    if isinstance(value, dict):
+                        value = dict(value)
+                        value.pop("feishu_webhook", None)
+                        payload[key] = value
+                payload.pop("feishu_webhook", None)
+                row.settings = payload
+                migrated += 1
+            await session.commit()
+    finally:
+        await dispose_engine(engine)
+    print(f"User secret migration completed: migrated={migrated} invalid={invalid}.")
+    return 0 if invalid == 0 else 2
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -276,6 +328,8 @@ def main(
     try:
         if args.command == "bootstrap-admin":
             return asyncio.run(_bootstrap_admin(args))
+        if args.command == "migrate-user-secrets":
+            return asyncio.run(_migrate_user_secrets())
         if args.command == "bootstrap-securities":
             return asyncio.run(
                 run_security_bootstrap(

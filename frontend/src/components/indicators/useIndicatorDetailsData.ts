@@ -18,6 +18,7 @@ import {
 import type { DetailSelection } from "./detail-types";
 import { getIndicatorValue, isRecord } from "./indicator-utils";
 import type { MiniChartPoint } from "./MiniChart";
+import { useWorkspaceSettings } from "@/lib/use-workspace-settings";
 
 function persistedParameterKey(selection: DetailSelection | null): string | undefined {
   if (!selection || selection.kind !== "indicator") return undefined;
@@ -28,6 +29,8 @@ function persistedParameterKey(selection: DetailSelection | null): string | unde
 
 export function useIndicatorDetailsData(selection: DetailSelection | null) {
   const range = useMemo(() => historyWindow(), []);
+  const { settings } = useWorkspaceSettings();
+  const adjustment = settings.adjustType;
   const open = selection !== null;
   const symbol = selection?.stock.symbol ?? "";
   const parameterKey = persistedParameterKey(selection);
@@ -36,17 +39,17 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
     return parameterKey ? { ...selection.column, parameter_key: parameterKey } : selection.column;
   }, [parameterKey, selection]);
   const indicatorQuery = useQuery({
-    queryKey: ["indicator-history", symbol, range.start, range.end, parameterKey ?? null],
+    queryKey: ["indicator-history", symbol, range.start, range.end, adjustment, parameterKey ?? null],
     queryFn: () => getIndicatorHistory(symbol, {
       ...range,
-      adjust: "qfq",
+      adjust: adjustment,
       ...(parameterKey ? { parameter_key: parameterKey } : {}),
     }),
     enabled: open && Boolean(historyColumn),
   });
   const stateQuery = useQuery({
-    queryKey: ["state-history", symbol, range.start, range.end],
-    queryFn: () => getStateHistory(symbol, { ...range, adjust: "qfq" }),
+    queryKey: ["state-history", symbol, range.start, range.end, adjustment],
+    queryFn: () => getStateHistory(symbol, { ...range, adjust: adjustment }),
     enabled: open,
   });
 
@@ -82,5 +85,6 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
     latestValue: historyValue(indicatorItems[indicatorItems.length - 1], historyColumn),
     currentValue: selection && "column" in selection ? getIndicatorValue(selection.stock, selection.column) : null,
     parameterKey,
+    showMiniChart: settings.showMiniChart,
   };
 }

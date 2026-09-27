@@ -78,6 +78,7 @@ export type WatchTableColumn = {
   type: string;
   column_type?: string;
   indicator_type?: string;
+  state_code?: string;
   title?: string;
   label?: string;
   view_mode: IndicatorViewMode;
@@ -108,6 +109,9 @@ export type IndicatorState = {
   active?: boolean;
   transition?: boolean;
   trade_date?: string;
+  parameters?: IndicatorParameters;
+  parameter_key?: string;
+  adjust_type?: "qfq" | "none";
   metadata?: Record<string, unknown>;
 };
 
@@ -173,8 +177,7 @@ export type StateHistoryResponse = {
 export type HistoryQuery = {
   start?: string;
   end?: string;
-  /** History currently has one coherent PRD sequence; do not request none. */
-  adjust?: "qfq";
+  adjust?: "qfq" | "none";
   parameter_key?: string;
 };
 
@@ -189,6 +192,7 @@ export type AddStockInput = {
 export type CreateColumnInput = {
   column_type: "INDICATOR" | string;
   indicator_type: string;
+  state_code?: string;
   parameters?: IndicatorParameters;
   view_mode: IndicatorViewMode;
 };
@@ -200,12 +204,13 @@ export type UpdateColumnInput = Partial<{
   order: number;
   width: number;
   view_mode: IndicatorViewMode;
+  state_code: string;
   parameters: IndicatorParameters;
 }>;
 
 export type AlertConditionType = "STATE" | "VALUE";
 
-export type AlertOperator = ">" | ">=" | "<" | "<=" | "=" | "!=";
+export type AlertOperator = ">" | ">=" | "<" | "<=" | "=";
 
 export type AlertRule = {
   id: Identifier;
@@ -217,6 +222,11 @@ export type AlertRule = {
   indicator_type?: string | null;
   operator?: AlertOperator | string | null;
   threshold?: number | string | null;
+  parameters?: IndicatorParameters | null;
+  parameter_key?: string | null;
+  field?: string | null;
+  adjust_type?: "qfq" | "none";
+  needs_review?: boolean;
   enabled?: boolean;
   symbol?: string | null;
   name?: string | null;
@@ -232,6 +242,9 @@ export type CreateAlertInput = {
   indicator?: string;
   operator?: AlertOperator;
   threshold?: number;
+  parameters?: IndicatorParameters;
+  field?: string;
+  adjust_type?: "qfq" | "none";
 };
 
 export type UpdateAlertInput = Partial<CreateAlertInput> & {
@@ -272,7 +285,7 @@ export type DisplaySettings = {
 };
 
 export type NotificationSettings = {
-  /** Empty string is never sent; the UI maps it to null to clear the secret. */
+  /** Omit to keep the current secret; null explicitly clears it. */
   feishu_webhook?: string | null;
   /** Backends may expose configuration state without returning the secret. */
   feishu_webhook_configured?: boolean;

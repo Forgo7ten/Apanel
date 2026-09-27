@@ -117,7 +117,7 @@ export function SettingsWorkspace() {
             <section className="rounded-panel border border-line bg-panel shadow-panel">
               <div className="border-b border-line px-4 py-4">
                 <h2 className="text-sm font-semibold text-primary">数据口径</h2>
-                <p className="mt-1 text-xs leading-5 text-muted">指标与状态持久化固定使用前复权（qfq）；以下偏好仅影响行情读取，不会改变指标计算口径。</p>
+                <p className="mt-1 text-xs leading-5 text-muted">指标与状态会按前复权（qfq）和不复权（none）分别持久化；这里选择当前工作台默认观察口径。</p>
               </div>
               <div className="px-4 py-4">
                 <fieldset disabled={saveMutation.isPending}>
@@ -129,7 +129,7 @@ export function SettingsWorkspace() {
                     </label>
                     <label className={`flex cursor-pointer items-center gap-2 rounded-panel border px-3 py-2.5 text-xs transition ${form.adjustType === "none" ? "border-brand bg-brand/10 text-primary" : "border-line bg-card text-secondary hover:border-brand/50"}`}>
                       <input type="radio" name="adjust-type" value="none" checked={form.adjustType === "none"} onChange={() => updateForm({ adjustType: "none" })} className="accent-brand" />
-                      不复权（none，仅原始行情）
+                      不复权（none）
                     </label>
                   </div>
                 </fieldset>
@@ -229,13 +229,16 @@ export function SettingsWorkspace() {
                     id="feishu-webhook"
                     type="password"
                     value={form.webhook}
-                    onChange={(event) => updateForm({ webhook: event.target.value })}
-                    placeholder={form.webhookConfigured ? "已配置；重新输入可替换，留空会清除" : "https://open.feishu.cn/open-apis/bot/v2/hook/..."}
+                    onChange={(event) => updateForm({ webhook: event.target.value, clearWebhook: false })}
+                    placeholder={form.webhookConfigured ? "已配置；重新输入可替换" : "https://open.feishu.cn/open-apis/bot/v2/hook/..."}
                     autoComplete="new-password"
                     spellCheck={false}
                     className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none placeholder:text-muted focus:border-brand focus:ring-2 focus:ring-brand/30"
                   />
-                  <p className="mt-2 text-[11px] leading-5 text-muted">为安全起见，已保存地址不会回填；提交空值会明确清除后端保存的 Webhook。</p>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <p className="text-[11px] leading-5 text-muted">为安全起见，已保存地址不会回填；留空表示保持现有配置。</p>
+                    {form.webhookConfigured ? <button type="button" onClick={() => updateForm({ webhook: "", clearWebhook: true, webhookConfigured: false })} className="rounded border border-negative/30 px-2 py-1 text-[11px] text-negative hover:bg-negative/10">清除 Webhook</button> : null}
+                  </div>
                 </fieldset>
               </div>
             </section>
@@ -253,7 +256,7 @@ export function SettingsWorkspace() {
               {saveMutation.isPending ? "保存中…" : "保存设置"}
             </button>
             <div className="mt-5 border-t border-line pt-4 text-[11px] leading-5 text-muted">
-              空 Webhook 会提交 `null`，用于清除已保存的通知出口；不会把敏感值放进错误提示。
+              空 Webhook 默认保持现有通知出口；只有点击“清除 Webhook”才提交 `null`。敏感值不会进入错误提示。
             </div>
           </aside>
         </form>

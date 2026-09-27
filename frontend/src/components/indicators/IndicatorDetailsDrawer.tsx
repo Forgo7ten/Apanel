@@ -193,7 +193,7 @@ export function IndicatorDetailsDrawer({
               {data.indicatorState === "loading" ? <p className="text-xs text-muted" aria-busy="true">正在加载历史…</p> : null}
               {data.indicatorState === "error" ? <p className="text-xs text-negative" role="alert">历史加载失败，请稍后重试。</p> : null}
               {data.indicatorState === "empty" ? <p className="text-xs text-muted">暂无该参数的历史数据。</p> : null}
-              {data.indicatorState === "ready" ? <MiniChart points={data.chartPoints} /> : null}
+              {data.indicatorState === "ready" && data.showMiniChart ? <MiniChart points={data.chartPoints} /> : null}
               {data.indicatorState === "ready" && data.chartPoints.length === 0 ? <p className="text-xs text-muted">历史中没有可绘制的数值。</p> : null}
               {data.indicatorState === "ready" ? <p className="mt-2 text-[11px] text-muted">最近值 {formatMetricValue(data.latestValue)}</p> : null}
             </section>

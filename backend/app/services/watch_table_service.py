@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,7 +19,7 @@ from app.indicators.parameters import (
     parameter_key,
     select_snapshot_variant,
 )
-from app.models import TableColumn, WatchTable, WatchTableSymbol
+from app.models import TableColumn, UserSetting, WatchTable, WatchTableSymbol
 from app.repositories.security import SecurityRepository
 from app.repositories.watch_table import WatchTableRepository
 from app.schemas.watch import (
@@ -32,6 +33,8 @@ from app.schemas.watch import (
     WatchTableSummaryData,
 )
 from app.services.dividend_service import DividendYieldResult, DividendYieldService
+from app.services.state_service import state_parameter_key
+from app.states import DEFAULT_REGISTRY, UnknownStateError
 
 _COLUMN_TYPES = {"PRICE", "INDICATOR", "STATE"}
 _VIEW_MODES = {"NUMBER", "DELTA", "STATUS", "COMPOSITE"}
@@ -62,6 +65,49 @@ class WatchTableService:
             description=description.strip() if description else None,
         )
         self.session.add(table)
+        await self.session.flush()
+        setting = (
+            await self.session.execute(select(UserSetting).where(UserSetting.user_id == user_id))
+        ).scalar_one_or_none()
+        raw_settings = (
+            setting.settings if setting is not None and isinstance(setting.settings, dict) else {}
+        )
+        indicator_settings = (
+            raw_settings.get("indicator_settings")
+            if isinstance(raw_settings.get("indicator_settings"), dict)
+            else {}
+        )
+        default_types = (
+            indicator_settings.get("defaults")
+            if isinstance(indicator_settings.get("defaults"), list)
+            else []
+        )
+        default_parameters = (
+            indicator_settings.get("parameters")
+            if isinstance(indicator_settings.get("parameters"), dict)
+            else {}
+        )
+        for position, raw_type in enumerate(default_types):
+            indicator_type = _normalize_indicator_type(str(raw_type))
+            if indicator_type == "DIVIDEND_YIELD":
+                parameters = {}
+            else:
+                parameters = canonicalize_parameters(
+                    indicator_type,
+                    default_parameters.get(indicator_type),
+                    fill_defaults=True,
+                )
+            self.session.add(
+                TableColumn(
+                    watch_table_id=table.id,
+                    column_type="INDICATOR",
+                    indicator_type=indicator_type,
+                    parameters=parameters,
+                    view_mode="COMPOSITE",
+                    position=position,
+                    visible=True,
+                )
+            )
         try:
             await self.session.commit()
         except IntegrityError as exc:
@@ -86,9 +132,14 @@ class WatchTableService:
     async def detail(self, user_id: int, table_id: int) -> WatchTableDetailsData:
         table = await self._owned(table_id, user_id, with_details=True)
         security_ids = [membership.security_id for membership in table.symbols]
+        adjustment = await self._user_adjustment(user_id)
         quotes = await self.security_repository.latest_quotes_batch(security_ids)
-        snapshots_by_security = await self.security_repository.latest_indicators_batch(security_ids)
-        states_by_security = await self.security_repository.current_states_batch(security_ids)
+        snapshots_by_security = await self.security_repository.latest_indicators_batch(
+            security_ids, adjustment=adjustment
+        )
+        states_by_security = await self.security_repository.current_states_batch(
+            security_ids, adjustment=adjustment
+        )
         dividend_results: Mapping[int, DividendYieldResult | ApiError] | None = None
         if any(
             column.column_type.upper() == "INDICATOR"
@@ -109,7 +160,43 @@ class WatchTableService:
                 dividend_results=dividend_results,
             )
             price = _price_data(quotes.get(security.id))
-            state_data = [_state_data(state) for state in states_by_security.get(security.id, ())]
+            all_states = states_by_security.get(security.id, ())
+            for column in table.columns:
+                if column.view_mode.upper() != "STATUS" or not column.state_code:
+                    continue
+                key = state_parameter_key(column.state_code.upper(), dict(column.parameters or {}))
+                matched = next(
+                    (
+                        state
+                        for state in all_states
+                        if state.state_code == column.state_code.upper()
+                        and state.parameter_key == key
+                    ),
+                    None,
+                )
+                column_key = str(column.id)
+                if matched is None:
+                    column_values[column_key] = _unavailable_column_value(
+                        column,
+                        column.indicator_type or "STATE",
+                        dict(column.parameters or {}),
+                        "STATE_NOT_FOUND",
+                    )
+                else:
+                    metadata = dict(matched.metadata or {})
+                    column_values[column_key] = {
+                        "column_id": column.id,
+                        "view_mode": "STATUS",
+                        "indicator_type": matched.indicator_type,
+                        "parameters": _json_numbers(dict(matched.parameters or {})),
+                        "available": True,
+                        "parameter_key": matched.parameter_key,
+                        "status": metadata.get("name", matched.state_code),
+                        "state": matched.state_code,
+                        "title": metadata.get("name", matched.state_code),
+                    }
+            visible_states = _visible_states(all_states, table.columns)
+            state_data = [_state_data(state) for state in visible_states]
             stocks.append(
                 WatchTableStockData(
                     security_id=security.id,
@@ -134,6 +221,17 @@ class WatchTableService:
             columns=columns,
             stocks=stocks,
         )
+
+    async def _user_adjustment(self, user_id: int) -> str:
+        setting = (
+            await self.session.execute(select(UserSetting).where(UserSetting.user_id == user_id))
+        ).scalar_one_or_none()
+        raw = (
+            setting.settings.get("adjust_type")
+            if setting and isinstance(setting.settings, dict)
+            else None
+        )
+        return "none" if raw == "none" else "qfq"
 
     async def _indicator_projections(
         self,
@@ -238,9 +336,7 @@ class WatchTableService:
                 return _dividend_yield_error(result)
         return _dividend_yield_data(result)
 
-    async def add_stock(
-        self, user_id: int, table_id: int, security_id: int
-    ) -> WatchTableStockData:
+    async def add_stock(self, user_id: int, table_id: int, security_id: int) -> WatchTableStockData:
         table = await self._owned(table_id, user_id)
         security = await self.security_repository.get_by_id(security_id)
         if security is None:
@@ -261,6 +357,9 @@ class WatchTableService:
                 "WATCH_STOCK_EXISTS", "Security is already in this watch table.", 409
             ) from exc
         await self.session.refresh(security)
+        from app.tasks.jobs import enqueue_security_bootstrap
+
+        enqueue_security_bootstrap(security.symbol)
         return await self._stock_projection(membership, security)
 
     async def remove_stock(self, user_id: int, table_id: int, security_id: int) -> None:
@@ -310,6 +409,7 @@ class WatchTableService:
             table.id,
             column_type=column_type,
             indicator_type=indicator_type,
+            state_code=getattr(request, "state_code", None),
             parameters=parameters,
         )
         if duplicate is not None:
@@ -325,6 +425,7 @@ class WatchTableService:
             watch_table_id=table.id,
             column_type=column_type,
             indicator_type=indicator_type,
+            state_code=request.state_code.strip().upper() if request.state_code else None,
             parameters=parameters,
             view_mode=view_mode,
             position=position,
@@ -338,6 +439,11 @@ class WatchTableService:
             await self.session.rollback()
             raise ApiError("WATCH_COLUMN_EXISTS", "This column already exists.", 409) from exc
         await self.session.refresh(column)
+        from app.tasks.jobs import enqueue_security_bootstrap
+
+        for membership in await self.repository.list_symbols(table.id):
+            if membership.security is not None:
+                enqueue_security_bootstrap(membership.security.symbol)
         return _column_data(column)
 
     async def update_column(
@@ -347,8 +453,26 @@ class WatchTableService:
         if column is None:
             raise ApiError("WATCH_COLUMN_NOT_FOUND", "Column was not found.", 404)
         next_parameters = column.parameters
+        if request.state_code is not None:
+            column.state_code = request.state_code.strip().upper()
         if request.parameters is not None:
-            if column.indicator_type is None:
+            if (
+                column.view_mode.upper() == "STATUS"
+                or (request.view_mode or "").upper() == "STATUS"
+            ):
+                if not column.state_code:
+                    raise ApiError(
+                        "STATE_TARGET_REQUIRED", "STATUS columns require state_code.", 400
+                    )
+                try:
+                    definition = DEFAULT_REGISTRY.get(column.state_code)
+                except UnknownStateError as exc:
+                    raise ApiError("INVALID_STATE_CODE", "State code is invalid.", 400) from exc
+                column.indicator_type = definition.indicator_type
+                next_parameters = _normalize_state_parameters(
+                    definition.indicator_type, request.parameters
+                )
+            elif column.indicator_type is None:
                 next_parameters = normalize_json_parameters(request.parameters)
             else:
                 next_parameters = _normalize_indicator_parameters(
@@ -380,6 +504,7 @@ class WatchTableService:
             column.watch_table_id,
             column_type=column.column_type,
             indicator_type=column.indicator_type,
+            state_code=column.state_code,
             parameters=column.parameters,
             exclude_id=column.id,
         )
@@ -485,12 +610,21 @@ def _validate_column_request(
     view_mode = request.view_mode.upper()
     _validate_view_mode(view_mode)
     indicator_type = request.indicator_type.upper() if request.indicator_type else None
-    if column_type == "INDICATOR" and not indicator_type:
+    if column_type == "INDICATOR" and not indicator_type and view_mode != "STATUS":
         raise ApiError("INVALID_COLUMN", "Indicator columns require indicator_type.", 400)
     if column_type == "PRICE":
         indicator_type = None
-    if indicator_type is None:
-        parameters: dict[str, Any] = {}
+    if view_mode == "STATUS":
+        if not request.state_code:
+            raise ApiError("STATE_TARGET_REQUIRED", "STATUS columns require state_code.", 400)
+        try:
+            definition = DEFAULT_REGISTRY.get(request.state_code.strip().upper())
+        except (UnknownStateError, ValueError, TypeError) as exc:
+            raise ApiError("INVALID_STATE_CODE", "State code is invalid.", 400) from exc
+        indicator_type = definition.indicator_type
+        parameters = _normalize_state_parameters(indicator_type, request.parameters)
+    elif indicator_type is None:
+        parameters = {}
     else:
         indicator_type = _normalize_indicator_type(indicator_type)
         parameters = _normalize_indicator_parameters(
@@ -505,6 +639,24 @@ def _validate_column_request(
 def _validate_view_mode(view_mode: str) -> None:
     if view_mode.upper() not in _VIEW_MODES:
         raise ApiError("INVALID_VIEW_MODE", "View mode is invalid.", 400)
+
+
+def _normalize_state_parameters(
+    indicator_type: str, parameters: Mapping[str, Any]
+) -> dict[str, Any]:
+    if indicator_type == "MA":
+        raw = dict(parameters or {})
+        try:
+            short = int(raw.get("short_period", raw.get("short", 5)))
+            long = int(raw.get("long_period", raw.get("long", 10)))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(
+                "INVALID_STATE_PARAMETERS", "MA state periods are invalid.", 400
+            ) from exc
+        if short <= 0 or long <= 0 or short >= long:
+            raise ApiError("INVALID_STATE_PARAMETERS", "MA state periods are invalid.", 400)
+        return {"short_period": short, "long_period": long}
+    return canonicalize_parameters(indicator_type, parameters, fill_defaults=True)
 
 
 def _normalize_indicator_type(value: str | None) -> str:
@@ -610,9 +762,7 @@ def _is_composite_parameters(indicator_type: str, parameters: Mapping[str, Any])
 
 def _calculation_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        str(key): value
-        for key, value in parameters.items()
-        if str(key).strip().lower() != "field"
+        str(key): value for key, value in parameters.items() if str(key).strip().lower() != "field"
     }
 
 
@@ -877,6 +1027,38 @@ def _mapping_key(values: dict[str, Any], expected: str) -> str | None:
     )
 
 
+def _visible_states(states: Sequence[Any], columns: Sequence[TableColumn]) -> list[Any]:
+    explicit: set[tuple[str, str]] = set()
+    for column in columns:
+        if column.view_mode.upper() != "STATUS" or not column.state_code:
+            continue
+        explicit.add(
+            (
+                column.state_code.upper(),
+                state_parameter_key(column.state_code.upper(), dict(column.parameters or {})),
+            )
+        )
+    visible = []
+    for state in states:
+        if getattr(state, "parameter_key", None) == "default":
+            visible.append(state)
+            continue
+        parameters = dict(getattr(state, "parameters", {}) or {})
+        is_default_ma = parameters == {"short_period": 5, "long_period": 10}
+        if getattr(state, "indicator_type", "") == "MA":
+            is_default = is_default_ma
+        else:
+            try:
+                is_default = parameters == canonicalize_parameters(
+                    state.indicator_type, None, fill_defaults=True
+                )
+            except ApiError:
+                is_default = False
+        if is_default or (state.state_code, state.parameter_key) in explicit:
+            visible.append(state)
+    return visible
+
+
 def _security_data(security) -> Any:
     from app.schemas.security import SecurityData
 
@@ -926,6 +1108,9 @@ def _state_data(state) -> CurrentStateData:
         active=bool(metadata.get("active", state.status == "ACTIVE")),
         transition=bool(metadata.get("transition", False)),
         trade_date=state.trade_date,
+        parameters=dict(state.parameters or {}),
+        parameter_key=state.parameter_key,
+        adjust_type=state.adjust_type,
         metadata=metadata,
     )
 
@@ -957,6 +1142,7 @@ def _column_data(column: TableColumn) -> TableColumnData:
         column_type=column.column_type,
         type=column.indicator_type or column.column_type,
         indicator_type=column.indicator_type,
+        state_code=column.state_code,
         parameters=_json_numbers(column.parameters),
         view_mode=column.view_mode,
         position=column.position,

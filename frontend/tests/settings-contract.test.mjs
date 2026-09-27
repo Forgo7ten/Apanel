@@ -21,23 +21,28 @@ test("normalizes settings without exposing a masked webhook", () => {
 });
 
 test("does not copy an unmasked webhook returned by a legacy backend", () => {
-  const form = normalizeSettings({ notification_settings: { feishu_webhook: "https://open.feishu.cn/hook/secret" } });
+  const form = normalizeSettings({ notification_settings: { feishu_webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/secret" } });
 
   assert.equal(form.webhook, "");
   assert.equal(form.webhookConfigured, true);
 });
 
-test("serializes an empty webhook as null so the backend can clear it", () => {
+test("omits an empty webhook so saving other settings keeps the secret", () => {
   const form = normalizeSettings({ notification_settings: { feishu_webhook_configured: true } });
   const payload = toSettingsPayload({ ...form, webhook: "  " });
 
+  assert.equal(Object.hasOwn(payload, "notification_settings"), false);
+});
+
+test("serializes null only after an explicit clear action", () => {
+  const form = normalizeSettings({ notification_settings: { feishu_webhook_configured: true } });
+  const payload = toSettingsPayload({ ...form, clearWebhook: true });
   assert.equal(payload.notification_settings.feishu_webhook, null);
-  assert.equal(Object.hasOwn(payload.notification_settings, "feishu_webhook"), true);
 });
 
 test("trims a replacement webhook only at the API boundary", () => {
   const form = normalizeSettings({});
-  const payload = toSettingsPayload({ ...form, webhook: " https://open.feishu.cn/hook/example " });
+  const payload = toSettingsPayload({ ...form, webhook: " https://open.feishu.cn/open-apis/bot/v2/hook/example " });
 
-  assert.equal(payload.notification_settings.feishu_webhook, "https://open.feishu.cn/hook/example");
+  assert.equal(payload.notification_settings.feishu_webhook, "https://open.feishu.cn/open-apis/bot/v2/hook/example");
 });

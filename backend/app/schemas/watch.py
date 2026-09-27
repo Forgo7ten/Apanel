@@ -55,13 +55,14 @@ class ColumnCreateRequest(BaseModel):
         validation_alias=AliasChoices("column_type", "type"),
     )
     indicator_type: str | None = Field(default=None, max_length=32)
+    state_code: str | None = Field(default=None, max_length=64)
     parameters: dict[str, Any] = Field(default_factory=dict)
     view_mode: str = Field(default="NUMBER", max_length=16)
     position: int | None = Field(default=None, ge=0)
     visible: bool = True
     width: int | None = Field(default=None, ge=1, le=2000)
 
-    @field_validator("column_type", "view_mode", "indicator_type")
+    @field_validator("column_type", "view_mode", "indicator_type", "state_code")
     @classmethod
     def strip_values(cls, value: str | None) -> str | None:
         return value.strip().upper() if value is not None else value
@@ -76,9 +77,10 @@ class ColumnUpdateRequest(BaseModel):
     order: int | None = Field(default=None, ge=0)
     width: int | None = Field(default=None, ge=1, le=2000)
     view_mode: str | None = Field(default=None, max_length=16)
+    state_code: str | None = Field(default=None, max_length=64)
     parameters: dict[str, Any] | None = None
 
-    @field_validator("view_mode")
+    @field_validator("view_mode", "state_code")
     @classmethod
     def strip_view_mode(cls, value: str | None) -> str | None:
         return value.strip().upper() if value is not None else value
@@ -97,6 +99,7 @@ class TableColumnData(BaseModel):
     column_type: str
     type: str
     indicator_type: str | None = None
+    state_code: str | None = None
     parameters: dict[str, Any]
     view_mode: str
     position: int
@@ -130,6 +133,9 @@ class CurrentStateData(BaseModel):
     active: bool
     transition: bool = False
     trade_date: date
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    parameter_key: str = "default"
+    adjust_type: str = "qfq"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

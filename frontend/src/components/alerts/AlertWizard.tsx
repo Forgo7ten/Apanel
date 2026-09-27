@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 
 import { searchSecurities } from "@/api/securities";
 import type { AlertRule, CreateAlertInput, Security } from "@/api/types";
+import { getDefaultIndicatorParameters, getIndicatorFieldOptions, indicatorUsesAdjustment } from "@/lib/indicator-metadata.mjs";
 import { StateTag, stateToneFromLevel } from "@/components/ui/StateTag";
 import { isApiError } from "@/lib/api-errors";
 import {
@@ -15,6 +16,16 @@ import {
 } from "@/lib/notification-contract.mjs";
 
 type SelectedSecurity = Security & { id: number | string };
+
+export type AlertWizardDraft = {
+  security?: SelectedSecurity | null;
+  condition_type?: "STATE" | "VALUE";
+  state_id?: string;
+  indicator?: string;
+  parameters?: Record<string, number>;
+  field?: string;
+  adjust_type?: "qfq" | "none";
+};
 
 function getSecurityIdentifier(security: Security | null): number | string | null {
   if (!security) return null;
@@ -43,6 +54,7 @@ function getRuleSecurity(rule: AlertRule): SelectedSecurity | null {
 export function AlertWizard({
   open,
   initialRule,
+  initialDraft,
   isSubmitting = false,
   submitError,
   onClose,
@@ -50,19 +62,31 @@ export function AlertWizard({
 }: {
   open: boolean;
   initialRule?: AlertRule | null;
+  initialDraft?: AlertWizardDraft | null;
   isSubmitting?: boolean;
   submitError?: unknown;
   onClose: () => void;
   onSubmit: (input: CreateAlertInput) => void;
 }) {
-  const initialSecurity = initialRule ? getRuleSecurity(initialRule) : null;
+  const initialSecurity = initialRule ? getRuleSecurity(initialRule) : initialDraft?.security ?? null;
   const [securityQuery, setSecurityQuery] = useState(initialSecurity?.symbol ?? "");
   const [selectedSecurity, setSelectedSecurity] = useState<SelectedSecurity | null>(initialSecurity);
-  const [conditionType, setConditionType] = useState<"STATE" | "VALUE">(initialRule?.condition_type.toUpperCase() === "VALUE" ? "VALUE" : "STATE");
-  const [stateId, setStateId] = useState(initialRule?.state_id ?? initialRule?.state_code ?? ALERT_STATE_OPTIONS[0]?.id ?? "");
-  const [indicator, setIndicator] = useState(initialRule?.indicator ?? initialRule?.indicator_type ?? ALERT_INDICATOR_OPTIONS[0]?.id ?? "RSI");
+  const [conditionType, setConditionType] = useState<"STATE" | "VALUE">(
+    initialRule?.condition_type.toUpperCase() === "VALUE" ? "VALUE" : initialDraft?.condition_type ?? "STATE",
+  );
+  const [stateId, setStateId] = useState(initialRule?.state_id ?? initialRule?.state_code ?? initialDraft?.state_id ?? ALERT_STATE_OPTIONS[0]?.id ?? "");
+  const [indicator, setIndicator] = useState(initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator ?? ALERT_INDICATOR_OPTIONS[0]?.id ?? "RSI");
   const [operator, setOperator] = useState(initialRule?.operator ?? ALERT_OPERATOR_OPTIONS[0]?.id ?? ">=");
   const [threshold, setThreshold] = useState(initialRule?.threshold === null || initialRule?.threshold === undefined ? "70" : String(initialRule.threshold));
+  const initialIndicator = initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator ?? "RSI";
+  const [parameters, setParameters] = useState<Record<string, number>>(() => ({
+    ...getDefaultIndicatorParameters(initialIndicator),
+    ...((initialRule?.parameters ?? initialDraft?.parameters ?? {}) as Record<string, number>),
+  }));
+  const [field, setField] = useState(initialRule?.field ?? initialDraft?.field ?? "");
+  const [adjustType, setAdjustType] = useState<"qfq" | "none">(
+    (initialRule?.adjust_type ?? initialDraft?.adjust_type) === "none" ? "none" : "qfq",
+  );
   const [formError, setFormError] = useState<string | null>(null);
 
   const editing = initialRule !== null && initialRule !== undefined;
@@ -109,6 +133,9 @@ export function AlertWizard({
         indicator,
         operator,
         threshold,
+        parameters,
+        field,
+        adjust_type: adjustType,
       });
       onSubmit(payload as CreateAlertInput);
     } catch (error) {
@@ -202,29 +229,70 @@ export function AlertWizard({
             </div>
 
             {conditionType === "STATE" ? (
-              <div>
-                <label htmlFor="alert-state" className="text-xs font-medium text-secondary">状态</label>
-                <select id="alert-state" value={stateId} onChange={(event) => setStateId(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30">
-                  {ALERT_STATE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.title} · {option.id}</option>)}
-                </select>
-                {selectedState ? <div className="mt-2"><StateTag tone={stateToneFromLevel(selectedState.level)}>{selectedState.title}</StateTag></div> : null}
-                <p className="mt-2 text-[11px] leading-5 text-muted">状态语义来自后端 State Registry；前端只提交状态 ID。</p>
+              <div className="space-y-3">
+                <label htmlFor="alert-state" className="text-xs font-medium text-secondary">状态
+                  <select id="alert-state" value={stateId} onChange={(event) => setStateId(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30">
+                    {ALERT_STATE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.title} · {option.id}</option>)}
+                  </select>
+                </label>
+                <label className="block text-xs font-medium text-secondary">复权
+                  <select value={adjustType} onChange={(event) => setAdjustType(event.target.value as "qfq" | "none")} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary">
+                    <option value="qfq">前复权</option><option value="none">不复权</option>
+                  </select>
+                </label>
+                {selectedState ? <div><StateTag tone={stateToneFromLevel(selectedState.level)}>{selectedState.title}</StateTag></div> : null}
+                <p className="text-[11px] leading-5 text-muted">状态由后端按参数和复权口径识别；已有规则不会随全局默认设置改变。</p>
               </div>
             ) : (
-              <div className="grid gap-3 sm:grid-cols-[1fr_1fr_1.2fr]">
-                <label className="text-xs font-medium text-secondary">指标
-                  <select value={indicator} onChange={(event) => setIndicator(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-2 text-sm font-normal text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30">
-                    {ALERT_INDICATOR_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.title}</option>)}
-                  </select>
-                </label>
-                <label className="text-xs font-medium text-secondary">比较
-                  <select value={operator} onChange={(event) => setOperator(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-2 text-sm font-normal text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30">
-                    {ALERT_OPERATOR_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.id} · {option.title}</option>)}
-                  </select>
-                </label>
-                <label htmlFor="alert-threshold" className="text-xs font-medium text-secondary">阈值
-                  <input id="alert-threshold" type="number" step="any" value={threshold} onChange={(event) => setThreshold(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm font-normal text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30" />
-                </label>
+              <div className="space-y-4">
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <label className="text-xs font-medium text-secondary">指标
+                    <select value={indicator} onChange={(event) => {
+                        const next = event.target.value;
+                        setIndicator(next);
+                        setParameters(getDefaultIndicatorParameters(next));
+                        setField("");
+                      }} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-2 text-sm font-normal text-primary">
+                      {ALERT_INDICATOR_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.title}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-xs font-medium text-secondary">比较
+                    <select value={operator} onChange={(event) => setOperator(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-2 text-sm font-normal text-primary">
+                      {ALERT_OPERATOR_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.id} · {option.title}</option>)}
+                    </select>
+                  </label>
+                  <label htmlFor="alert-threshold" className="text-xs font-medium text-secondary">阈值
+                    <input id="alert-threshold" type="number" step="any" value={threshold} onChange={(event) => setThreshold(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm font-normal text-primary" />
+                  </label>
+                </div>
+                {Object.keys(parameters).length ? (
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    {Object.entries(parameters).map(([key, value]) => (
+                      <label key={key} className="text-xs font-medium text-secondary">{key}
+                        <input type="number" min="1" step={key === "multiplier" ? "0.1" : "1"} value={value}
+                          onChange={(event) => setParameters((current) => ({ ...current, [key]: Number(event.target.value) }))}
+                          className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary" />
+                      </label>
+                    ))}
+                  </div>
+                ) : null}
+                {(getIndicatorFieldOptions(indicator).length > 1 || indicator === "MA") ? (
+                  <label className="block text-xs font-medium text-secondary">字段
+                    <select value={field} onChange={(event) => setField(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary">
+                      <option value="">请选择</option>
+                      {indicator === "MA"
+                        ? <option value={`MA${parameters.period ?? 5}`}>{`MA${parameters.period ?? 5}`}</option>
+                        : getIndicatorFieldOptions(indicator).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                    </select>
+                  </label>
+                ) : null}
+                {indicatorUsesAdjustment(indicator) ? (
+                  <label className="block text-xs font-medium text-secondary">复权
+                    <select value={adjustType} onChange={(event) => setAdjustType(event.target.value as "qfq" | "none")} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary">
+                      <option value="qfq">前复权</option><option value="none">不复权</option>
+                    </select>
+                  </label>
+                ) : null}
               </div>
             )}
           </fieldset>
