@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 import {
   ALERT_STATE_OPTIONS,
@@ -118,4 +119,10 @@ test("notification retry action never derives retryability from unsafe error tex
     }),
     false,
   );
+});
+
+test("alert wizard only shows security-search loading while an unselected search is fetching", () => {
+  const source = readFileSync(new URL("../src/components/alerts/AlertWizard.tsx", import.meta.url), "utf8");
+  assert.match(source, /!selectedSecurity && searchQuery\.isFetching/);
+  assert.doesNotMatch(source, /\{searchQuery\.isPending \? <p[^>]*>正在搜索证券/);
 });

@@ -34,7 +34,7 @@ export function CompositeCell({ value, states = [] }: { value: unknown; states?:
   }
 
   return (
-    <div className="min-w-[150px] whitespace-nowrap py-1">
+    <div className="w-full min-w-0 overflow-hidden whitespace-nowrap py-1">
       <div className="space-y-0.5">
         {fields.map(([key, fieldValue]) => {
           const direction = getDirection(fieldValue);

@@ -14,7 +14,7 @@ import {
 import { MiniChart } from "./MiniChart";
 import { trapDialogTab } from "../ui/dialog-focus";
 import type { DetailNotificationHandler, DetailSelection } from "./detail-types";
-import { formatMetricValue, getDirection, getFieldValue } from "./indicator-utils";
+import { formatMetricValue, formatPercentageValue, getColumnTitle, getDirection, getFieldValue, isDividendYieldColumn } from "./indicator-utils";
 import { useIndicatorDetailsData } from "./useIndicatorDetailsData";
 import { stateToneFromLevel, StateTag } from "../ui/StateTag";
 
@@ -27,16 +27,17 @@ function directionLabel(direction: unknown): string {
   return "—";
 }
 
-function ScalarSummary({ value }: { value: unknown }) {
+function ScalarSummary({ value, percentage = false }: { value: unknown; percentage?: boolean }) {
   const current = getFieldValue(value, "value") ?? value;
   const previous = getFieldValue(value, "previous_value");
   const delta = getFieldValue(value, "delta");
   const direction = getDirection(value);
+  const format = percentage ? formatPercentageValue : formatMetricValue;
   return (
     <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs sm:grid-cols-4">
-      <div><dt className="text-muted">当前</dt><dd className="mt-1 tabular-nums text-primary">{formatMetricValue(current)}</dd></div>
-      <div><dt className="text-muted">前值</dt><dd className="mt-1 tabular-nums text-secondary">{formatMetricValue(previous)}</dd></div>
-      <div><dt className="text-muted">变化</dt><dd className="mt-1 tabular-nums text-secondary">{formatMetricValue(delta)}</dd></div>
+      <div><dt className="text-muted">当前</dt><dd className="mt-1 tabular-nums text-primary">{format(current)}</dd></div>
+      <div><dt className="text-muted">前值</dt><dd className="mt-1 tabular-nums text-secondary">{format(previous)}</dd></div>
+      <div><dt className="text-muted">变化</dt><dd className="mt-1 tabular-nums text-secondary">{format(delta)}</dd></div>
       <div><dt className="text-muted">方向</dt><dd className="mt-1 text-secondary">{directionLabel(direction)}</dd></div>
     </dl>
   );
@@ -65,6 +66,7 @@ function StateCurrentSummary({ state }: { state: IndicatorState }) {
 function CurrentValue({ selection, currentValue }: { selection: DetailSelection; currentValue: unknown }) {
   if (selection.kind === "state") return <StateCurrentSummary state={selection.state} />;
 
+  const percentage = isDividendYieldColumn(selection.column);
   const fields = getColumnFields(currentValue);
   if (selection.column.view_mode === "COMPOSITE" && fields.length > 0) {
     return (
@@ -72,13 +74,13 @@ function CurrentValue({ selection, currentValue }: { selection: DetailSelection;
         {orderHistoryFields(Object.fromEntries(fields) as Record<string, unknown>).map(([field, fieldValue]) => (
           <div key={field} className="rounded-panel border border-line/70 bg-card/30 px-3 py-2">
             <div className="text-xs font-medium text-secondary">{field}</div>
-            <div className="mt-1"><ScalarSummary value={fieldValue} /></div>
+            <div className="mt-1"><ScalarSummary value={fieldValue} percentage={percentage} /></div>
           </div>
         ))}
       </div>
     );
   }
-  return <ScalarSummary value={currentValue} />;
+  return <ScalarSummary value={currentValue} percentage={percentage} />;
 }
 
 function HistoryStateList({ items }: { items: Array<{
@@ -145,7 +147,7 @@ export function IndicatorDetailsDrawer({
   if (!selection || !open) return null;
 
   const title = selection.kind === "indicator"
-    ? selection.column.title ?? selection.column.label ?? selection.column.indicator_type ?? selection.column.type
+    ? getColumnTitle(selection.column)
     : selection.state.title;
   const relatedStates = selection.kind === "indicator"
     ? selectRelatedStates<IndicatorState>(selection.stock.states, selection.column.indicator_type ?? selection.column.type)
@@ -195,7 +197,11 @@ export function IndicatorDetailsDrawer({
               {data.indicatorState === "empty" ? <p className="text-xs text-muted">暂无该参数的历史数据。</p> : null}
               {data.indicatorState === "ready" && data.showMiniChart ? <MiniChart points={data.chartPoints} /> : null}
               {data.indicatorState === "ready" && data.chartPoints.length === 0 ? <p className="text-xs text-muted">历史中没有可绘制的数值。</p> : null}
-              {data.indicatorState === "ready" ? <p className="mt-2 text-[11px] text-muted">最近值 {formatMetricValue(data.latestValue)}</p> : null}
+              {data.indicatorState === "ready" ? (
+                <p className="mt-2 text-[11px] text-muted">
+                  最近值 {isDividendYieldColumn(selection.column) ? formatPercentageValue(data.latestValue) : formatMetricValue(data.latestValue)}
+                </p>
+              ) : null}
             </section>
           ) : null}
 

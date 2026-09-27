@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { getIndicatorDisplayTitle } from "../src/lib/indicator-metadata.mjs";
 
 import {
   getDefaultIndicatorParameters,
   getIndicatorFieldOptions,
   getSecurityIdentifier,
+  reorderColumnIdsForDrop,
   toAddStockPayload,
   toCreateColumnPayload,
   toColumnOrderPayload,
@@ -13,8 +15,12 @@ import {
   filterWatchStocks,
   calculateVirtualRange,
   dialogFocusTargetIndex,
+  expectedCompositeFieldCount,
   isCurrentWatchDetail,
+  isWatchStockDataReady,
   virtualScrollTopForKey,
+  WATCH_BOOTSTRAP_POLL_INTERVAL_MS,
+  WATCH_BOOTSTRAP_TIMEOUT_MS,
   WATCH_DETAIL_REFRESH_INTERVAL_MS,
   watchRowLayoutContract,
   watchDetailViewState,
@@ -83,6 +89,23 @@ test("column payload preserves selected mode and strict indicator parameters", (
   );
 });
 
+test("projected MA uses a period-specific Chinese display title", () => {
+  assert.equal(getIndicatorDisplayTitle("PROJECTED_MA", { period: 5 }), "预测5日线");
+  assert.equal(getIndicatorDisplayTitle("PROJECTED_MA", { period: 20 }), "预测20日线");
+});
+
+test("dividend yield always persists as the single NUMBER view", () => {
+  assert.deepEqual(
+    toCreateColumnPayload({ indicatorType: "DIVIDEND_YIELD", viewMode: "COMPOSITE" }),
+    {
+      column_type: "INDICATOR",
+      indicator_type: "DIVIDEND_YIELD",
+      parameters: {},
+      view_mode: "NUMBER",
+    },
+  );
+});
+
 test("composite indicator field options use the canonical backend vocabulary", () => {
   assert.deepEqual(getIndicatorFieldOptions("BOLL").map((option) => option.value), ["upper", "middle", "lower", "width"]);
   assert.deepEqual(getIndicatorFieldOptions("KDJ").map((option) => option.value), ["k", "d", "j"]);
@@ -120,6 +143,14 @@ test("column order payload only contains persisted dynamic column ids", () => {
   assert.deepEqual(toColumnOrderPayload(["security", "price", "states"]), { column_ids: [] });
 });
 
+test("drag-and-drop reorder moves source before target without mutating input", () => {
+  const original = ["11", "12", "13", "14"];
+  assert.deepEqual(reorderColumnIdsForDrop(original, "14", "12"), ["11", "14", "12", "13"]);
+  assert.deepEqual(reorderColumnIdsForDrop(original, "11", "14", "after"), ["12", "13", "14", "11"]);
+  assert.deepEqual(original, ["11", "12", "13", "14"]);
+  assert.deepEqual(reorderColumnIdsForDrop(original, "missing", "12"), original);
+});
+
 test("watch filters match stock identity and active state without calculating indicators", () => {
   const stocks = [
     { symbol: "600519", name: "贵州茅台", states: [{ state_code: "BOLL_WIDTH_NARROWING", title: "带口收窄" }] },
@@ -134,16 +165,119 @@ test("watch filters match stock identity and active state without calculating in
 
 test("watch detail polling interval is five minutes", () => {
   assert.equal(WATCH_DETAIL_REFRESH_INTERVAL_MS, 300_000);
+  assert.equal(WATCH_BOOTSTRAP_POLL_INTERVAL_MS, 5_000);
+  assert.equal(WATCH_BOOTSTRAP_TIMEOUT_MS, 120_000);
   const source = readFileSync(new URL("../src/app/(workspace)/watch/page.tsx", import.meta.url), "utf8");
-  assert.match(source, /refetchInterval: WATCH_DETAIL_REFRESH_INTERVAL_MS/);
+  assert.match(source, /stillPreparing \? WATCH_BOOTSTRAP_POLL_INTERVAL_MS : WATCH_DETAIL_REFRESH_INTERVAL_MS/);
+  assert.match(source, /query\.state\.data/);
   assert.match(source, /refetchIntervalInBackground: false/);
+  assert.doesNotMatch(source, /正在刷新监控数据/);
 });
 
-test("add-stock dialog bounds long search results and refreshes after async bootstrap", () => {
+test("add-stock dialog bounds long search results and inserts a stable bootstrap row", () => {
   const source = readFileSync(new URL("../src/components/table/AddStockDialog.tsx", import.meta.url), "utf8");
   assert.match(source, /max-h-\[15rem\].*overflow-y-auto/);
-  assert.match(source, /BOOTSTRAP_REFRESH_DELAYS_MS = \[2_000, 5_000, 10_000, 20_000, 40_000\]/);
+  assert.match(source, /setQueryData<WatchTableDetails>/);
+  assert.match(source, /onAdded\?\.\(stock\)/);
+  assert.doesNotMatch(source, /BOOTSTRAP_REFRESH_DELAYS_MS/);
   assert.match(source, /title=\{security\.name\}/);
+});
+
+test("watch stock readiness waits for price and visible column materialization", () => {
+  const columns = [
+    { id: 11, visible: true },
+    { id: 12, visible: true },
+    { id: 13, visible: false },
+  ];
+  assert.equal(isWatchStockDataReady({
+    price: { value: 10.5 },
+    column_values: {
+      11: { available: true },
+      12: { available: true },
+    },
+  }, columns), true);
+  assert.equal(isWatchStockDataReady({
+    price: { value: 10.5 },
+    column_values: {
+      11: { available: true },
+      12: { available: false },
+    },
+  }, columns), false);
+  assert.equal(isWatchStockDataReady({
+    price: null,
+    column_values: {
+      11: { available: true },
+      12: { available: true },
+    },
+  }, columns), false);
+  assert.equal(isWatchStockDataReady({
+    bootstrap_ready: false,
+    price: { value: 10.5 },
+    column_values: {
+      11: { available: true },
+      12: { available: true },
+    },
+  }, columns), false);
+  assert.equal(isWatchStockDataReady({
+    bootstrap_ready: true,
+    price: null,
+    column_values: {},
+  }, columns), true);
+});
+
+test("row layout reserves composite field height from column definitions", () => {
+  assert.equal(expectedCompositeFieldCount([
+    { indicator_type: "KDJ", view_mode: "COMPOSITE", parameters: { period: 9 } },
+    { indicator_type: "BOLL", view_mode: "COMPOSITE", parameters: { period: 20 } },
+  ]), 4);
+  assert.equal(expectedCompositeFieldCount([
+    { indicator_type: "MA", view_mode: "COMPOSITE", parameters: { periods: [5, 10, 20] } },
+  ]), 3);
+  assert.equal(expectedCompositeFieldCount([
+    { indicator_type: "BOLL", view_mode: "COMPOSITE", visible: false, parameters: { period: 20 } },
+    { indicator_type: "RSI", view_mode: "NUMBER", parameters: { period: 14 } },
+  ]), 0);
+});
+
+test("watch table suppresses partial bootstrap values until the new row is ready", () => {
+  const source = readFileSync(new URL("../src/components/table/WatchTable.tsx", import.meta.url), "utf8");
+  assert.match(source, /bootstrappingStockIds/);
+  assert.match(source, /数据准备中/);
+  assert.match(source, /expectedCompositeFieldCount\(layoutColumns\)/);
+  assert.match(source, /className="table-fixed border-collapse text-left"/);
+  assert.match(source, /<colgroup>/);
+  assert.match(source, /columnPixelWidth/);
+  assert.doesNotMatch(source, /getColumnFields\(getIndicatorValue\(stock, column\)\)/);
+});
+
+test("column manager is a viewport modal with integrated add flow and drag sorting", () => {
+  const source = readFileSync(new URL("../src/components/table/ColumnManager.tsx", import.meta.url), "utf8");
+  const watchSource = readFileSync(new URL("../src/components/table/WatchTable.tsx", import.meta.url), "utf8");
+  assert.match(source, /createPortal\(/);
+  assert.match(source, /document\.body/);
+  assert.match(source, /fixed inset-0 z-50/);
+  assert.match(source, /max-h-\[min\(82vh,48rem\)\]/);
+  assert.match(source, /min-h-0 flex-1 overflow-y-auto/);
+  assert.match(source, /aria-modal="true"/);
+  assert.match(source, /trapDialogTab/);
+  assert.match(source, /<ColumnAddForm tableId=\{tableId\}/);
+  assert.match(source, /draggable=\{!item\.pending\}/);
+  assert.match(source, /onReorder\(draggedId, item\.id, dragOverPosition\)/);
+  assert.doesNotMatch(source, /absolute right-0 top-10/);
+  assert.doesNotMatch(watchSource, /AddColumnDialog/);
+});
+
+test("dividend yield display is locked to NUMBER and formatted as a three-decimal percentage", () => {
+  const watchSource = readFileSync(new URL("../src/components/table/WatchTable.tsx", import.meta.url), "utf8");
+  const addSource = readFileSync(new URL("../src/components/table/ColumnAddForm.tsx", import.meta.url), "utf8");
+  const utilSource = readFileSync(new URL("../src/components/indicators/indicator-utils.ts", import.meta.url), "utf8");
+  assert.match(addSource, /dividendYield \? "NUMBER" : viewMode/);
+  assert.match(addSource, /disabled=\{dividendYield\}/);
+  assert.match(watchSource, /viewModeLocked: dividendYield/);
+  assert.match(watchSource, /percentage=\{isDividendYieldColumn\(column\)\}/);
+  assert.match(utilSource, /minimumFractionDigits: 3/);
+  assert.match(utilSource, /maximumFractionDigits: 3/);
+  assert.match(utilSource, /numeric \* 100/);
 });
 
 test("watch detail keeps stale data during refresh and separates initial errors", () => {

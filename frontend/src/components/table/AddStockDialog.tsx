@@ -4,13 +4,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type RefObject } from "react";
 
 import { searchSecurities } from "@/api/securities";
-import type { Identifier, Security } from "@/api/types";
+import type { Identifier, Security, WatchTableDetails, WatchTableStock, WatchTableSummary } from "@/api/types";
 import { addStockToWatchTable } from "@/api/watch";
 import { isApiError } from "@/lib/api-errors";
 import { getSecurityIdentifier, toAddStockPayload } from "@/lib/watch-contract.mjs";
 import { trapDialogTab } from "../ui/dialog-focus";
-
-const BOOTSTRAP_REFRESH_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000] as const;
 
 function securityId(security: Security): Identifier | null {
   return getSecurityIdentifier(security);
@@ -19,10 +17,12 @@ function securityId(security: Security): Identifier | null {
 export function AddStockDialog({
   tableId,
   restoreFocusRef,
+  onAdded,
   onClose,
 }: {
   tableId: Identifier;
   restoreFocusRef?: RefObject<HTMLButtonElement | null>;
+  onAdded?: (stock: WatchTableStock) => void;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -44,17 +44,22 @@ export function AddStockDialog({
       if (payload === null) throw new Error("搜索结果缺少 security_id，暂时无法添加。");
       return addStockToWatchTable(tableId, payload);
     },
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
-      ]);
+    onSuccess: (stock) => {
+      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => {
+        if (!current) return current;
+        if (current.stocks.some((item) => String(item.security_id) === String(stock.security_id))) {
+          return current;
+        }
+        const stocks = [...current.stocks, stock];
+        return { ...current, stocks, stock_count: stocks.length };
+      });
+      queryClient.setQueryData<WatchTableSummary[]>(["watch-tables"], (current) => current?.map((summary) => (
+        String(summary.id) === String(tableId)
+          ? { ...summary, stock_count: summary.stock_count + 1 }
+          : summary
+      )));
+      onAdded?.(stock);
       onClose();
-      for (const delay of BOOTSTRAP_REFRESH_DELAYS_MS) {
-        window.setTimeout(() => {
-          void queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] });
-        }, delay);
-      }
     },
   });
   const pendingRef = useRef(false);

@@ -219,6 +219,7 @@ class WatchTableService:
                     name=security.name,
                     market=security.market,
                     security=_security_data(security),
+                    bootstrap_ready=_bootstrap_ready(membership, security),
                     price=price,
                     indicators=indicators,
                     indicator_values=indicators,
@@ -587,6 +588,7 @@ class WatchTableService:
             name=security.name,
             market=security.market,
             security=_security_data(security),
+            bootstrap_ready=_bootstrap_ready(membership, security),
         )
 
     @staticmethod
@@ -614,6 +616,18 @@ def _dividend_yield_error(error: ApiError) -> dict[str, Any]:
         "price_source": None,
         "error_code": error.code,
     }
+
+
+def _bootstrap_ready(membership: WatchTableSymbol, security: Any) -> bool:
+    completed_at = getattr(security, "bootstrap_completed_at", None)
+    requested_at = getattr(membership, "created_at", None)
+    if completed_at is None or requested_at is None:
+        return False
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=UTC)
+    if requested_at.tzinfo is None:
+        requested_at = requested_at.replace(tzinfo=UTC)
+    return completed_at >= requested_at
 
 
 def _normalize_name(value: str) -> str:

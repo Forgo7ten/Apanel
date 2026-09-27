@@ -97,6 +97,9 @@ class Security(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    bootstrap_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     daily_bars: Mapped[list[DailyBar]] = relationship(
         back_populates="security", cascade="all, delete-orphan"
     )

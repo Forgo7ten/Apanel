@@ -1,11 +1,12 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useMemo, useState } from "react";
 
 import { createWatchTableColumn } from "@/api/watch";
 import type { Identifier, IndicatorViewMode } from "@/api/types";
 import { isApiError } from "@/lib/api-errors";
+import { getIndicatorDisplayTitle } from "@/lib/indicator-metadata.mjs";
 import { ALERT_STATE_OPTIONS } from "@/lib/notification-contract.mjs";
 import {
   getDefaultIndicatorParameters,
@@ -13,7 +14,6 @@ import {
   toCreateColumnPayload,
   WATCH_INDICATOR_OPTIONS,
 } from "@/lib/watch-contract.mjs";
-import { trapDialogTab } from "../ui/dialog-focus";
 
 type ParameterField = {
   key: string;
@@ -66,7 +66,6 @@ function toNumericParameters(parameters: Record<string, string>): Record<string,
   return Object.fromEntries(Object.entries(parameters).map(([key, value]) => [key, Number(value)]));
 }
 
-
 function compatibleStateOptions(indicatorType: string) {
   const prefix = `${indicatorType.toUpperCase()}_`;
   return ALERT_STATE_OPTIONS.filter((option) => option.id.startsWith(prefix));
@@ -97,48 +96,48 @@ function mutationErrorMessage(error: unknown): string | null {
   return error instanceof Error ? error.message : "指标列创建失败，请稍后重试。";
 }
 
-export function AddColumnDialog({
+export function ColumnAddForm({
   tableId,
-  restoreFocusRef,
-  onClose,
+  onCreated,
 }: {
   tableId: Identifier;
-  restoreFocusRef?: RefObject<HTMLButtonElement | null>;
-  onClose: () => void;
+  onCreated?: () => void;
 }) {
   const queryClient = useQueryClient();
-  const indicatorSelectRef = useRef<HTMLSelectElement>(null);
-  const dialogRef = useRef<HTMLElement>(null);
   const [indicatorType, setIndicatorType] = useState("MA");
   const [viewMode, setViewMode] = useState<IndicatorViewMode>("COMPOSITE");
   const [parameters, setParameters] = useState(() => toFormParameters("MA"));
   const [field, setField] = useState("");
   const [stateCode, setStateCode] = useState("");
+  const dividendYield = indicatorType === "DIVIDEND_YIELD";
+  const effectiveViewMode: IndicatorViewMode = dividendYield ? "NUMBER" : viewMode;
   const stateOptions = useMemo(() => compatibleStateOptions(indicatorType), [indicatorType]);
   const fields = useMemo(
-    () => viewMode === "STATUS" ? getStatusParameterFields(indicatorType) : getParameterFields(indicatorType),
-    [indicatorType, viewMode],
+    () => effectiveViewMode === "STATUS" ? getStatusParameterFields(indicatorType) : getParameterFields(indicatorType),
+    [effectiveViewMode, indicatorType],
   );
   const fieldOptions = useMemo(() => getIndicatorFieldOptions(indicatorType), [indicatorType]);
-  const requiresField = (viewMode === "NUMBER" || viewMode === "DELTA") && fieldOptions.length > 0;
+  const requiresField = (effectiveViewMode === "NUMBER" || effectiveViewMode === "DELTA") && fieldOptions.length > 0;
   const fieldError = requiresField && field.length === 0 ? "NUMBER/DELTA 模式需要选择明确字段。" : null;
-  const stateError = viewMode === "STATUS" && stateCode.length === 0 ? "STATUS 模式需要选择明确状态。" : null;
+  const stateError = effectiveViewMode === "STATUS" && stateCode.length === 0 ? "STATUS 模式需要选择明确状态。" : null;
+  const numericParameters = toNumericParameters(parameters);
+  const previewTitle = getIndicatorDisplayTitle(indicatorType, numericParameters, indicatorType);
+
   const createMutation = useMutation({
     mutationFn: () => {
       if (fieldError) throw new Error(fieldError);
       if (stateError) throw new Error(stateError);
-      const numericParameters = toNumericParameters(parameters);
+      if (Object.values(numericParameters).some((value) => !Number.isFinite(value) || value <= 0)) {
+        throw new Error("指标参数必须是正数。");
+      }
       const payload = toCreateColumnPayload({
         indicatorType,
-        viewMode,
+        viewMode: effectiveViewMode,
         stateCode,
-        parameters: viewMode === "STATUS"
+        parameters: effectiveViewMode === "STATUS"
           ? numericParameters
           : { ...numericParameters, ...(field ? { field } : {}) },
       });
-      if (Object.values(numericParameters).some((value) => !Number.isFinite(value) || value <= 0)) {
-        throw new Error("指标参数必须是正数。 ");
-      }
       return createWatchTableColumn(tableId, payload);
     },
     onSuccess: async () => {
@@ -147,73 +146,55 @@ export function AddColumnDialog({
         queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
         queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
       ]);
-      onClose();
+      onCreated?.();
     },
   });
-  const pendingRef = useRef(false);
-  useEffect(() => {
-    pendingRef.current = createMutation.isPending;
-  }, [createMutation.isPending]);
-
-  useEffect(() => {
-    indicatorSelectRef.current?.focus();
-    const trigger = restoreFocusRef?.current;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        if (pendingRef.current) return;
-        event.preventDefault();
-        onClose();
-        return;
-      }
-      if (event.key === "Tab" && dialogRef.current && trapDialogTab(dialogRef.current, event.shiftKey)) {
-        event.preventDefault();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      trigger?.focus();
-    };
-  }, [onClose, restoreFocusRef]);
 
   const errorMessage = mutationErrorMessage(createMutation.error);
 
-  return (
-    <div
-      className="fixed inset-0 z-40 grid place-items-center bg-black/60 px-4 py-6"
-      role="presentation"
-      onMouseDown={(event) => event.target === event.currentTarget && !createMutation.isPending && onClose()}
-    >
-        <section ref={dialogRef} className="w-full max-w-lg rounded-panel border border-line bg-panel p-5 shadow-panel" role="dialog" aria-modal="true" aria-labelledby="add-column-title">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <p id="add-column-title" className="text-base font-semibold text-primary">添加指标列</p>
-            <p className="mt-1 text-xs leading-5 text-muted">选择后端已计算的指标与展示模式，参数会按服务端契约持久化。</p>
-          </div>
-          <button type="button" onClick={onClose} disabled={createMutation.isPending} className="rounded p-1 text-muted hover:bg-card hover:text-primary disabled:opacity-40" aria-label="关闭添加指标列">
-            ×
-          </button>
-        </div>
+  function selectIndicator(nextIndicator: string) {
+    setIndicatorType(nextIndicator);
+    if (nextIndicator === "DIVIDEND_YIELD") {
+      setViewMode("NUMBER");
+      setParameters({});
+      setStateCode("");
+      setField("");
+      return;
+    }
+    if (effectiveViewMode === "STATUS") {
+      const options = compatibleStateOptions(nextIndicator);
+      setParameters(toStatusFormParameters(nextIndicator));
+      setStateCode(options[0]?.id ?? "");
+    } else {
+      setParameters(toFormParameters(nextIndicator));
+      setStateCode("");
+    }
+    setField("");
+  }
 
-        <div className="mt-5 grid gap-4 sm:grid-cols-2">
+  function selectViewMode(nextMode: IndicatorViewMode) {
+    if (dividendYield) return;
+    setViewMode(nextMode);
+    if (nextMode === "STATUS") {
+      setField("");
+      setParameters(toStatusFormParameters(indicatorType));
+      setStateCode(compatibleStateOptions(indicatorType)[0]?.id ?? "");
+    } else {
+      setParameters(toFormParameters(indicatorType));
+      setStateCode("");
+      if (nextMode === "COMPOSITE") setField("");
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-panel border border-line/80 bg-card/30 p-4">
+        <div className="grid gap-4 sm:grid-cols-2">
           <label className="block text-xs font-medium text-secondary">
             指标
             <select
-              ref={indicatorSelectRef}
               value={indicatorType}
-              onChange={(event) => {
-                const nextIndicator = event.target.value;
-                setIndicatorType(nextIndicator);
-                if (viewMode === "STATUS") {
-                  const options = compatibleStateOptions(nextIndicator);
-                  setParameters(toStatusFormParameters(nextIndicator));
-                  setStateCode(options[0]?.id ?? "");
-                } else {
-                  setParameters(toFormParameters(nextIndicator));
-                  setStateCode("");
-                }
-                setField("");
-              }}
+              onChange={(event) => selectIndicator(event.target.value)}
               className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
             >
               {WATCH_INDICATOR_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
@@ -222,28 +203,30 @@ export function AddColumnDialog({
           <label className="block text-xs font-medium text-secondary">
             展示模式
             <select
-              value={viewMode}
-              onChange={(event) => {
-                const nextMode = event.target.value as IndicatorViewMode;
-                setViewMode(nextMode);
-                if (nextMode === "STATUS") {
-                  setField("");
-                  setParameters(toStatusFormParameters(indicatorType));
-                  setStateCode(compatibleStateOptions(indicatorType)[0]?.id ?? "");
-                } else {
-                  setParameters(toFormParameters(indicatorType));
-                  setStateCode("");
-                  if (nextMode === "COMPOSITE") setField("");
-                }
-              }}
-              className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
+              value={effectiveViewMode}
+              disabled={dividendYield}
+              onChange={(event) => selectViewMode(event.target.value as IndicatorViewMode)}
+              className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {VIEW_MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
+              {dividendYield
+                ? <option value="NUMBER">NUMBER 数值（固定）</option>
+                : VIEW_MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}
             </select>
           </label>
         </div>
 
-        {viewMode === "STATUS" ? (
+        {indicatorType === "PROJECTED_MA" ? (
+          <p className="mt-3 rounded-panel border border-brand/20 bg-brand/5 px-3 py-2 text-xs text-secondary">
+            表格列名预览：<span className="font-medium text-primary">{previewTitle}</span>
+          </p>
+        ) : null}
+        {dividendYield ? (
+          <p className="mt-3 rounded-panel border border-line/80 bg-card px-3 py-2 text-xs leading-5 text-muted">
+            股息率固定使用数值模式，表格中按百分数显示并保留 3 位小数。
+          </p>
+        ) : null}
+
+        {effectiveViewMode === "STATUS" ? (
           <label className="mt-4 block text-xs font-medium text-secondary">
             状态
             <select
@@ -260,19 +243,19 @@ export function AddColumnDialog({
 
         {fields.length > 0 ? (
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
-            {fields.map((field) => (
-              <label key={field.key} className="block text-xs font-medium text-secondary">
-                {field.label}
+            {fields.map((parameterField) => (
+              <label key={parameterField.key} className="block text-xs font-medium text-secondary">
+                {parameterField.label}
                 <input
                   type="number"
                   min="1"
-                  step={field.key === "multiplier" ? "0.1" : "1"}
-                  value={parameters[field.key] ?? ""}
-                  onChange={(event) => setParameters((current) => ({ ...current, [field.key]: event.target.value }))}
+                  step={parameterField.key === "multiplier" ? "0.1" : "1"}
+                  value={parameters[parameterField.key] ?? ""}
+                  onChange={(event) => setParameters((current) => ({ ...current, [parameterField.key]: event.target.value }))}
                   className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm tabular-nums text-primary outline-none focus:border-brand focus:ring-2 focus:ring-brand/30"
-                  aria-label={field.label}
+                  aria-label={parameterField.label}
                 />
-                {field.hint ? <span className="mt-1 block text-[10px] font-normal text-muted">{field.hint}</span> : null}
+                {parameterField.hint ? <span className="mt-1 block text-[10px] font-normal text-muted">{parameterField.hint}</span> : null}
               </label>
             ))}
           </div>
@@ -280,7 +263,7 @@ export function AddColumnDialog({
           <p className="mt-4 rounded-panel border border-line/80 bg-card/40 px-3 py-2 text-xs text-muted">该指标不需要额外参数。</p>
         )}
 
-        {fieldOptions.length > 0 && viewMode !== "COMPOSITE" ? (
+        {fieldOptions.length > 0 && effectiveViewMode !== "COMPOSITE" ? (
           <label className="mt-4 block text-xs font-medium text-secondary">
             字段
             <select
@@ -299,13 +282,17 @@ export function AddColumnDialog({
         {stateError ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{stateError}</p> : null}
         {errorMessage ? <p className="mt-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs leading-5 text-negative" role="alert">{errorMessage}</p> : null}
 
-        <div className="mt-5 flex justify-end gap-2">
-          <button type="button" onClick={onClose} disabled={createMutation.isPending} className="rounded-panel border border-line bg-card px-3 py-2 text-xs font-medium text-secondary hover:text-primary disabled:opacity-40">取消</button>
-          <button type="button" onClick={() => createMutation.mutate()} disabled={createMutation.isPending || Boolean(fieldError) || Boolean(stateError)} className="rounded-panel bg-brand px-3 py-2 text-xs font-medium text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50">
-            {createMutation.isPending ? "保存中…" : "添加指标列"}
+        <div className="mt-4 flex justify-end">
+          <button
+            type="button"
+            onClick={() => createMutation.mutate()}
+            disabled={createMutation.isPending || Boolean(fieldError) || Boolean(stateError)}
+            className="rounded-panel bg-brand px-4 py-2 text-xs font-medium text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {createMutation.isPending ? "保存中…" : `添加「${previewTitle}」`}
           </button>
         </div>
-      </section>
+      </div>
     </div>
   );
 }

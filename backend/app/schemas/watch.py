@@ -147,6 +147,7 @@ class WatchTableStockData(BaseModel):
     name: str
     market: str
     security: SecurityData
+    bootstrap_ready: bool = True
     price: PriceData | None = None
     indicators: dict[str, dict[str, Any]] = Field(default_factory=dict)
     indicator_values: dict[str, dict[str, Any]] = Field(default_factory=dict)

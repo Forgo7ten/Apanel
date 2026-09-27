@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { CreateAlertInput, Identifier } from "@/api/types";
+import type { CreateAlertInput, Identifier, WatchTableStock } from "@/api/types";
 import { createAlert } from "@/api/alerts";
 import { createWatchTable, deleteWatchTable, getWatchTable, getWatchTables } from "@/api/watch";
 import { AddStockDialog } from "@/components/table/AddStockDialog";
@@ -12,10 +12,12 @@ import { AlertWizard, type AlertWizardDraft } from "@/components/alerts/AlertWiz
 import type { DetailSelection } from "@/components/indicators/detail-types";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { LoadingState, QueryErrorState } from "@/components/ui/QueryState";
-import { StateTag } from "@/components/ui/StateTag";
 import { isApiError } from "@/lib/api-errors";
 import {
   isCurrentWatchDetail,
+  isWatchStockDataReady,
+  WATCH_BOOTSTRAP_POLL_INTERVAL_MS,
+  WATCH_BOOTSTRAP_TIMEOUT_MS,
   WATCH_DETAIL_REFRESH_INTERVAL_MS,
   watchDetailViewState,
 } from "@/lib/watch-contract.mjs";
@@ -25,11 +27,14 @@ function sameId(left: Identifier | null, right: Identifier | null): boolean {
   return left !== null && right !== null && String(left) === String(right);
 }
 
+const EMPTY_BOOTSTRAP_DEADLINES: Readonly<Record<string, number>> = Object.freeze({});
+
 export default function WatchPage() {
   const queryClient = useQueryClient();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [createName, setCreateName] = useState("");
   const [alertDraft, setAlertDraft] = useState<AlertWizardDraft | null>(null);
+  const [bootstrapDeadlinesByTable, setBootstrapDeadlinesByTable] = useState<Record<string, Record<string, number>>>({});
   const addStockTriggerRef = useRef<HTMLButtonElement | null>(null);
   const closeAddStockDialog = useCallback(() => setAddDialogOpen(false), []);
   const { selectedTableId, setSelectedTableId, resetTableView } = useWatchStore();
@@ -37,23 +42,59 @@ export default function WatchPage() {
   const tables = useMemo(() => tablesQuery.data ?? [], [tablesQuery.data]);
   const selectedTable = tables.find((table) => sameId(table.id, selectedTableId)) ?? tables[0];
   const activeTableId = selectedTable?.id ?? null;
+  const activeBootstrapDeadlines = activeTableId === null
+    ? EMPTY_BOOTSTRAP_DEADLINES
+    : bootstrapDeadlinesByTable[String(activeTableId)] ?? EMPTY_BOOTSTRAP_DEADLINES;
   const detailsQuery = useQuery({
     queryKey: ["watch-table", activeTableId],
     queryFn: () => getWatchTable(activeTableId as Identifier),
     enabled: activeTableId !== null,
     placeholderData: (previous) => previous,
-    refetchInterval: WATCH_DETAIL_REFRESH_INTERVAL_MS,
+    refetchInterval: (query) => {
+      const pendingEntries = Object.entries(activeBootstrapDeadlines)
+        .filter(([, deadline]) => deadline > Date.now());
+      if (pendingEntries.length === 0) return WATCH_DETAIL_REFRESH_INTERVAL_MS;
+      const data = query.state.data;
+      const detail = data && isCurrentWatchDetail(data, activeTableId) ? data : undefined;
+      const stillPreparing = pendingEntries.some(([securityId]) => {
+        const stock = detail?.stocks.find((item) => String(item.security_id) === securityId);
+        return !detail || (stock ? !isWatchStockDataReady(stock, detail.columns) : false);
+      });
+      return stillPreparing ? WATCH_BOOTSTRAP_POLL_INTERVAL_MS : WATCH_DETAIL_REFRESH_INTERVAL_MS;
+    },
     refetchIntervalInBackground: false,
   });
   const currentDetail = detailsQuery.data && isCurrentWatchDetail(detailsQuery.data, activeTableId)
     ? detailsQuery.data
     : undefined;
+  const bootstrappingStockIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const securityId of Object.keys(activeBootstrapDeadlines)) {
+      const stock = currentDetail?.stocks.find((item) => String(item.security_id) === securityId);
+      if (!currentDetail || (stock && !isWatchStockDataReady(stock, currentDetail.columns))) {
+        ids.add(securityId);
+      }
+    }
+    return ids;
+  }, [activeBootstrapDeadlines, currentDetail]);
   const detailState = watchDetailViewState({
-    isPending: detailsQuery.isPending || (detailsQuery.isFetching && !currentDetail),
-    isFetching: detailsQuery.isFetching,
+    isPending: detailsQuery.isPending || (!currentDetail && !detailsQuery.isError),
     isError: detailsQuery.isError,
     hasData: Boolean(currentDetail),
   });
+  const markStockBootstrapping = useCallback((stock: WatchTableStock) => {
+    if (activeTableId === null) return;
+    const securityId = stock.security_id ?? stock.security?.security_id ?? stock.security?.id;
+    if (securityId === undefined || securityId === null) return;
+    const tableKey = String(activeTableId);
+    setBootstrapDeadlinesByTable((current) => ({
+      ...current,
+      [tableKey]: {
+        ...(current[tableKey] ?? {}),
+        [String(securityId)]: Date.now() + WATCH_BOOTSTRAP_TIMEOUT_MS,
+      },
+    }));
+  }, [activeTableId]);
   const createMutation = useMutation({
     mutationFn: () => {
       const name = createName.trim();
@@ -128,6 +169,24 @@ export default function WatchPage() {
       resetTableView();
     }
   }, [resetTableView, selectedTableId, setSelectedTableId, tables]);
+
+  useEffect(() => {
+    const deadlines = Object.values(bootstrapDeadlinesByTable).flatMap((bySecurity) => Object.values(bySecurity));
+    if (deadlines.length === 0) return;
+    const nextDeadline = Math.min(...deadlines);
+    const timeout = window.setTimeout(() => {
+      const now = Date.now();
+      setBootstrapDeadlinesByTable((current) => Object.fromEntries(
+        Object.entries(current)
+          .map(([tableId, bySecurity]) => [
+            tableId,
+            Object.fromEntries(Object.entries(bySecurity).filter(([, deadline]) => deadline > now)),
+          ] as const)
+          .filter(([, bySecurity]) => Object.keys(bySecurity).length > 0),
+      ));
+    }, Math.max(50, nextDeadline - Date.now() + 50));
+    return () => window.clearTimeout(timeout);
+  }, [bootstrapDeadlinesByTable]);
 
   function selectTable(id: Identifier) {
     if (sameId(id, selectedTableId)) return;
@@ -226,48 +285,34 @@ export default function WatchPage() {
             })}
           </section>
 
-          <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_240px]">
-            <div className="min-w-0">
-              {detailState === "loading" ? <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel"><LoadingState /></div> : null}
-              {detailState === "error" ? <div className="rounded-panel border border-line bg-panel shadow-panel"><QueryErrorState error={detailsQuery.error} onRetry={() => detailsQuery.refetch()} /></div> : null}
-              {detailState === "empty" ? <div className="rounded-panel border border-line bg-panel shadow-panel"><EmptyState title="暂无监控表详情" description="当前监控表暂时没有可展示的数据。" /></div> : null}
-              {currentDetail ? (
-                <>
-                  {detailState === "refreshing" ? <p className="mb-2 rounded-panel border border-line bg-card/50 px-3 py-2 text-xs text-muted" role="status" aria-live="polite">正在刷新监控数据…</p> : null}
-                  {detailState === "refresh-error" ? <div className="mb-2 flex items-center justify-between gap-3 rounded-panel border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning" role="alert"><span>刷新失败，当前仍显示上一次数据。</span><button type="button" onClick={() => detailsQuery.refetch()} className="shrink-0 rounded border border-warning/40 px-2 py-1 font-medium hover:bg-warning/10 focus:outline-none focus:ring-2 focus:ring-brand/40">重试</button></div> : null}
-                  <WatchTable key={String(currentDetail.id ?? activeTableId)} table={currentDetail} onAddStock={(trigger) => { addStockTriggerRef.current = trigger ?? null; setAddDialogOpen(true); }} onCreateNotification={openAlertFromDetail} />
-                </>
-              ) : null}
-            </div>
-            <aside className="h-fit rounded-panel border border-line bg-panel p-card shadow-panel">
-              <div className="flex items-center justify-between">
-                <p className="text-sm font-semibold text-primary">工作台状态</p>
-                <StateTag tone={detailState === "error" || detailState === "refresh-error" ? "warning" : "positive"}>{detailState === "error" || detailState === "refresh-error" ? "待重试" : detailState === "refreshing" ? "刷新中" : "已连接"}</StateTag>
-              </div>
-              <dl className="mt-5 divide-y divide-line/80">
-                <div className="flex items-center justify-between py-3 first:pt-0">
-                  <dt className="text-xs text-muted">当前表格</dt>
-                  <dd className="max-w-[120px] truncate text-xs text-secondary">{selectedTable?.name ?? "—"}</dd>
-                </div>
-                <div className="flex items-center justify-between py-3">
-                  <dt className="text-xs text-muted">监控股票</dt>
-                  <dd className="text-xs tabular-nums text-secondary">{currentDetail?.stocks.length ?? selectedTable?.stock_count ?? 0}</dd>
-                </div>
-                <div className="flex items-center justify-between py-3 last:pb-0">
-                  <dt className="text-xs text-muted">指标列</dt>
-                  <dd className="text-xs tabular-nums text-secondary">{currentDetail?.columns.length ?? "—"}</dd>
-                </div>
-              </dl>
-              <div className="mt-5 rounded-panel border border-warning/20 bg-warning/5 p-3">
-                <p className="text-xs font-medium text-warning">数据边界</p>
-                <p className="mt-1.5 text-xs leading-5 text-muted">前端只展示后端返回的行情、指标和状态，不在浏览器计算 RSI、MACD 或 BOLL。</p>
-              </div>
-            </aside>
+          <section className="min-w-0">
+            {detailState === "loading" ? <div className="overflow-hidden rounded-panel border border-line bg-panel shadow-panel"><LoadingState /></div> : null}
+            {detailState === "error" ? <div className="rounded-panel border border-line bg-panel shadow-panel"><QueryErrorState error={detailsQuery.error} onRetry={() => detailsQuery.refetch()} /></div> : null}
+            {detailState === "empty" ? <div className="rounded-panel border border-line bg-panel shadow-panel"><EmptyState title="暂无监控表详情" description="当前监控表暂时没有可展示的数据。" /></div> : null}
+            {currentDetail ? (
+              <>
+                {detailState === "refresh-error" ? <div className="mb-2 flex items-center justify-between gap-3 rounded-panel border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning" role="alert"><span>刷新失败，当前仍显示上一次数据。</span><button type="button" onClick={() => detailsQuery.refetch()} className="shrink-0 rounded border border-warning/40 px-2 py-1 font-medium hover:bg-warning/10 focus:outline-none focus:ring-2 focus:ring-brand/40">重试</button></div> : null}
+                <WatchTable
+                  key={String(currentDetail.id ?? activeTableId)}
+                  table={currentDetail}
+                  bootstrappingStockIds={bootstrappingStockIds}
+                  onAddStock={(trigger) => { addStockTriggerRef.current = trigger ?? null; setAddDialogOpen(true); }}
+                  onCreateNotification={openAlertFromDetail}
+                />
+              </>
+            ) : null}
           </section>
         </>
       ) : null}
 
-      {addDialogOpen && activeTableId !== null ? <AddStockDialog tableId={activeTableId} restoreFocusRef={addStockTriggerRef} onClose={closeAddStockDialog} /> : null}
+      {addDialogOpen && activeTableId !== null ? (
+        <AddStockDialog
+          tableId={activeTableId}
+          restoreFocusRef={addStockTriggerRef}
+          onAdded={markStockBootstrapping}
+          onClose={closeAddStockDialog}
+        />
+      ) : null}
       <AlertWizard
         key={alertDraft ? `${alertDraft.security?.symbol ?? "draft"}-${alertDraft.condition_type}` : "closed"}
         open={alertDraft !== null}

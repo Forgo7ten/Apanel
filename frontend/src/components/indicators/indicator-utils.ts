@@ -3,6 +3,7 @@ import {
   getColumnFieldValue,
   getColumnValue,
 } from "@/lib/indicator-contract.mjs";
+import { getIndicatorDisplayTitle, normalizeIndicatorType } from "@/lib/indicator-metadata.mjs";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -38,6 +39,17 @@ export function formatMetricValue(value: unknown): string {
   }
 
   return displayValue;
+}
+
+export function formatPercentageValue(value: unknown): string {
+  const displayValue = getDisplayNumber(value);
+  if (displayValue === null || displayValue === "") return "—";
+  const numeric = typeof displayValue === "number" ? displayValue : Number(displayValue);
+  if (!Number.isFinite(numeric)) return String(displayValue);
+  return `${new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 3,
+  }).format(numeric * 100)}%`;
 }
 
 export function getDelta(value: unknown): number | string | null {
@@ -79,7 +91,15 @@ export function getFieldValue(value: unknown, key: "value" | "previous_value" | 
 }
 
 export function getColumnTitle(column: WatchTableColumn): string {
-  return column.title ?? column.label ?? column.indicator_type ?? column.type;
+  const indicatorType = column.indicator_type ?? column.type;
+  if (normalizeIndicatorType(indicatorType) === "PROJECTED_MA") {
+    return getIndicatorDisplayTitle(indicatorType, column.parameters ?? {}, indicatorType);
+  }
+  return column.title ?? column.label ?? getIndicatorDisplayTitle(indicatorType, column.parameters ?? {}, indicatorType);
+}
+
+export function isDividendYieldColumn(column: WatchTableColumn): boolean {
+  return normalizeIndicatorType(column.indicator_type ?? column.type) === "DIVIDEND_YIELD";
 }
 
 export function getStateToneLevel(state: IndicatorState): string | undefined {

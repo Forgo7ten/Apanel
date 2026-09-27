@@ -2,12 +2,13 @@ import type { IndicatorState, IndicatorViewMode } from "@/api/types";
 import { StateTag, stateToneFromLevel } from "@/components/ui/StateTag";
 
 import { CompositeCell } from "./CompositeCell";
-import { formatMetricValue, getDelta, getDirection, getDisplayNumber, getFieldValue, isRecord } from "./indicator-utils";
+import { formatMetricValue, formatPercentageValue, getDelta, getDirection, getDisplayNumber, getFieldValue, isRecord } from "./indicator-utils";
 
 type IndicatorCellProps = {
   mode: IndicatorViewMode;
   value: unknown;
   states?: IndicatorState[];
+  percentage?: boolean;
 };
 
 function DeltaCell({ value }: { value: unknown }) {
@@ -38,7 +39,7 @@ function StatusCell({ value, states }: { value: unknown; states: IndicatorState[
   return <span className="text-sm text-muted">—</span>;
 }
 
-export function IndicatorCell({ mode, value, states = [] }: IndicatorCellProps) {
+export function IndicatorCell({ mode, value, states = [], percentage = false }: IndicatorCellProps) {
   switch (mode) {
     case "DELTA":
       return <DeltaCell value={value} />;
@@ -48,6 +49,12 @@ export function IndicatorCell({ mode, value, states = [] }: IndicatorCellProps) 
       return <CompositeCell value={value} states={states} />;
     case "NUMBER":
     default:
-      return <span className="text-sm tabular-nums text-primary">{formatMetricValue(getFieldValue(value, "value") ?? getDisplayNumber(value))}</span>;
+      return (
+        <span className="text-sm tabular-nums text-primary">
+          {percentage
+            ? formatPercentageValue(getFieldValue(value, "value") ?? getDisplayNumber(value))
+            : formatMetricValue(getFieldValue(value, "value") ?? getDisplayNumber(value))}
+        </span>
+      );
   }
 }

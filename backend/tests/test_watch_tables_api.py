@@ -167,7 +167,7 @@ def _as_user(app, user: User) -> None:
 
 
 async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_context) -> None:
-    client, _, user_one, user_two = watch_context
+    client, session_factory, user_one, user_two = watch_context
     app = client._transport.app  # type: ignore[attr-defined]
     _as_user(app, user_one)
     cleared_defaults = await client.put(
@@ -183,6 +183,7 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
 
     added = await client.post(f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1})
     assert added.status_code == 201
+    assert added.json()["data"]["bootstrap_ready"] is False
     duplicate = await client.post(
         f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1}
     )
@@ -221,10 +222,17 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     assert updated.json()["data"]["visible"] is False
     assert updated.json()["data"]["width"] == 180
 
+    async with session_factory() as session:
+        security = await session.get(Security, 1)
+        assert security is not None
+        security.bootstrap_completed_at = datetime.now(UTC) + timedelta(minutes=1)
+        await session.commit()
+
     details = await client.get(f"/api/v1/watch-tables/{table_id}")
     assert details.status_code == 200
     stock = details.json()["data"]["stocks"][0]
     assert stock["security_id"] == 1
+    assert stock["bootstrap_ready"] is True
     assert stock["price"]["value"] == 1680.0
     assert stock["indicators"]["RSI"]["value"] == 71.0
     assert stock["states"][0]["state_id"] == "RSI_OVERBOUGHT"

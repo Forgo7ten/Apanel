@@ -49,7 +49,8 @@ export { getDefaultIndicatorParameters, getIndicatorFieldOptions };
  */
 export function toCreateColumnPayload({ indicatorType, viewMode = "COMPOSITE", parameters, stateCode }) {
   const normalizedType = normalizeIndicatorType(indicatorType);
-  const normalizedViewMode = typeof viewMode === "string" ? viewMode.toUpperCase() : "COMPOSITE";
+  const requestedViewMode = typeof viewMode === "string" ? viewMode.toUpperCase() : "COMPOSITE";
+  const normalizedViewMode = normalizedType === "DIVIDEND_YIELD" ? "NUMBER" : requestedViewMode;
   const nextParameters = normalizedViewMode === "STATUS"
     ? (parameters && typeof parameters === "object" ? { ...parameters } : {})
     : parameters && typeof parameters === "object"
@@ -81,6 +82,20 @@ export function toCreateColumnPayload({ indicatorType, viewMode = "COMPOSITE", p
   return payload;
 }
 
+export function reorderColumnIdsForDrop(ids, sourceId, targetId, position = "before") {
+  const order = Array.isArray(ids) ? [...ids] : [];
+  const source = String(sourceId);
+  const target = String(targetId);
+  const sourceIndex = order.findIndex((id) => String(id) === source);
+  const targetIndex = order.findIndex((id) => String(id) === target);
+  if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return order;
+  const [moved] = order.splice(sourceIndex, 1);
+  const adjustedTargetIndex = order.findIndex((id) => String(id) === target);
+  const insertionIndex = position === "after" ? adjustedTargetIndex + 1 : adjustedTargetIndex;
+  order.splice(insertionIndex, 0, moved);
+  return order;
+}
+
 /**
  * Convert the client-side TanStack order (which contains fixed display
  * columns) into the backend's persisted dynamic-column order request.
@@ -97,6 +112,69 @@ export function toColumnOrderPayload(columnOrder) {
 }
 
 export const WATCH_DETAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+export const WATCH_BOOTSTRAP_POLL_INTERVAL_MS = 5 * 1000;
+export const WATCH_BOOTSTRAP_TIMEOUT_MS = 2 * 60 * 1000;
+
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasPrice(stock) {
+  if (!isRecord(stock)) return false;
+  const price = stock.price;
+  if (typeof price === "number" || typeof price === "string") return price !== "";
+  if (!isRecord(price)) return false;
+  const value = price.value ?? price.price;
+  return (typeof value === "number" && Number.isFinite(value))
+    || (typeof value === "string" && value.trim().length > 0);
+}
+
+/**
+ * A newly added stock is ready for presentation once the price and every
+ * currently visible dynamic column have a materialized value.  This is a UI
+ * readiness check only; indicator calculation remains entirely on the backend.
+ */
+export function isWatchStockDataReady(stock, columns = []) {
+  if (isRecord(stock) && typeof stock.bootstrap_ready === "boolean") {
+    return stock.bootstrap_ready;
+  }
+  if (!hasPrice(stock)) return false;
+  if (!isRecord(stock.column_values)) {
+    return !Array.isArray(columns) || columns.filter((column) => column?.visible !== false && column?.hidden !== true).length === 0;
+  }
+
+  for (const column of Array.isArray(columns) ? columns : []) {
+    if (!column || column.visible === false || column.hidden === true) continue;
+    if (column.id === null || column.id === undefined) continue;
+    const value = stock.column_values[String(column.id)];
+    if (!isRecord(value) || value.available !== true) return false;
+  }
+  return true;
+}
+
+/**
+ * Reserve the final row height from column definitions, not from whatever
+ * subset of bootstrap data happens to have arrived.  This prevents the whole
+ * virtual table from changing height while KDJ/BOLL/MACD fields materialize.
+ */
+export function expectedCompositeFieldCount(columns = []) {
+  let maximum = 0;
+  for (const column of Array.isArray(columns) ? columns : []) {
+    if (!column || column.visible === false || column.hidden === true) continue;
+    if (String(column.view_mode ?? "").toUpperCase() !== "COMPOSITE") continue;
+    const indicatorType = normalizeIndicatorType(column.indicator_type ?? column.type);
+    const parameters = isRecord(column.parameters) ? column.parameters : {};
+    let count = 1;
+    if (indicatorType === "MA") {
+      const periods = Array.isArray(parameters.periods) ? parameters.periods : [];
+      count = periods.length > 0 ? new Set(periods.map((period) => String(period))).size : 1;
+    } else {
+      count = Math.max(1, getIndicatorFieldOptions(indicatorType).length);
+    }
+    maximum = Math.max(maximum, count);
+  }
+  return maximum;
+}
 
 export function filterWatchStocks(stocks, { query = "", state = "ALL" } = {}) {
   const items = Array.isArray(stocks) ? stocks : [];

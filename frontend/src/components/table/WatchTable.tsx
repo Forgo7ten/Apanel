@@ -29,14 +29,15 @@ import {
   reorderWatchTableColumns,
   updateWatchTableColumn,
 } from "@/api/watch";
-import { getColumnTitle, getIndicatorValue } from "@/components/indicators/indicator-utils";
+import { getColumnTitle, getIndicatorValue, isDividendYieldColumn } from "@/components/indicators/indicator-utils";
 import { IndicatorCell } from "@/components/indicators/IndicatorCell";
 import { isApiError } from "@/lib/api-errors";
 import { isDetailActivationKey } from "@/lib/detail-contract.mjs";
-import { getColumnFields } from "@/lib/indicator-contract.mjs";
 import {
   calculateVirtualRange,
+  expectedCompositeFieldCount,
   filterWatchStocks,
+  reorderColumnIdsForDrop,
   toColumnOrderPayload,
   virtualScrollTopForKey,
   WATCH_COMPOSITE_LAYOUT,
@@ -51,11 +52,18 @@ import {
   type DetailSelection,
 } from "@/components/indicators/IndicatorDetailsDrawer";
 
-import { AddColumnDialog } from "./AddColumnDialog";
 import { ColumnManager, type ColumnManagerItem } from "./ColumnManager";
 
 const WATCH_OVERSCAN = 4;
 const DEFAULT_VIEWPORT_HEIGHT = 560;
+const DEFAULT_COLUMN_WIDTHS = {
+  security: 190,
+  price: 120,
+  states: 220,
+  actions: 88,
+  scalar: 132,
+  composite: 220,
+} as const;
 
 function columnId(column: WatchTableColumn, index: number): string {
   return String(column.id ?? column.key ?? column.indicator_type ?? `${column.type}-${index}`);
@@ -137,12 +145,13 @@ function buildColumnDefs(
   onOpenIndicator: (stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => void,
   onOpenState: (stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => void,
   showDeltas: boolean,
+  isBootstrapping: (stock: WatchTableStock) => boolean,
 ): ColumnDef<WatchTableStock, unknown>[] {
   const dynamicColumns = columns.map((column, index) => {
     const id = columnId(column, index);
     return {
       id,
-      accessorFn: (stock: WatchTableStock) => getIndicatorValue(stock, column),
+      accessorFn: (stock: WatchTableStock) => isBootstrapping(stock) ? undefined : getIndicatorValue(stock, column),
       header: getColumnTitle(column),
       sortingFn: (rowA, rowB, sortingColumnId) => {
         const valueA = sortValue(rowA.getValue(sortingColumnId));
@@ -150,21 +159,29 @@ function buildColumnDefs(
         if (typeof valueA === "number" && typeof valueB === "number") return valueA - valueB;
         return String(valueA).localeCompare(String(valueB), "zh-CN", { numeric: true });
       },
-      cell: ({ row }) => (
-        <button
-          type="button"
-          onClick={(event) => onOpenIndicator(row.original, column, event.currentTarget)}
-          onKeyDown={(event) => {
-            if (!isDetailActivationKey(event.key)) return;
-            event.preventDefault();
-            onOpenIndicator(row.original, column, event.currentTarget);
-          }}
-          className="rounded-panel text-left focus:outline-none focus:ring-2 focus:ring-brand/40"
-          aria-label={`查看${getColumnTitle(column)}详情`}
-        >
-          <IndicatorCell mode={column.view_mode === "DELTA" && !showDeltas ? "NUMBER" : column.view_mode} value={getIndicatorValue(row.original, column)} states={row.original.states} />
-        </button>
-      ),
+      cell: ({ row }) => {
+        if (isBootstrapping(row.original)) return <span className="text-xs text-muted">—</span>;
+        return (
+          <button
+            type="button"
+            onClick={(event) => onOpenIndicator(row.original, column, event.currentTarget)}
+            onKeyDown={(event) => {
+              if (!isDetailActivationKey(event.key)) return;
+              event.preventDefault();
+              onOpenIndicator(row.original, column, event.currentTarget);
+            }}
+            className="rounded-panel text-left focus:outline-none focus:ring-2 focus:ring-brand/40"
+            aria-label={`查看${getColumnTitle(column)}详情`}
+          >
+            <IndicatorCell
+              mode={isDividendYieldColumn(column) ? "NUMBER" : column.view_mode === "DELTA" && !showDeltas ? "NUMBER" : column.view_mode}
+              value={getIndicatorValue(row.original, column)}
+              states={row.original.states}
+              percentage={isDividendYieldColumn(column)}
+            />
+          </button>
+        );
+      },
       meta: { label: getColumnTitle(column), movable: true, width: column.width },
     } satisfies ColumnDef<WatchTableStock, unknown>;
   });
@@ -177,10 +194,14 @@ function buildColumnDefs(
       sortingFn: (rowA, rowB) => compareRows(rowA.original, rowB.original, "security"),
       cell: ({ row }) => {
         const stock = row.original;
+        const preparing = isBootstrapping(stock);
         return (
-          <div className="min-w-[150px] whitespace-nowrap">
-            <p className="font-medium text-primary">{stock.name ?? stock.security?.name ?? "未命名证券"}</p>
-            <p className="mt-1 font-mono text-[11px] text-muted">{stock.symbol}</p>
+          <div className="w-full min-w-0 overflow-hidden whitespace-nowrap">
+            <div className="flex min-w-0 items-center gap-2">
+              <p className="min-w-0 flex-1 truncate font-medium text-primary" title={stock.name ?? stock.security?.name ?? "未命名证券"}>{stock.name ?? stock.security?.name ?? "未命名证券"}</p>
+              {preparing ? <span className="shrink-0 rounded-full border border-brand/25 bg-brand/10 px-1.5 py-0.5 text-[10px] font-medium text-brand">数据准备中</span> : null}
+            </div>
+            <p className="mt-1 truncate font-mono text-[11px] text-muted">{stock.symbol}</p>
           </div>
         );
       },
@@ -188,18 +209,22 @@ function buildColumnDefs(
     },
     {
       id: "price",
-      accessorFn: (stock) => stock.price,
+      accessorFn: (stock) => isBootstrapping(stock) ? undefined : stock.price,
       header: "当前价",
       sortingFn: (rowA, rowB) => compareRows(rowA.original, rowB.original, "price"),
-      cell: ({ row }) => <IndicatorCell mode={showDeltas ? "DELTA" : "NUMBER"} value={row.original.price} />,
+      cell: ({ row }) => isBootstrapping(row.original)
+        ? <span className="text-xs text-muted">—</span>
+        : <IndicatorCell mode={showDeltas ? "DELTA" : "NUMBER"} value={row.original.price} />,
       meta: { label: "当前价", movable: false, toggleable: false },
     },
     ...dynamicColumns,
     {
       id: "states",
-      accessorFn: (stock) => stock.states?.map((state) => state.title).join(" ") ?? "",
+      accessorFn: (stock) => isBootstrapping(stock) ? "" : stock.states?.map((state) => state.title).join(" ") ?? "",
       header: "状态",
-      cell: ({ row }) => <StateList states={row.original.states ?? []} onOpen={(state, trigger) => onOpenState(row.original, state, trigger)} />,
+      cell: ({ row }) => isBootstrapping(row.original)
+        ? <StateTag compact tone="neutral">准备中</StateTag>
+        : <StateList states={row.original.states ?? []} onOpen={(state, trigger) => onOpenState(row.original, state, trigger)} />,
       meta: { label: "状态", movable: false, toggleable: false },
     },
   ];
@@ -240,9 +265,21 @@ function toVisibility(columns: WatchTableColumn[]): VisibilityState {
   return Object.fromEntries(columns.map((column, index) => [columnId(column, index), column.hidden !== true && column.visible !== false]));
 }
 
-function columnWidthStyle(columns: WatchTableColumn[], id: string): React.CSSProperties | undefined {
+function columnPixelWidth(columns: WatchTableColumn[], id: string): number {
   const source = columns.find((column, index) => columnId(column, index) === id);
-  return source?.width ? { width: `${source.width}px`, minWidth: `${source.width}px` } : undefined;
+  if (source?.width) return source.width;
+  if (id === "security") return DEFAULT_COLUMN_WIDTHS.security;
+  if (id === "price") return DEFAULT_COLUMN_WIDTHS.price;
+  if (id === "states") return DEFAULT_COLUMN_WIDTHS.states;
+  if (id === "actions") return DEFAULT_COLUMN_WIDTHS.actions;
+  return String(source?.view_mode ?? "").toUpperCase() === "COMPOSITE"
+    ? DEFAULT_COLUMN_WIDTHS.composite
+    : DEFAULT_COLUMN_WIDTHS.scalar;
+}
+
+function columnWidthStyle(columns: WatchTableColumn[], id: string): React.CSSProperties {
+  const width = columnPixelWidth(columns, id);
+  return { width, minWidth: width, maxWidth: width };
 }
 
 function reorderDynamicColumns(columnOrder: string[], id: string, direction: "up" | "down", dynamicIds: string[]): string[] {
@@ -274,20 +311,19 @@ function mutationErrorMessage(error: unknown): string | null {
 
 export function WatchTable({
   table,
+  bootstrappingStockIds,
   onAddStock,
   onCreateNotification,
 }: {
   table: WatchTableDetails;
+  bootstrappingStockIds?: ReadonlySet<string>;
   onAddStock?: (trigger?: HTMLButtonElement) => void;
   onCreateNotification?: DetailNotificationHandler;
 }) {
   const queryClient = useQueryClient();
   const { settings: workspaceSettings } = useWorkspaceSettings();
-  const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
-  const addColumnTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const closeAddColumnDialog = useCallback(() => setAddColumnOpen(false), []);
   const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -305,6 +341,12 @@ export function WatchTable({
     setDetailSelection({ kind: "state", stock, state });
   }, []);
   const closeDetail = useCallback(() => setDetailSelection(null), []);
+  const isBootstrapping = useCallback((stock: WatchTableStock) => {
+    const securityId = stock.security_id ?? stock.security?.security_id ?? stock.security?.id;
+    return securityId !== undefined
+      && securityId !== null
+      && Boolean(bootstrappingStockIds?.has(String(securityId)));
+  }, [bootstrappingStockIds]);
 
   const removeStockMutation = useMutation({
     mutationFn: ({ securityId }: { securityId: Identifier }) => removeStockFromWatchTable(tableId, securityId),
@@ -378,8 +420,8 @@ export function WatchTable({
   const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
   const removeStock = removeStockMutation.mutate;
   const baseColumnDefs = useMemo(
-    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas),
-    [columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas],
+    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas, isBootstrapping),
+    [columns, isBootstrapping, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas],
   );
   const columnDefs = useMemo(
     () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId })],
@@ -447,16 +489,23 @@ export function WatchTable({
     getSortedRowModel: getSortedRowModel(),
   });
   const tableRows = tableInstance.getRowModel().rows;
-  const maxCompositeFields = useMemo(() => {
-    let maximum = 0;
-    for (const column of columns) {
-      if (String(column.view_mode ?? "").toUpperCase() !== "COMPOSITE") continue;
-      for (const stock of filteredStocks) {
-        maximum = Math.max(maximum, getColumnFields(getIndicatorValue(stock, column)).length);
-      }
-    }
-    return maximum;
-  }, [columns, filteredStocks]);
+  const visibleLeafColumns = tableInstance.getVisibleLeafColumns();
+  const tablePixelWidth = visibleLeafColumns.reduce(
+    (total, column) => total + columnPixelWidth(columns, column.id),
+    0,
+  );
+  const layoutColumns = useMemo(
+    () => columns.map((column, index) => {
+      const id = columnId(column, index);
+      const visible = columnVisibility[id] ?? (column.hidden !== true && column.visible !== false);
+      return { ...column, visible, hidden: !visible };
+    }),
+    [columnVisibility, columns],
+  );
+  const maxCompositeFields = useMemo(
+    () => expectedCompositeFieldCount(layoutColumns),
+    [layoutColumns],
+  );
   const comfortableDensity = workspaceSettings.density === "comfortable";
   const rowLayout = useMemo(
     () => watchRowLayoutContract(maxCompositeFields, workspaceSettings.density),
@@ -526,6 +575,21 @@ export function WatchTable({
     reorderColumnsMutation.mutate(nextIds);
   }
 
+  function handleReorder(sourceId: string, targetId: string, position: "before" | "after") {
+    const baseOrder = columnOrder.length > 0 ? columnOrder : allColumnIds;
+    const currentDynamicOrder = [
+      ...baseOrder.filter((id) => dynamicColumnIds.includes(id)),
+      ...dynamicColumnIds.filter((id) => !baseOrder.includes(id)),
+    ];
+    const nextDynamicOrder = reorderColumnIdsForDrop(currentDynamicOrder, sourceId, targetId, position);
+    const nextIds = toColumnOrderPayload(nextDynamicOrder).column_ids;
+    if (nextIds.length !== dynamicColumnIds.length || nextIds.length === 0) {
+      setActionError("当前指标列还没有可持久化的顺序。");
+      return;
+    }
+    reorderColumnsMutation.mutate(nextIds);
+  }
+
   const pendingColumnId = updateColumnMutation.isPending
     ? updateColumnMutation.variables?.columnId
     : deleteColumnMutation.isPending
@@ -535,6 +599,7 @@ export function WatchTable({
   const managerItems: ColumnManagerItem[] = tableInstance.getAllLeafColumns().map((column) => {
     const source = columns.find((candidate, index) => columnId(candidate, index) === column.id);
     const fixed = ["security", "price", "states", "actions"].includes(column.id);
+    const dividendYield = source ? isDividendYieldColumn(source) : false;
     return {
       id: column.id,
       label: String(column.columnDef.meta && "label" in column.columnDef.meta ? column.columnDef.meta.label : column.id),
@@ -542,7 +607,8 @@ export function WatchTable({
       movable: !fixed,
       toggleable: !fixed,
       width: source?.width,
-      viewMode: source?.view_mode,
+      viewMode: dividendYield ? "NUMBER" : source?.view_mode,
+      viewModeLocked: dividendYield,
       deletable: !fixed,
       pending: anyColumnMutationPending && (reorderColumnsMutation.isPending || (pendingColumnId !== undefined && pendingColumnId !== null && String(pendingColumnId) === column.id)),
     };
@@ -553,7 +619,7 @@ export function WatchTable({
       <div className={`flex flex-wrap items-center justify-between gap-3 border-b border-line ${comfortableDensity ? "px-5 py-4" : "px-4 py-3"}`}>
         <div>
           <p className="text-sm font-semibold text-primary">{table.name}</p>
-          <p className="mt-1 text-xs text-muted">{filteredStocks.length === table.stocks.length ? `${table.stocks.length} 支股票` : `${filteredStocks.length} / ${table.stocks.length} 支股票`} · 指标由后端提供</p>
+          <p className="mt-1 text-xs text-muted">{filteredStocks.length === table.stocks.length ? `${table.stocks.length} 支股票` : `${filteredStocks.length} / ${table.stocks.length} 支股票`}</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <input
@@ -583,14 +649,12 @@ export function WatchTable({
             <button type="button" onClick={() => { setFilterQuery(""); setStateFilter("ALL"); }} className="h-8 rounded-panel border border-line bg-card px-2.5 text-xs text-secondary hover:text-primary">清除筛选</button>
           ) : null}
           {columns.length === 0 ? <span className="text-[11px] text-muted">暂无指标列</span> : null}
-          <button type="button" onClick={(event) => { addColumnTriggerRef.current = event.currentTarget; setActionError(null); setAddColumnOpen(true); }} className="inline-flex h-8 items-center gap-1.5 rounded-panel bg-brand px-2.5 text-xs font-medium text-white transition hover:bg-brand/90 focus:outline-none focus:ring-2 focus:ring-brand/40">
-            <span className="text-base leading-none">+</span>
-            添加指标列
-          </button>
           <ColumnManager
+            tableId={tableId}
             items={managerItems}
             onToggle={(id, visible) => updateColumn(id, { visible })}
             onMove={handleMove}
+            onReorder={handleReorder}
             onWidthChange={(id, width) => updateColumn(id, { width })}
             onViewModeChange={(id, viewMode) => viewMode && updateColumn(id, { view_mode: viewMode as IndicatorViewMode })}
             onDelete={(id) => {
@@ -616,7 +680,15 @@ export function WatchTable({
         aria-describedby={`watch-table-keyboard-help-${String(tableId)}`}
       >
         <p id={`watch-table-keyboard-help-${String(tableId)}`} className="sr-only">聚焦此区域后，使用上下方向键按行移动，PageUp/PageDown 按页移动，Home/End 跳转首尾；移动后按 Tab 访问当前区域内的操作。</p>
-        <table className="w-full min-w-[860px] border-collapse text-left" aria-label={`${table.name}股票监控表`} aria-rowcount={tableRows.length + 1}>
+        <table
+          className="table-fixed border-collapse text-left"
+          style={{ width: tablePixelWidth, minWidth: "100%" }}
+          aria-label={`${table.name}股票监控表`}
+          aria-rowcount={tableRows.length + 1}
+        >
+          <colgroup>
+            {visibleLeafColumns.map((column) => <col key={column.id} style={columnWidthStyle(columns, column.id)} />)}
+          </colgroup>
           <thead className={`sticky top-0 z-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary ${comfortableDensity ? "h-12" : "h-10"}`}>
             {tableInstance.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id} aria-rowindex={1}>
@@ -631,7 +703,7 @@ export function WatchTable({
           <tbody className="divide-y divide-line/80">
             {tableRows.length === 0 ? (
               <tr>
-                <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)}>
+                <td colSpan={Math.max(1, visibleLeafColumns.length)}>
                   <div className="flex min-h-44 flex-col items-center justify-center px-6 py-10 text-center">
                     <p className="text-sm font-medium text-primary">{table.stocks.length === 0 ? "还没有监控股票" : "没有符合筛选条件的股票"}</p>
                     <p className="mt-1.5 text-xs text-muted">{table.stocks.length === 0 ? "添加第一只股票后，后端行情和指标会出现在这里。" : "调整名称、代码或状态筛选条件后重试。"}</p>
@@ -644,7 +716,7 @@ export function WatchTable({
               <>
                 {virtualRange.offsetTop > 0 ? (
                   <tr aria-hidden="true" role="presentation">
-                    <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)} className="p-0" style={{ height: virtualRange.offsetTop }} />
+                    <td colSpan={Math.max(1, visibleLeafColumns.length)} className="p-0" style={{ height: virtualRange.offsetTop }} />
                   </tr>
                 ) : null}
                 {visibleRows.map((row, visibleIndex) => (
@@ -658,7 +730,7 @@ export function WatchTable({
                 ))}
                 {virtualRange.offsetBottom > 0 ? (
                   <tr aria-hidden="true" role="presentation">
-                    <td colSpan={Math.max(1, tableInstance.getVisibleLeafColumns().length)} className="p-0" style={{ height: virtualRange.offsetBottom }} />
+                    <td colSpan={Math.max(1, visibleLeafColumns.length)} className="p-0" style={{ height: virtualRange.offsetBottom }} />
                   </tr>
                 ) : null}
               </>
@@ -666,7 +738,6 @@ export function WatchTable({
           </tbody>
         </table>
       </div>
-      {addColumnOpen ? <AddColumnDialog tableId={tableId} restoreFocusRef={addColumnTriggerRef} onClose={closeAddColumnDialog} /> : null}
       <IndicatorDetailsDrawer
         selection={detailSelection}
         onClose={closeDetail}

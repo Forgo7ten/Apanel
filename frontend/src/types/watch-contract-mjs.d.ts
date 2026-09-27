@@ -17,7 +17,17 @@ declare module "@/lib/watch-contract.mjs" {
     view_mode: "NUMBER" | "DELTA" | "STATUS" | "COMPOSITE";
   };
   export function toColumnOrderPayload(columnOrder: unknown): { column_ids: number[] };
+  export function reorderColumnIdsForDrop(
+    ids: Array<string | number>,
+    sourceId: string | number,
+    targetId: string | number,
+    position?: "before" | "after",
+  ): Array<string | number>;
   export const WATCH_DETAIL_REFRESH_INTERVAL_MS: number;
+  export const WATCH_BOOTSTRAP_POLL_INTERVAL_MS: number;
+  export const WATCH_BOOTSTRAP_TIMEOUT_MS: number;
+  export function isWatchStockDataReady(stock: unknown, columns?: unknown[]): boolean;
+  export function expectedCompositeFieldCount(columns?: unknown[]): number;
   export function filterWatchStocks(
     stocks: unknown,
     filters?: { query?: string; state?: string },

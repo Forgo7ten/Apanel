@@ -7,17 +7,19 @@ import inspect
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, NoReturn
 from zoneinfo import ZoneInfo
 
 from celery import Task
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.clients.market_data_hub import MarketDataHubClient, MarketDataHubClientProtocol
 from app.core.config import Settings, get_settings
 from app.db.redis import close_redis_client, create_redis_client
 from app.db.session import create_engine, dispose_engine
+from app.models import Security
 from app.services.data_bootstrap_service import SecurityDataBootstrapService
 from app.services.notification_service import dispatch_pending_notifications
 from app.services.trading_calendar_service import TradingCalendarService
@@ -482,6 +484,16 @@ async def execute_security_bootstrap(
             adjustments=("qfq", "none") if app_settings.enable_none_analysis else ("qfq",),
             requests=requests,
         )
+        async with session_factory() as session:
+            security = (
+                await session.execute(
+                    select(Security).where(Security.symbol == result.symbol)
+                )
+            ).scalar_one_or_none()
+            if security is None:
+                raise RuntimeError("security bootstrap target was not found")
+            security.bootstrap_completed_at = datetime.now(UTC)
+            await session.commit()
         return {
             "status": "completed",
             "operation": "security_bootstrap",
