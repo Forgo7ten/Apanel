@@ -1,0 +1,27 @@
+[project]
+name = "apanel-market-data-hub"
+version = "0.1.0"
+description = "Apanel independent market data hub foundation"
+requires-python = ">=3.12"
+dependencies = [
+  "asyncpg>=0.30,<1",
+  "akshare==1.18.97",
+  "fastapi>=0.115,<1",
+  "pydantic-settings>=2.6,<3",
+  "eltdx==3.2.2",
+  "redis>=5.2,<6",
+  "SQLAlchemy[asyncio]>=2.0.36,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -53,9 +53,9 @@ services:
     networks:
       - apanel
 
-  market-data-service:
+  market-data-hub:
     build:
-      context: ./market-data-service
+      context: ./market-data-hub
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
@@ -67,23 +67,20 @@ services:
       DATABASE_COMMAND_TIMEOUT_SECONDS: ${DATABASE_COMMAND_TIMEOUT_SECONDS:-5}
       REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS: ${REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS:-5}
       REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-5}
-      MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-tdx}
-      PROVIDER_TIMEOUT_SECONDS: ${PROVIDER_TIMEOUT_SECONDS:-5}
+      ELTDX_HOSTS: "${ELTDX_HOSTS:-}"
+      ELTDX_TIMEOUT_SECONDS: ${ELTDX_TIMEOUT_SECONDS:-5}
+      ELTDX_PROBE_HOSTS: ${ELTDX_PROBE_HOSTS:-true}
+      ELTDX_HEARTBEAT_INTERVAL_SECONDS: ${ELTDX_HEARTBEAT_INTERVAL_SECONDS:-30}
+      ELTDX_BAR_PAGE_SIZE: ${ELTDX_BAR_PAGE_SIZE:-800}
+      ELTDX_BAR_MAX_PAGES: ${ELTDX_BAR_MAX_PAGES:-64}
       SECURITY_MASTER_FALLBACK_PROVIDER: ${SECURITY_MASTER_FALLBACK_PROVIDER:-akshare}
       AKSHARE_SECURITY_TIMEOUT_SECONDS: ${AKSHARE_SECURITY_TIMEOUT_SECONDS:-90}
       AKSHARE_MIN_STOCK_COUNT: ${AKSHARE_MIN_STOCK_COUNT:-1000}
       AKSHARE_MIN_ETF_COUNT: ${AKSHARE_MIN_ETF_COUNT:-1}
-      TDX_SERVERS: ${TDX_SERVERS:-119.147.212.81:7709,101.227.73.20:7709}
-      TDX_CONNECT_TIMEOUT_SECONDS: ${TDX_CONNECT_TIMEOUT_SECONDS:-5}
-      TDX_RETRY_ATTEMPTS: ${TDX_RETRY_ATTEMPTS:-1}
-      TDX_SYMBOL_TIMEOUT_SECONDS: ${TDX_SYMBOL_TIMEOUT_SECONDS:-60}
-      TDX_SYMBOL_MAX_PAGES: ${TDX_SYMBOL_MAX_PAGES:-100}
-      TDX_BAR_PAGE_SIZE: ${TDX_BAR_PAGE_SIZE:-800}
-      TDX_BAR_MAX_PAGES: ${TDX_BAR_MAX_PAGES:-64}
       HTTP_PROXY: "${MARKET_DATA_HTTP_PROXY:-}"
       HTTPS_PROXY: "${MARKET_DATA_HTTPS_PROXY:-}"
       ALL_PROXY: "${MARKET_DATA_ALL_PROXY:-}"
-      NO_PROXY: "${MARKET_DATA_NO_PROXY:-localhost,127.0.0.1},postgres,redis,backend,market-data-service"
+      NO_PROXY: "${MARKET_DATA_NO_PROXY:-localhost,127.0.0.1},postgres,redis,backend,market-data-hub"
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
     expose:
       - "8001"
@@ -120,7 +117,7 @@ services:
     restart: "no"
     environment:
       APP_ENV: ${APP_ENV:?APP_ENV is required; copy .env.example to .env}
-      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      MARKET_DATA_HUB_URL: http://market-data-hub:8001
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
     command:
       [
@@ -135,7 +132,7 @@ services:
         "${SECURITY_BOOTSTRAP_TIMEOUT_SECONDS:-180}",
       ]
     depends_on:
-      market-data-service:
+      market-data-hub:
         condition: service_healthy
     networks:
       - apanel
@@ -151,7 +148,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      MARKET_DATA_HUB_URL: http://market-data-hub:8001
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required; copy .env.example to .env}
       JWT_ISSUER: ${JWT_ISSUER:-apanel}
@@ -179,7 +176,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      market-data-service:
+      market-data-hub:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -211,7 +208,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      MARKET_DATA_HUB_URL: http://market-data-hub:8001
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
       QUOTE_REFRESH_INTERVAL_MINUTES: ${QUOTE_REFRESH_INTERVAL_MINUTES:-5}
       EOD_PIPELINE_HOUR: ${EOD_PIPELINE_HOUR:-15}
@@ -225,7 +222,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      market-data-service:
+      market-data-hub:
         condition: service_healthy
       backend:
         condition: service_healthy
@@ -256,7 +253,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      MARKET_DATA_HUB_URL: http://market-data-hub:8001
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?INTERNAL_API_TOKEN is required; copy .env.example to .env}
       QUOTE_REFRESH_INTERVAL_MINUTES: ${QUOTE_REFRESH_INTERVAL_MINUTES:-5}
       EOD_PIPELINE_HOUR: ${EOD_PIPELINE_HOUR:-15}
@@ -271,7 +268,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      market-data-service:
+      market-data-hub:
         condition: service_healthy
       backend:
         condition: service_healthy

@@ -15,11 +15,11 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from app.clients.market_data_hub import MarketDataHubClient, MarketDataHubClientError
 from app.core.config import get_settings
 from app.core.errors import ApiError
 from app.db.session import create_engine, dispose_engine
 from app.services.auth_service import bootstrap_admin
-from app.tasks.market_data import HttpMarketDataClient, MarketDataClientError
 
 
 def _positive_float(value: str) -> float:
@@ -106,7 +106,7 @@ def _failure_result(message: str, *, retryable: bool) -> BootstrapAttemptResult:
     )
 
 
-def _safe_market_data_error(error: MarketDataClientError) -> str:
+def _safe_market_data_error(error: MarketDataHubClientError) -> str:
     if error.retryable:
         return "market data request temporarily unavailable"
     return "market data synchronization failed"
@@ -115,24 +115,24 @@ def _safe_market_data_error(error: MarketDataClientError) -> str:
 def _bootstrap_result(data: object) -> BootstrapAttemptResult:
     if not isinstance(data, Mapping):
         return _failure_result(
-            "market data service returned an invalid synchronization summary",
+            "market data hub returned an invalid synchronization summary",
             retryable=False,
         )
     if "success" in data:
         if data.get("success") is not True:
             return _failure_result(
-                "market data service reported synchronization failed",
+                "market data hub reported synchronization failed",
                 retryable=False,
             )
         data = data.get("data")
         if not isinstance(data, Mapping):
             return _failure_result(
-                "market data service returned an invalid synchronization summary",
+                "market data hub returned an invalid synchronization summary",
                 retryable=False,
             )
     if "ok" in data and data.get("ok") is not True:
         return _failure_result(
-            "market data service reported synchronization failed",
+            "market data hub reported synchronization failed",
             retryable=False,
         )
     succeeded = data.get("succeeded")
@@ -146,7 +146,7 @@ def _bootstrap_result(data: object) -> BootstrapAttemptResult:
         or failed < 0
     ):
         return _failure_result(
-            "market data service returned an invalid synchronization summary",
+            "market data hub returned an invalid synchronization summary",
             retryable=False,
         )
     if "total" in data:
@@ -158,7 +158,7 @@ def _bootstrap_result(data: object) -> BootstrapAttemptResult:
             or total != succeeded + failed
         ):
             return _failure_result(
-                "market data service returned an invalid synchronization summary",
+                "market data hub returned an invalid synchronization summary",
                 retryable=False,
             )
     if failed:
@@ -198,7 +198,7 @@ async def run_security_bootstrap(
     try:
         try:
             client = market_data_client_factory(
-                settings.market_data_service_url,
+                settings.market_data_hub_url,
                 internal_api_token=settings.internal_api_token,
                 timeout_seconds=args.timeout_seconds,
             )
@@ -216,7 +216,7 @@ async def run_security_bootstrap(
                 result = _bootstrap_result(data)
             except asyncio.CancelledError:
                 raise
-            except MarketDataClientError as exc:
+            except MarketDataHubClientError as exc:
                 result = _failure_result(
                     _safe_market_data_error(exc),
                     retryable=exc.retryable,
@@ -269,7 +269,7 @@ def main(
     argv: list[str] | None = None,
     *,
     settings: Any | None = None,
-    market_data_client_factory: Callable[..., Any] = HttpMarketDataClient,
+    market_data_client_factory: Callable[..., Any] = MarketDataHubClient,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> int:
     args = build_parser().parse_args(argv)

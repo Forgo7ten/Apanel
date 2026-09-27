@@ -73,9 +73,9 @@ class Settings(BaseSettings):
     database_command_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_socket_connect_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
-    market_data_service_url: str = Field(
-        default="http://market-data-service:8001",
-        validation_alias=AliasChoices("MARKET_DATA_SERVICE_URL", "MARKET_DATA_URL"),
+    market_data_hub_url: str = Field(
+        default="http://market-data-hub:8001",
+        validation_alias=AliasChoices("MARKET_DATA_HUB_URL", "MARKET_DATA_URL"),
     )
     internal_api_token: str | None = Field(
         default=None,

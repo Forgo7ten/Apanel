@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.cli import main
-from app.tasks.market_data import (
-    HttpMarketDataClient,
-    MarketDataClientError,
-    PermanentMarketDataClientError,
-    RetryableMarketDataClientError,
+from app.clients.market_data_hub import (
+    MarketDataHubClient,
+    MarketDataHubClientError,
+    PermanentMarketDataHubError,
+    RetryableMarketDataHubError,
 )
 
 
@@ -52,7 +52,7 @@ class RaisingHttpClient:
         raise self.error
 
 
-class ScriptedMarketDataClient:
+class ScriptedMarketDataHubClientProtocol:
     def __init__(self, outcomes: list[object]) -> None:
         self.outcomes = outcomes
         self.sync_calls = 0
@@ -70,18 +70,18 @@ class ScriptedMarketDataClient:
 
 
 class ClientFactory:
-    def __init__(self, client: ScriptedMarketDataClient) -> None:
+    def __init__(self, client: ScriptedMarketDataHubClientProtocol) -> None:
         self.client = client
         self.calls: list[dict[str, object]] = []
 
-    def __call__(self, base_url: str, **kwargs: object) -> ScriptedMarketDataClient:
+    def __call__(self, base_url: str, **kwargs: object) -> ScriptedMarketDataHubClientProtocol:
         self.calls.append({"base_url": base_url, **kwargs})
         return self.client
 
 
 def cli_settings() -> SimpleNamespace:
     return SimpleNamespace(
-        market_data_service_url="http://market-data-service:8001",
+        market_data_hub_url="http://market-data-hub:8001",
         internal_api_token="internal-secret",
     )
 
@@ -97,8 +97,8 @@ async def test_sync_securities_uses_authenticated_internal_endpoint_and_envelope
             }
         )
     )
-    client = HttpMarketDataClient(
-        "http://market-data-service:8001/",
+    client = MarketDataHubClient(
+        "http://market-data-hub:8001/",
         internal_api_token="internal-secret",
         timeout_seconds=4,
         client=transport,
@@ -109,7 +109,7 @@ async def test_sync_securities_uses_authenticated_internal_endpoint_and_envelope
     assert result == {"operation": "security", "succeeded": 2, "failed": 0}
     assert transport.calls == [
         {
-            "url": "http://market-data-service:8001/internal/sync/securities",
+            "url": "http://market-data-hub:8001/internal/sync/securities",
             "json": {},
             "headers": {"X-Internal-Token": "internal-secret"},
             "timeout": 4.0,
@@ -128,9 +128,9 @@ async def test_sync_securities_rejects_unsuccessful_envelope() -> None:
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(PermanentMarketDataClientError, match="synchronization failed"):
+    with pytest.raises(PermanentMarketDataHubError, match="synchronization failed"):
         await client.sync_securities()
 
 
@@ -151,9 +151,9 @@ async def test_sync_securities_classifies_transient_error_envelope_as_retryable(
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(RetryableMarketDataClientError) as raised:
+    with pytest.raises(RetryableMarketDataHubError) as raised:
         await client.sync_securities()
 
     assert str(raised.value) == "market data request temporarily unavailable"
@@ -195,9 +195,9 @@ async def test_sync_securities_classifies_transient_item_error_as_retryable(
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(RetryableMarketDataClientError):
+    with pytest.raises(RetryableMarketDataHubError):
         await client.sync_securities()
 
 
@@ -217,9 +217,9 @@ async def test_sync_securities_keeps_mixed_item_errors_permanent() -> None:
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(PermanentMarketDataClientError):
+    with pytest.raises(PermanentMarketDataHubError):
         await client.sync_securities()
 
 
@@ -241,9 +241,9 @@ async def test_sync_securities_keeps_permanent_top_level_error_permanent() -> No
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(PermanentMarketDataClientError) as raised:
+    with pytest.raises(PermanentMarketDataHubError) as raised:
         await client.sync_securities()
 
     assert str(raised.value) == "market data synchronization failed"
@@ -269,9 +269,9 @@ async def test_sync_securities_keeps_transient_top_level_and_items_retryable(
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(RetryableMarketDataClientError):
+    with pytest.raises(RetryableMarketDataHubError):
         await client.sync_securities()
 
 
@@ -290,9 +290,9 @@ async def test_sync_securities_keeps_transient_top_level_with_permanent_item_per
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(PermanentMarketDataClientError):
+    with pytest.raises(PermanentMarketDataHubError):
         await client.sync_securities()
 
 
@@ -313,9 +313,9 @@ async def test_sync_securities_retries_transient_items_without_top_level_error(
     if include_top_level_error:
         body["error"] = None
     transport = RecordingHttpClient(FakeResponse(body))
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(RetryableMarketDataClientError):
+    with pytest.raises(RetryableMarketDataHubError):
         await client.sync_securities()
 
 
@@ -347,8 +347,8 @@ def test_bootstrap_securities_does_not_sleep_for_permanent_top_level_error_with_
     )
     delays: list[float] = []
 
-    def factory(base_url: str, **kwargs: object) -> HttpMarketDataClient:
-        return HttpMarketDataClient(base_url, client=transport, **kwargs)
+    def factory(base_url: str, **kwargs: object) -> MarketDataHubClient:
+        return MarketDataHubClient(base_url, client=transport, **kwargs)
 
     async def record_sleep(seconds: float) -> None:
         delays.append(seconds)
@@ -396,8 +396,8 @@ def test_bootstrap_securities_retries_transient_http_envelope(capsys) -> None:
     )
     delays: list[float] = []
 
-    def factory(base_url: str, **kwargs: object) -> HttpMarketDataClient:
-        return HttpMarketDataClient(base_url, client=transport, **kwargs)
+    def factory(base_url: str, **kwargs: object) -> MarketDataHubClient:
+        return MarketDataHubClient(base_url, client=transport, **kwargs)
 
     async def record_sleep(seconds: float) -> None:
         delays.append(seconds)
@@ -438,8 +438,8 @@ def test_bootstrap_securities_single_attempt_keeps_transient_http_failure_nonzer
     )
     delays: list[float] = []
 
-    def factory(base_url: str, **kwargs: object) -> HttpMarketDataClient:
-        return HttpMarketDataClient(base_url, client=transport, **kwargs)
+    def factory(base_url: str, **kwargs: object) -> MarketDataHubClient:
+        return MarketDataHubClient(base_url, client=transport, **kwargs)
 
     async def record_sleep(seconds: float) -> None:
         delays.append(seconds)
@@ -483,9 +483,9 @@ async def test_sync_securities_keeps_non_allowlisted_error_codes_permanent(
             }
         )
     )
-    client = HttpMarketDataClient("http://market-data-service:8001", client=transport)
+    client = MarketDataHubClient("http://market-data-hub:8001", client=transport)
 
-    with pytest.raises(PermanentMarketDataClientError) as raised:
+    with pytest.raises(PermanentMarketDataHubError) as raised:
         await client.sync_securities()
 
     assert str(raised.value) == "market data synchronization failed"
@@ -495,42 +495,42 @@ async def test_sync_securities_keeps_non_allowlisted_error_codes_permanent(
 @pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 599])
 @pytest.mark.asyncio
 async def test_sync_securities_classifies_transient_http_statuses(status_code: int) -> None:
-    client = HttpMarketDataClient(
-        "http://market-data-service:8001",
+    client = MarketDataHubClient(
+        "http://market-data-hub:8001",
         client=RecordingHttpClient(FakeResponse({}, status_code=status_code)),
     )
 
-    with pytest.raises(RetryableMarketDataClientError):
+    with pytest.raises(RetryableMarketDataHubError):
         await client.sync_securities()
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
 @pytest.mark.asyncio
 async def test_sync_securities_classifies_permanent_http_statuses(status_code: int) -> None:
-    client = HttpMarketDataClient(
-        "http://market-data-service:8001",
+    client = MarketDataHubClient(
+        "http://market-data-hub:8001",
         client=RecordingHttpClient(FakeResponse({}, status_code=status_code)),
     )
 
-    with pytest.raises(PermanentMarketDataClientError):
+    with pytest.raises(PermanentMarketDataHubError):
         await client.sync_securities()
 
 
 @pytest.mark.asyncio
 async def test_sync_securities_classifies_network_failures_as_retryable() -> None:
-    client = HttpMarketDataClient(
-        "http://market-data-service:8001",
+    client = MarketDataHubClient(
+        "http://market-data-hub:8001",
         client=RaisingHttpClient(ConnectionError("token=do-not-print")),
     )
 
-    with pytest.raises(RetryableMarketDataClientError):
+    with pytest.raises(RetryableMarketDataHubError):
         await client.sync_securities()
 
 
 @pytest.mark.asyncio
 async def test_sync_securities_does_not_wrap_unexpected_transport_errors() -> None:
-    client = HttpMarketDataClient(
-        "http://market-data-service:8001",
+    client = MarketDataHubClient(
+        "http://market-data-hub:8001",
         client=RaisingHttpClient(RuntimeError("programming bug")),
     )
 
@@ -539,7 +539,7 @@ async def test_sync_securities_does_not_wrap_unexpected_transport_errors() -> No
 
 
 def test_bootstrap_securities_succeeds_only_with_persisted_securities(capsys) -> None:
-    client = ScriptedMarketDataClient([{"succeeded": 3, "failed": 0}])
+    client = ScriptedMarketDataHubClientProtocol([{"succeeded": 3, "failed": 0}])
     factory = ClientFactory(client)
 
     exit_code = main(
@@ -552,7 +552,7 @@ def test_bootstrap_securities_succeeds_only_with_persisted_securities(capsys) ->
     assert client.closed is True
     assert factory.calls == [
         {
-            "base_url": "http://market-data-service:8001",
+            "base_url": "http://market-data-hub:8001",
             "internal_api_token": "internal-secret",
             "timeout_seconds": 4.0,
         }
@@ -561,7 +561,7 @@ def test_bootstrap_securities_succeeds_only_with_persisted_securities(capsys) ->
 
 
 def test_bootstrap_securities_rejects_empty_result_and_closes_client(capsys) -> None:
-    client = ScriptedMarketDataClient([{"succeeded": 0, "failed": 0}])
+    client = ScriptedMarketDataHubClientProtocol([{"succeeded": 0, "failed": 0}])
 
     exit_code = main(
         ["bootstrap-securities"],
@@ -575,7 +575,7 @@ def test_bootstrap_securities_rejects_empty_result_and_closes_client(capsys) -> 
 
 
 def test_bootstrap_securities_rejects_partial_failure(capsys) -> None:
-    client = ScriptedMarketDataClient([{"succeeded": 1, "failed": 1}])
+    client = ScriptedMarketDataHubClientProtocol([{"succeeded": 1, "failed": 1}])
 
     exit_code = main(
         ["bootstrap-securities"],
@@ -589,7 +589,7 @@ def test_bootstrap_securities_rejects_partial_failure(capsys) -> None:
 
 
 def test_bootstrap_securities_hides_exception_secrets(capsys) -> None:
-    client = ScriptedMarketDataClient([RuntimeError("token=do-not-print")])
+    client = ScriptedMarketDataHubClientProtocol([RuntimeError("token=do-not-print")])
 
     exit_code = main(
         ["bootstrap-securities"],
@@ -606,8 +606,8 @@ def test_bootstrap_securities_hides_exception_secrets(capsys) -> None:
 
 
 def test_bootstrap_securities_hides_market_data_error_details(capsys) -> None:
-    client = ScriptedMarketDataClient(
-        [MarketDataClientError("provider-token=do-not-print")]
+    client = ScriptedMarketDataHubClientProtocol(
+        [MarketDataHubClientError("provider-token=do-not-print")]
     )
 
     exit_code = main(
@@ -639,7 +639,7 @@ def test_bootstrap_securities_handles_client_factory_failure_without_details(cap
 
 
 def test_bootstrap_securities_rejects_false_summary_status(capsys) -> None:
-    client = ScriptedMarketDataClient([{"ok": False, "succeeded": 2, "failed": 0}])
+    client = ScriptedMarketDataHubClientProtocol([{"ok": False, "succeeded": 2, "failed": 0}])
 
     exit_code = main(
         ["bootstrap-securities"],
@@ -652,9 +652,9 @@ def test_bootstrap_securities_rejects_false_summary_status(capsys) -> None:
 
 
 def test_bootstrap_securities_retries_until_success(capsys) -> None:
-    client = ScriptedMarketDataClient(
+    client = ScriptedMarketDataHubClientProtocol(
         [
-            RetryableMarketDataClientError("provider-token=do-not-print"),
+            RetryableMarketDataHubError("provider-token=do-not-print"),
             {"succeeded": 0, "failed": 0},
             {"succeeded": 2, "failed": 0},
         ]
@@ -687,13 +687,13 @@ def test_bootstrap_securities_retries_until_success(capsys) -> None:
 @pytest.mark.parametrize(
     "outcome",
     [
-        PermanentMarketDataClientError("provider-token=do-not-print"),
+        PermanentMarketDataHubError("provider-token=do-not-print"),
         {"succeeded": "2", "failed": 0},
         {"succeeded": 1, "failed": 1},
     ],
 )
 def test_bootstrap_securities_does_not_retry_permanent_failures(outcome, capsys) -> None:
-    client = ScriptedMarketDataClient([outcome])
+    client = ScriptedMarketDataHubClientProtocol([outcome])
     delays: list[float] = []
 
     async def record_sleep(seconds: float) -> None:
@@ -720,7 +720,7 @@ def test_bootstrap_securities_does_not_retry_permanent_failures(outcome, capsys)
 
 
 def test_bootstrap_securities_does_not_retry_unexpected_exceptions(capsys) -> None:
-    client = ScriptedMarketDataClient([RuntimeError("programming bug")])
+    client = ScriptedMarketDataHubClientProtocol([RuntimeError("programming bug")])
     delays: list[float] = []
 
     async def record_sleep(seconds: float) -> None:
@@ -742,7 +742,7 @@ def test_bootstrap_securities_does_not_retry_unexpected_exceptions(capsys) -> No
 
 
 def test_bootstrap_securities_propagates_cancellation_after_close() -> None:
-    client = ScriptedMarketDataClient([asyncio.CancelledError()])
+    client = ScriptedMarketDataHubClientProtocol([asyncio.CancelledError()])
 
     with pytest.raises(asyncio.CancelledError):
         main(

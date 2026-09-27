@@ -83,7 +83,7 @@ class NotificationStatus(StrEnum):
 
 
 class Security(Base):
-    """A security record shared with the market-data service."""
+    """A security record shared with the Market Data Hub."""
 
     __tablename__ = "securities"
 

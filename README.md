@@ -10,7 +10,7 @@ Apanel 不预测价格、不提供买卖建议，也不执行自动交易。当�
 - FastAPI 后端健康检查，统一 JSON 成功/错误响应。
 - 可插拔的指标注册表，内置 MA、Projected MA、RSI、KDJ、BOLL 和 MACD。
 - 可复用的状态注册表与状态引擎，内置交叉、方向、带宽变化和突破状态。
-- 独立的行情数据服务，提供 TDX provider、证券元数据、日线、报价快照和分红事件的持久化边界。
+- 独立的 Market Data Hub：以 eltdx 作为 TDX 主 Provider、AKShare 作为证券主数据 fallback，统一负责证券元数据、日线、报价和分红的外部数据边界。
 - Next.js 工作台，包括登录、邀请注册、股票监控、通知和设置页面。
 - Docker Compose 编排 PostgreSQL、Redis、迁移、后端、行情服务、调度器、前端和 Nginx。
 
@@ -21,7 +21,7 @@ Apanel 不预测价格、不提供买卖建议，也不执行自动交易。当�
 | `nginx` | 对外入口；转发 Web、前端健康检查和后端 API | 宿主机 `${HTTP_PORT}`，默认 `8080` |
 | `frontend` | Next.js 页面、浏览器认证会话和 `/api/health` | `3000`（仅内部暴露） |
 | `backend` | FastAPI 认证、健康检查、指标与状态内核 | `8000`（仅内部暴露） |
-| `market-data-service` | provider 适配、行情读取与同步、市场数据持久化 | `8001`（仅内部暴露） |
+| `market-data-hub` | provider 适配、行情读取与同步、市场数据持久化 | `8001`（仅内部暴露） |
 | `migrate` | 启动前执行 Alembic 数据库迁移 | 一次性容器 |
 | `scheduler` | Celery Beat 进程入口 | 无 HTTP 端口 |
 | `postgres` | PostgreSQL 16，认证和行情数据存储 | 仅内部网络 |
@@ -64,7 +64,7 @@ MARKET_DATA_ALL_PROXY=
 MARKET_DATA_NO_PROXY=
 ```
 
-这些变量只注入 `market-data-service`；默认留空时不会启用代理。Compose 会自动把 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-service` 加入 `NO_PROXY`，保证内部请求不经过外部代理。`host.docker.internal` 使用跨 Linux 的 `host-gateway` 映射；宿主代理必须监听 Docker 可达接口，不能只监听宿主机的 `127.0.0.1`。代理 URL 可能包含敏感凭据，请只保存在被 Git 忽略的 `.env` 中，应用日志不会打印这些值。
+这些变量只注入 `market-data-hub`；默认留空时不会启用代理。Compose 会自动把 `localhost`、`127.0.0.1`、`postgres`、`redis`、`backend` 和 `market-data-hub` 加入 `NO_PROXY`，保证内部请求不经过外部代理。`host.docker.internal` 使用跨 Linux 的 `host-gateway` 映射；宿主代理必须监听 Docker 可达接口，不能只监听宿主机的 `127.0.0.1`。代理 URL 可能包含敏感凭据，请只保存在被 Git 忽略的 `.env` 中，应用日志不会打印这些值。
 
 ## 初始化管理员
 
@@ -83,7 +83,7 @@ docker compose exec backend python -m app.cli bootstrap-admin \
 docker compose up --build -d       # 构建并后台启动
 docker compose ps                  # 查看服务状态
 docker compose logs -f backend     # 跟踪后端日志
-docker compose logs -f market-data-service
+docker compose logs -f market-data-hub
 docker compose down                # 停止服务，保留命名卷
 ```
 
@@ -99,7 +99,7 @@ backend/                 FastAPI、认证、Alembic、指标和状态引擎
   app/indicators/        指标输入、结果和注册表
   app/states/            状态定义、注册表和识别引擎
   alembic/                数据库迁移
-market-data-service/     独立行情服务与 provider 适配器
+market-data-hub/          独立行情数据中枢与 Provider 适配器
 frontend/                Next.js 工作台
 nginx/                   同源反向代理配置
 compose.yaml             本地服务编排

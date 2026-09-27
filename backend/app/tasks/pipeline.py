@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from app.clients.market_data_hub import MarketDataHubClientProtocol
 from app.core.errors import ApiError
 from app.indicators.parameters import (
     IndicatorRequest,
@@ -29,7 +30,6 @@ from .contracts import (
     PipelineStep,
     PipelineStepError,
 )
-from .market_data import MarketDataClient
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ class EODPipeline:
 def build_default_eod_steps(
     *,
     session_factory: Any,
-    market_data_client: MarketDataClient,
+    market_data_client: MarketDataHubClientProtocol,
     alert_runner: Integration | None = None,
     notification_runner: Integration | None = None,
     delta_runner: Integration | None = None,

@@ -31,7 +31,7 @@ http://localhost:8080/api/v1
 }
 ```
 
-行情服务也返回 `success`、`data` 和 `error`。一般请求错误时 `data` 为 `null`；健康检查降级和部分同步失败会保留 `data`，分别返回依赖状态或逐项结果。后端请求校验错误还会带 `error.details`，其中只包含字段位置、错误类型和消息。
+行情数据中枢也返回 `success`、`data` 和 `error`。一般请求错误时 `data` 为 `null`；健康检查降级和部分同步失败会保留 `data`，分别返回依赖状态或逐项结果。后端请求校验错误还会带 `error.details`，其中只包含字段位置、错误类型和消息。
 
 ## 网关与健康检查
 
@@ -114,7 +114,7 @@ http://localhost:8080/api/v1
 省略 `adjust` 时默认使用 `qfq`；显式传入 `adjust=none` 会返回 `400`，并使用稳定错误码
 `UNSUPPORTED_INDICATOR_ADJUSTMENT`（当前值）或 `UNSUPPORTED_HISTORY_ADJUSTMENT`（历史值）。
 其中两个 `history` GET 只读取已经持久化的快照/状态，不会因为查看历史而重算或写入数据库；
-当前值接口按既有服务语义刷新并持久化 qfq 结果。EOD pipeline 同样只接受 `qfq`，因此行情服务
+当前值接口按既有服务语义刷新并持久化 qfq 结果。EOD pipeline 同样只接受 `qfq`，因此行情数据中枢
 仍可独立保存和读取 `none` 原始日线，但它不会进入指标或状态持久化计算，也不会覆盖已有的 qfq
 快照/状态。
 
@@ -172,13 +172,13 @@ Feishu HTTP 响应必须是 JSON object，并明确包含数值 `code` 或 `Stat
 `0`；缺字段、非法 JSON、非 object、非零业务码都会记录为失败。provider 请求超时固定为
 5 秒，错误响应不会回显 webhook 信息。
 
-## 行情服务 API
+## 行情数据中枢 API
 
-以下路径由 `market-data-service` 直接提供，不经过 Nginx，也没有 `/api/v1` 前缀。它们默认只在 Compose 网络内可访问。
+以下路径由 `market-data-hub` 直接提供，不经过 Nginx，也没有 `/api/v1` 前缀。它们默认只在 Compose 网络内可访问。
 
 ### `GET /health`
 
-探测行情服务的 PostgreSQL 和 Redis。全部健康时返回 `200`，任一依赖异常时返回 `503`，数据状态为 `healthy` 或 `degraded`。
+探测行情数据中枢的 PostgreSQL 和 Redis。全部健康时返回 `200`，任一依赖异常时返回 `503`，数据状态为 `healthy` 或 `degraded`。
 
 ### `GET /internal/quotes/{symbol}`
 
@@ -250,6 +250,6 @@ token 返回 `503`。
 
 ## 版本与限制
 
-- `/api/v1` 是后端当前实际挂载的 API 路径；行情服务不使用该前缀。
+- `/api/v1` 是后端当前实际挂载的 API 路径；行情数据中枢不使用该前缀。
 - 通知历史和失败/遗留投递恢复端点见“告警通知 API”；告警规则由 `/alerts` 端点管理。
 - 行情读取只读持久化结果；报价写入由 provider/repository 边界提供，但当前没有公开的报价同步 HTTP 路由。

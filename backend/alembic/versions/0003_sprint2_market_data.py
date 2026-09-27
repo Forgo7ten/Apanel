@@ -13,7 +13,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create the tables persisted by Market Data Service."""
+    """Create the tables persisted by Market Data Hub."""
 
     op.create_table(
         "securities",
