@@ -53,6 +53,36 @@ def rsi(series: Iterable[Any], period: int = 14) -> RSIResult:
 class RSIIndicator:
     name = "rsi"
 
+    def calculate_series(self, series: Iterable[Any], *, period: int | None = None):
+        selected = positive_int("period", self.period if period is None else period)
+        candles = normalize_series(series)
+        closes = close_values(candles)
+        output = [None] * len(closes)
+        if len(closes) < selected + 1:
+            return tuple(output)
+        changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        avg_gain = math.fsum(max(change, 0.0) for change in changes[:selected]) / selected
+        avg_loss = math.fsum(max(-change, 0.0) for change in changes[:selected]) / selected
+        for index in range(selected, len(closes)):
+            if index > selected:
+                change = changes[index - 1]
+                avg_gain = ((avg_gain * (selected - 1)) + max(change, 0.0)) / selected
+                avg_loss = ((avg_loss * (selected - 1)) + max(-change, 0.0)) / selected
+            if avg_loss == 0.0:
+                value = 50.0 if avg_gain == 0.0 else 100.0
+            elif avg_gain == 0.0:
+                value = 0.0
+            else:
+                rs = avg_gain / avg_loss
+                value = 100.0 - (100.0 / (1.0 + rs))
+            output[index] = RSIResult(
+                value=float(value),
+                period=selected,
+                average_gain=float(avg_gain),
+                average_loss=float(avg_loss),
+            )
+        return tuple(output)
+
     def __init__(self, period: int = 14) -> None:
         self.period = positive_int("period", period)
 

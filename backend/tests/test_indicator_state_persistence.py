@@ -12,7 +12,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import Settings
-from app.core.errors import ApiError
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import create_app
@@ -23,7 +22,7 @@ from app.models import (
     Security,
     StateDefinition,
 )
-from app.services.indicator_service import IndicatorService, serialize_current_indicators
+from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
 
 
@@ -47,19 +46,21 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
         await session.flush()
         for index in range(40):
             close = Decimal(str(100 + index * 0.2))
-            session.add(
-                DailyBar(
-                    security_id=security.id,
-                    trade_date=date(2026, 1, 1) + timedelta(days=index),
-                    open=close,
-                    high=close + 1,
-                    low=close - 1,
-                    close=close,
-                    volume=100,
-                    amount=10000,
-                    adjust_type="qfq",
+            for adjustment, offset in (("qfq", Decimal("0")), ("none", Decimal("5"))):
+                selected_close = close + offset
+                session.add(
+                    DailyBar(
+                        security_id=security.id,
+                        trade_date=date(2026, 1, 1) + timedelta(days=index),
+                        open=selected_close,
+                        high=selected_close + 1,
+                        low=selected_close - 1,
+                        close=selected_close,
+                        volume=100,
+                        amount=10000,
+                        adjust_type=adjustment,
+                    )
                 )
-            )
         await session.commit()
     yield session_factory
     await engine.dispose()
@@ -92,6 +93,7 @@ async def test_indicator_calculation_persists_defaults_and_is_idempotent(indicat
 
 async def test_state_history_survives_a_new_service_instance(indicator_context) -> None:
     async with indicator_context() as session:
+        await IndicatorService(session).calculate("600519")
         first = await StateService(session).calculate("600519")
         definition_count = (
             await session.execute(select(func.count()).select_from(StateDefinition))
@@ -117,8 +119,11 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
         jwt_secret_key="test-secret-that-is-at-least-32-bytes-long",
         refresh_cookie_secure=False,
     )
-    # The app's settings URL is not used after replacing its request session
-    # dependency with the fixture's already-open SQLite database.
+    # Read routes are side-effect free; materialize both adjustment series first.
+    async with indicator_context() as session:
+        for adjustment in ("qfq", "none"):
+            await IndicatorService(session).calculate("600519", adjustment=adjustment)
+            await StateService(session).calculate("600519", adjustment=adjustment)
     app = create_app(settings)
 
     async def override_get_db() -> AsyncIterator[AsyncSession]:
@@ -131,12 +136,10 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
         ) as client:
             indicators = await client.get("/api/v1/securities/600519/indicators")
-            indicator_history = await client.get(
-                "/api/v1/securities/600519/indicators/history"
-            )
+            indicator_history = await client.get("/api/v1/securities/600519/indicators/history")
             states = await client.get("/api/v1/securities/600519/states")
             state_history = await client.get("/api/v1/securities/600519/states/history")
-            rejected = {
+            none_results = {
                 path: await client.get(path, params={"adjust": "none"})
                 for path in (
                     "/api/v1/securities/600519/indicators",
@@ -155,22 +158,12 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
     assert states.status_code == 200
     assert state_history.status_code == 200
     assert state_history.json()["data"]["items"]
-    assert all(response.status_code == 400 for response in rejected.values())
+    assert all(response.status_code == 200 for response in none_results.values())
     assert (
-        rejected["/api/v1/securities/600519/indicators"].json()["error"]["code"]
-        == "UNSUPPORTED_INDICATOR_ADJUSTMENT"
-    )
-    assert (
-        rejected["/api/v1/securities/600519/states"].json()["error"]["code"]
-        == "UNSUPPORTED_INDICATOR_ADJUSTMENT"
-    )
-    assert (
-        rejected["/api/v1/securities/600519/indicators/history"].json()["error"]["code"]
-        == "UNSUPPORTED_HISTORY_ADJUSTMENT"
-    )
-    assert (
-        rejected["/api/v1/securities/600519/states/history"].json()["error"]["code"]
-        == "UNSUPPORTED_HISTORY_ADJUSTMENT"
+        none_results["/api/v1/securities/600519/indicators/history"].json()["data"]["items"][0][
+            "adjust_type"
+        ]
+        == "none"
     )
 
 
@@ -201,89 +194,42 @@ async def test_history_services_only_read_persisted_rows(indicator_context) -> N
         assert state_rows
 
 
-async def test_history_rejects_non_prd_adjustment(indicator_context) -> None:
+async def test_history_supports_qfq_and_none_without_fallback(indicator_context) -> None:
     async with indicator_context() as session:
         service = IndicatorService(session)
-        await service.calculate("600519")
-        try:
-            await service.history("600519", adjustment="none")
-        except ApiError as error:
-            assert error.code == "UNSUPPORTED_HISTORY_ADJUSTMENT"
-            assert error.status_code == 400
-        else:
-            raise AssertionError("history must reject the non-PRD adjustment series")
-
         state_service = StateService(session)
-        await state_service.calculate("600519")
-        try:
-            await state_service.history("600519", adjustment="none")
-        except ApiError as error:
-            assert error.code == "UNSUPPORTED_HISTORY_ADJUSTMENT"
-        else:
-            raise AssertionError("state history must reject the non-PRD adjustment series")
+        for adjustment in ("qfq", "none"):
+            await service.calculate("600519", adjustment=adjustment)
+            await state_service.calculate("600519", adjustment=adjustment)
+        qfq = await service.history("600519", adjustment="qfq")
+        none = await service.history("600519", adjustment="none")
+        assert qfq and none
+        assert all(row.adjust_type == "qfq" for row in qfq)
+        assert all(row.adjust_type == "none" for row in none)
+        assert await state_service.history("600519", adjustment="none")
 
 
-async def test_indicator_and_state_persistence_reject_none_without_writing(
-    indicator_context,
-) -> None:
+async def test_indicator_and_state_persistence_keep_adjustments_separate(indicator_context) -> None:
     async with indicator_context() as session:
         indicator_service = IndicatorService(session)
         state_service = StateService(session)
-
-        before_snapshots = (
-            await session.execute(select(func.count()).select_from(IndicatorSnapshot))
+        await indicator_service.calculate("600519", adjustment="qfq")
+        await state_service.calculate("600519", adjustment="qfq")
+        qfq_snapshot_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(IndicatorSnapshot)
+                .where(IndicatorSnapshot.adjust_type == "qfq")
+            )
         ).scalar_one()
-        before_states = (
-            await session.execute(select(func.count()).select_from(IndicatorState))
+        await indicator_service.calculate("600519", adjustment="none")
+        await state_service.calculate("600519", adjustment="none")
+        none_snapshot_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(IndicatorSnapshot)
+                .where(IndicatorSnapshot.adjust_type == "none")
+            )
         ).scalar_one()
-
-        for operation in (
-            lambda: indicator_service.calculate("600519", adjustment="none"),
-            lambda: indicator_service.latest("600519", adjustment="none"),
-            lambda: state_service.calculate("600519", adjustment="none"),
-            lambda: state_service.current("600519", adjustment="none"),
-        ):
-            try:
-                await operation()
-            except ApiError as error:
-                assert error.code == "UNSUPPORTED_INDICATOR_ADJUSTMENT"
-                assert error.status_code == 400
-            else:
-                raise AssertionError("indicator/state persistence must reject none")
-
-        after_snapshots = (
-            await session.execute(select(func.count()).select_from(IndicatorSnapshot))
-        ).scalar_one()
-        after_states = (
-            await session.execute(select(func.count()).select_from(IndicatorState))
-        ).scalar_one()
-        assert after_snapshots == before_snapshots == 0
-        assert after_states == before_states == 0
-
-
-def test_indicator_projection_has_stable_delta_for_missing_and_present_values() -> None:
-    missing = IndicatorSnapshot(
-        security_id=1,
-        trade_date=date(2026, 9, 24),
-        indicator_type="RSI",
-        parameters={"period": 14},
-        values={"value": 70},
-        previous_values=None,
-        delta=None,
-    )
-    present = IndicatorSnapshot(
-        security_id=1,
-        trade_date=date(2026, 9, 24),
-        indicator_type="RSI",
-        parameters={"period": 14},
-        values={"value": 71},
-        previous_values={"value": 70},
-        delta={"value": 1},
-    )
-
-    data = serialize_current_indicators([missing, present])
-
-    assert data["RSI"]["delta"] == 1.0
-
-    missing_only = serialize_current_indicators([missing])
-    assert missing_only["RSI"]["delta"] is None
+        assert qfq_snapshot_count > 0
+        assert none_snapshot_count > 0

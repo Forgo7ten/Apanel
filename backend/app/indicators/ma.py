@@ -58,6 +58,20 @@ def projected_ma(series: Iterable[Any], period: int = 5) -> ProjectedMAResult:
 class SMAIndicator:
     name = "ma"
 
+    def calculate_series(self, series: Iterable[Any], *, period: int | None = None):
+        selected = positive_int("period", self.period if period is None else period)
+        candles = normalize_series(series)
+        closes = close_values(candles)
+        output = [None] * len(closes)
+        running = 0.0
+        for index, value in enumerate(closes):
+            running += value
+            if index >= selected:
+                running -= closes[index - selected]
+            if index >= selected - 1:
+                output[index] = SMAResult(value=float(running / selected), period=selected)
+        return tuple(output)
+
     def __init__(self, period: int = 5) -> None:
         self.period = positive_int("period", period)
 
@@ -70,6 +84,23 @@ MAIndicator = SMAIndicator
 
 class ProjectedMAIndicator:
     name = "projected_ma"
+
+    def calculate_series(self, series: Iterable[Any], *, period: int | None = None):
+        selected = positive_int("period", self.period if period is None else period)
+        candles = normalize_series(series)
+        closes = close_values(candles)
+        output = [None] * len(closes)
+        for index in range(selected - 1, len(closes)):
+            projected_close = closes[index]
+            if selected == 1:
+                value = projected_close
+            else:
+                value = math.fsum(closes[index - selected + 2 : index + 1]) + projected_close
+                value /= selected
+            output[index] = ProjectedMAResult(
+                value=float(value), period=selected, projected_close=float(projected_close)
+            )
+        return tuple(output)
 
     def __init__(self, period: int = 5) -> None:
         self.period = positive_int("period", period)

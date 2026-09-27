@@ -81,6 +81,55 @@ def macd(
 class MACDIndicator:
     name = "macd"
 
+    def calculate_series(
+        self,
+        series: Iterable[Any],
+        *,
+        fast_period: int | None = None,
+        slow_period: int | None = None,
+        signal_period: int | None = None,
+    ):
+        fast = positive_int("fast_period", self.fast_period if fast_period is None else fast_period)
+        slow = positive_int("slow_period", self.slow_period if slow_period is None else slow_period)
+        signal = positive_int(
+            "signal_period", self.signal_period if signal_period is None else signal_period
+        )
+        if fast >= slow:
+            from .errors import InvalidParameterError
+
+            raise InvalidParameterError("fast_period must be less than slow_period")
+        candles = normalize_series(series)
+        closes = close_values(candles)
+        output = [None] * len(closes)
+        if len(closes) < slow:
+            return tuple(output)
+        fast_values = _ema(closes, fast)
+        slow_values = _ema(closes, slow)
+        diffs = []
+        indexes = []
+        for index in range(slow - 1, len(closes)):
+            fv, sv = fast_values[index], slow_values[index]
+            assert fv is not None and sv is not None
+            diffs.append(float(fv - sv))
+            indexes.append(index)
+        if len(diffs) < signal:
+            return tuple(output)
+        signal_values = _ema(tuple(diffs), signal)
+        for pos, index in enumerate(indexes):
+            dea = signal_values[pos]
+            if dea is None:
+                continue
+            diff = diffs[pos]
+            output[index] = MACDResult(
+                diff=float(diff),
+                dea=float(dea),
+                histogram=float(diff - dea),
+                fast_period=fast,
+                slow_period=slow,
+                signal_period=signal,
+            )
+        return tuple(output)
+
     def __init__(
         self, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9
     ) -> None:

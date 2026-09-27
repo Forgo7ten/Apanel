@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date
+from itertools import combinations
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
-from app.indicators.parameters import IndicatorVariant, select_snapshot_variant
+from app.indicators.parameters import IndicatorVariant, select_snapshot_variant, snapshot_variants
 from app.models import (
     IndicatorSnapshot as IndicatorSnapshotModel,
 )
@@ -21,7 +24,6 @@ from app.repositories.indicator_state import IndicatorStateRepository
 from app.services.indicator_service import (
     DEFAULT_HISTORY_ADJUSTMENT,
     DEFAULT_INDICATOR_ADJUSTMENT,
-    IndicatorService,
     _validate_history_adjustment,
     _validate_indicator_adjustment,
     _validate_range,
@@ -31,7 +33,7 @@ from app.states import DEFAULT_REGISTRY, IndicatorSnapshot, StateEngine, StateRe
 
 
 class StateService:
-    """Recognize and persist state rows using database-backed prior status."""
+    """Recognize persisted snapshots without recalculating indicators on reads."""
 
     def __init__(
         self,
@@ -41,7 +43,6 @@ class StateService:
     ) -> None:
         self.session = session
         self.repository = IndicatorStateRepository(session)
-        self.indicator_service = IndicatorService(session)
         self.registry = registry or DEFAULT_REGISTRY
 
     async def calculate(
@@ -49,30 +50,36 @@ class StateService:
         symbol: str,
         *,
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
+        start: date | None = None,
+        latest_only: bool = False,
     ) -> list[IndicatorState]:
-        _validate_indicator_adjustment(adjustment)
-        await self.indicator_service.calculate(symbol, adjustment=adjustment)
+        adjustment = _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
-        snapshots = await self.repository.list_snapshots(security.id)
+        snapshots = await self.repository.list_snapshots(
+            security.id,
+            adjustment=adjustment,
+            start=start,
+        )
         if not snapshots:
             raise ApiError("STATE_DATA_NOT_FOUND", "No indicator data is available.", 404)
 
         await self._persist_definitions()
-        existing_states = await self.repository.list_states(security.id)
+        existing_states = await self.repository.list_states(security.id, adjustment=adjustment)
         existing_by_key = {
-            (item.trade_date, item.state_code): item for item in existing_states
+            (item.trade_date, item.state_code, item.parameter_key): item for item in existing_states
         }
-        computed_by_key: dict[tuple[date, str], bool] = {}
+        computed_by_key: dict[tuple[date, str, str], bool] = {}
         bars = await self.repository.get_daily_bars(security.id, adjustment=adjustment)
-        close_by_date = {
-            item.trade_date: float(item.close)
-            for item in _select_one_adjustment_per_day(bars, preferred=adjustment)
-        }
+        close_by_date = {item.trade_date: float(item.close) for item in bars}
 
         by_date: dict[date, dict[str, IndicatorSnapshotModel]] = defaultdict(dict)
         for snapshot in snapshots:
             by_date[snapshot.trade_date][snapshot.indicator_type] = snapshot
         dates = sorted(by_date)
+        if latest_only and dates:
+            dates_to_persist = {dates[-1]}
+        else:
+            dates_to_persist = set(dates)
         engine = StateEngine(registry=self.registry)
         persisted: list[IndicatorState] = []
 
@@ -85,65 +92,79 @@ class StateService:
                 if current_model is None:
                     continue
                 previous_model = previous_by_indicator.get(definition.indicator_type)
-                current_variant = select_snapshot_variant(
-                    current_model,
+                for state_parameters, current_variant, previous_variant in _state_variant_pairs(
                     definition.indicator_type,
-                )
-                previous_variant = (
-                    select_snapshot_variant(previous_model, definition.indicator_type)
-                    if previous_model
-                    else None
-                )
-                if current_variant is None:
-                    continue
-                current = _to_domain_snapshot(current_model, current_variant)
-                previous = (
-                    _to_domain_snapshot(previous_model, previous_variant)
-                    if previous_model and previous_variant
-                    else None
-                )
-                prior_row = (
-                    existing_by_key.get((previous_date, definition.code))
-                    if previous_date is not None
-                    else None
-                )
-                prior_active = (
-                    prior_row.status == StateStatus.ACTIVE.value
-                    if prior_row is not None
-                    else computed_by_key.get((previous_date, definition.code), False)
-                )
-                current_close = close_by_date.get(trade_date)
-                previous_close = close_by_date.get(previous_date) if previous_date else None
-                result = engine.evaluate_state(
-                    definition.code,
-                    current,
-                    previous,
-                    current_price=current_close,
-                    previous_price=previous_close,
-                    stream_id=f"security:{security.id}",
-                    previous_active=prior_active,
-                )
-                state = await self.repository.upsert_state(
-                    security_id=security.id,
-                    trade_date=trade_date,
-                    state_code=result.code,
-                    indicator_type=result.indicator_type,
-                    status=result.status.value,
-                    metadata={
-                        "name": result.name,
-                        "level": result.level,
-                        "active": result.active,
-                        "transition": result.transition,
-                        "reason": result.reason,
-                        "values": dict(result.values),
-                        "definition": _json_value(result.metadata),
-                    },
-                )
-                persisted.append(state)
-                computed_by_key[(trade_date, definition.code)] = result.active
-
+                    current_model,
+                    previous_model,
+                ):
+                    if current_variant is None or previous_variant is None:
+                        continue
+                    state_key = state_parameter_key(definition.code, state_parameters)
+                    current = _to_domain_snapshot(current_model, current_variant)
+                    previous = _to_domain_snapshot(previous_model, previous_variant)
+                    if current is None or previous is None:
+                        continue
+                    prior_row = (
+                        existing_by_key.get((previous_date, definition.code, state_key))
+                        if previous_date is not None
+                        else None
+                    )
+                    prior_active = (
+                        prior_row.status == StateStatus.ACTIVE.value
+                        if prior_row is not None
+                        else computed_by_key.get((previous_date, definition.code, state_key), False)
+                    )
+                    result = engine.evaluate_state(
+                        definition.code,
+                        current,
+                        previous,
+                        current_price=close_by_date.get(trade_date),
+                        previous_price=close_by_date.get(previous_date) if previous_date else None,
+                        stream_id=f"security:{security.id}:{adjustment}:{state_key}",
+                        previous_active=prior_active,
+                    )
+                    computed_by_key[(trade_date, definition.code, state_key)] = result.active
+                    if trade_date not in dates_to_persist:
+                        continue
+                    state = await self.repository.upsert_state(
+                        security_id=security.id,
+                        trade_date=trade_date,
+                        state_code=result.code,
+                        indicator_type=result.indicator_type,
+                        status=result.status.value,
+                        parameters=state_parameters,
+                        parameter_key=state_key,
+                        adjust_type=adjustment,
+                        metadata={
+                            "name": result.name,
+                            "level": result.level,
+                            "active": result.active,
+                            "transition": result.transition,
+                            "reason": result.reason,
+                            "values": dict(result.values),
+                            "definition": _json_value(result.metadata),
+                        },
+                    )
+                    persisted.append(state)
         await self.session.commit()
         return persisted
+
+    async def rebuild_history(
+        self,
+        symbol: str,
+        *,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
+        start: date | None = None,
+    ) -> list[IndicatorState]:
+        return await self.calculate(symbol, adjustment=adjustment, start=start, latest_only=False)
+
+    async def materialize_latest(
+        self,
+        symbol: str,
+        *,
+        adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
+    ) -> list[IndicatorState]:
+        return await self.calculate(symbol, adjustment=adjustment, latest_only=True)
 
     async def current(
         self,
@@ -151,26 +172,9 @@ class StateService:
         *,
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
     ) -> list[IndicatorState]:
-        _validate_indicator_adjustment(adjustment)
+        adjustment = _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
-        persisted_date = await self.repository.latest_state_date(security.id)
-        persisted = (
-            await self.repository.list_states(
-                security.id,
-                start=persisted_date,
-                end=persisted_date,
-                active_only=True,
-            )
-            if persisted_date is not None
-            else []
-        )
-        try:
-            await self.calculate(symbol, adjustment=adjustment)
-        except ApiError as error:
-            if error.code != "INDICATOR_DATA_NOT_FOUND" or persisted_date is None:
-                raise
-            return persisted
-        latest_date = await self.repository.latest_state_date(security.id)
+        latest_date = await self.repository.latest_state_date(security.id, adjustment=adjustment)
         if latest_date is None:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
         return await self.repository.list_states(
@@ -178,6 +182,7 @@ class StateService:
             start=latest_date,
             end=latest_date,
             active_only=True,
+            adjustment=adjustment,
         )
 
     async def history(
@@ -187,19 +192,22 @@ class StateService:
         start: date | None = None,
         end: date | None = None,
         adjustment: str | None = DEFAULT_HISTORY_ADJUSTMENT,
+        state_code: str | None = None,
+        parameter_key: str | None = None,
     ) -> list[IndicatorState]:
         _validate_range(start, end)
-        _validate_history_adjustment(adjustment)
+        adjustment = _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
         persisted = await self.repository.list_states(
             security.id,
             start=start,
             end=end,
+            adjustment=adjustment,
+            state_code=state_code,
+            parameter_key=parameter_key,
         )
         if not persisted:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
-        # A history GET is read-only.  State recognition belongs to the EOD
-        # pipeline (or an explicit calculate call), never to this endpoint.
         return persisted
 
     async def _get_security(self, symbol: str):
@@ -220,6 +228,90 @@ class StateService:
                 metadata=metadata,
                 enabled=True,
             )
+
+
+def state_parameter_key(state_code: str, parameters: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        {"state_code": state_code, "parameters": _json_value(parameters)},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"v1_{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _state_variant_pairs(
+    indicator_type: str,
+    current_model: IndicatorSnapshotModel,
+    previous_model: IndicatorSnapshotModel | None,
+):
+    current_variants = snapshot_variants(current_model)
+    previous_variants = snapshot_variants(previous_model) if previous_model is not None else ()
+    if indicator_type == "MA":
+        for current_variant in current_variants:
+            periods = current_variant.parameters.get("periods")
+            if not isinstance(periods, list):
+                one = current_variant.parameters.get("period")
+                periods = [one] if one is not None else []
+            normalized_periods = sorted({int(period) for period in periods})
+            for short, long in combinations(normalized_periods, 2):
+                params = {"short_period": short, "long_period": long}
+                current = _project_ma_pair(current_variant, short, long)
+                previous = _find_ma_pair(previous_variants, short, long)
+                yield params, current, previous
+        return
+    for current_variant in current_variants:
+        previous_variant = next(
+            (item for item in previous_variants if item.key == current_variant.key),
+            None,
+        )
+        yield dict(current_variant.parameters), current_variant, previous_variant
+
+
+def _project_ma_pair(variant: IndicatorVariant, short: int, long: int) -> IndicatorVariant:
+    keys = {f"MA{short}", f"MA{long}"}
+    values = {
+        key: value
+        for key, value in variant.values.items()
+        if key.upper() in {item.upper() for item in keys}
+    }
+    previous = (
+        {
+            key: value
+            for key, value in variant.previous_values.items()
+            if key.upper() in {item.upper() for item in keys}
+        }
+        if variant.previous_values is not None
+        else None
+    )
+    delta = (
+        {
+            key: value
+            for key, value in variant.delta.items()
+            if key.upper() in {item.upper() for item in keys}
+        }
+        if variant.delta is not None
+        else None
+    )
+    return IndicatorVariant(
+        "MA",
+        f"pair:{short}:{long}",
+        {"short_period": short, "long_period": long},
+        values,
+        previous,
+        delta,
+        variant.source_format,
+    )
+
+
+def _find_ma_pair(
+    variants: Iterable[IndicatorVariant], short: int, long: int
+) -> IndicatorVariant | None:
+    for variant in variants:
+        projected = _project_ma_pair(variant, short, long)
+        if len(projected.values) == 2:
+            return projected
+    return None
 
 
 def _to_domain_snapshot(

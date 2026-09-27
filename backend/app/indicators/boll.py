@@ -66,6 +66,41 @@ calculate_boll = calculate_bollinger
 class BollingerIndicator:
     name = "boll"
 
+    def calculate_series(
+        self, series: Iterable[Any], *, period: int | None = None, multiplier: float | None = None
+    ):
+        selected = positive_int("period", self.period if period is None else period)
+        selected_multiplier = positive_number(
+            "multiplier", self.multiplier if multiplier is None else multiplier
+        )
+        candles = normalize_series(series)
+        closes = close_values(candles)
+        output = [None] * len(closes)
+        running = 0.0
+        squares = 0.0
+        for index, close in enumerate(closes):
+            running += close
+            squares += close * close
+            if index >= selected:
+                old = closes[index - selected]
+                running -= old
+                squares -= old * old
+            if index >= selected - 1:
+                middle = running / selected
+                variance = max((squares / selected) - (middle * middle), 0.0)
+                std = math.sqrt(variance)
+                upper = middle + selected_multiplier * std
+                lower = middle - selected_multiplier * std
+                output[index] = BollingerResult(
+                    upper=float(upper),
+                    middle=float(middle),
+                    lower=float(lower),
+                    width=normalized_band_width(upper, lower, middle),
+                    period=selected,
+                    multiplier=selected_multiplier,
+                )
+        return tuple(output)
+
     def __init__(self, period: int = 20, multiplier: float = 2.0) -> None:
         self.period = positive_int("period", period)
         self.multiplier = positive_number("multiplier", multiplier)

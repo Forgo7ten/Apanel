@@ -72,6 +72,28 @@ class IndicatorRegistry:
         result.__post_init__()
         return result
 
+    def calculate_series(self, name: str, series: Any, **parameters: Any):
+        indicator = self.get(name)
+        method = getattr(indicator, "calculate_series", None)
+        if not callable(method):
+            values = tuple(series)
+            output = []
+            for index in range(len(values)):
+                try:
+                    output.append(self.calculate(name, values[: index + 1], **parameters))
+                except Exception:
+                    output.append(None)
+            return tuple(output)
+        results = tuple(method(series, **parameters))
+        for result in results:
+            if result is not None:
+                if not isinstance(result, IndicatorResult):
+                    raise ResultValidationError(
+                        f"indicator {name!r} returned an invalid series item"
+                    )
+                result.__post_init__()
+        return results
+
     def names(self) -> tuple[str, ...]:
         return tuple(self._canonical_names)
 
