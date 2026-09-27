@@ -81,11 +81,11 @@ async def test_feishu_provider_reads_user_webhook_and_supports_string_message() 
     provider = FeishuWebhookProvider(client=client)
 
     await provider.send(
-        {"settings": {"feishu_webhook_url": "https://example.test/hook?token=secret"}},
+        {"settings": {"feishu_webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/secret"}},
         "hello",
     )
 
-    assert client.calls[0][0].startswith("https://example.test/")
+    assert client.calls[0][0].startswith("https://open.feishu.cn/")
     assert client.calls[0][1]["content"] == {"text": "hello"}
 
 
@@ -96,7 +96,7 @@ async def test_feishu_provider_reads_user_webhook_and_supports_string_message() 
         {},
         {"msg": "success"},
         [],
-        "{\"code\":0}",
+        '{"code":0}',
         None,
         {"code": 1},
         {"StatusCode": 1},
@@ -106,7 +106,9 @@ async def test_feishu_provider_reads_user_webhook_and_supports_string_message() 
 )
 async def test_feishu_provider_requires_explicit_numeric_zero_business_code(body: object) -> None:
     client = FakeClient(FakeResponse(200, body))
-    provider = FeishuWebhookProvider("https://example.test/hook", client=client)
+    provider = FeishuWebhookProvider(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test-token", client=client
+    )
 
     with pytest.raises(FeishuWebhookError):
         await provider.send(None, message())
@@ -115,7 +117,9 @@ async def test_feishu_provider_requires_explicit_numeric_zero_business_code(body
 @pytest.mark.asyncio
 async def test_feishu_provider_rejects_invalid_json_body() -> None:
     client = FakeClient(InvalidJsonResponse(200, object()))
-    provider = FeishuWebhookProvider("https://example.test/hook", client=client)
+    provider = FeishuWebhookProvider(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test-token", client=client
+    )
 
     with pytest.raises(FeishuWebhookError, match="invalid response"):
         await provider.send(None, message())
@@ -128,7 +132,9 @@ async def test_feishu_provider_rejects_non_2xx_without_leaking_webhook(
 ) -> None:
     token = "super-secret-token"
     client = FakeClient(FakeResponse(status_code, {"error": token}))
-    provider = FeishuWebhookProvider(f"https://example.test/hook?token={token}", client=client)
+    provider = FeishuWebhookProvider(
+        f"https://open.feishu.cn/open-apis/bot/v2/hook/{token}", client=client
+    )
 
     with pytest.raises(FeishuWebhookError) as raised:
         await provider.send(None, message())
@@ -141,7 +147,9 @@ async def test_feishu_provider_rejects_non_2xx_without_leaking_webhook(
 async def test_feishu_provider_rejects_feishu_business_error_without_leaking_body() -> None:
     token = "business-secret"
     client = FakeClient(FakeResponse(200, {"code": 19001, "msg": token}))
-    provider = FeishuWebhookProvider(f"https://example.test/hook?token={token}", client=client)
+    provider = FeishuWebhookProvider(
+        f"https://open.feishu.cn/open-apis/bot/v2/hook/{token}", client=client
+    )
 
     with pytest.raises(FeishuWebhookError) as raised:
         await provider.send(None, message())
@@ -153,13 +161,17 @@ async def test_feishu_provider_rejects_feishu_business_error_without_leaking_bod
 @pytest.mark.asyncio
 async def test_feishu_provider_wraps_timeout_and_transport_errors() -> None:
     timeout_client = FakeClient(error=httpx.ReadTimeout("timed out"))
-    provider = FeishuWebhookProvider("https://example.test/hook", client=timeout_client)
+    provider = FeishuWebhookProvider(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test-token", client=timeout_client
+    )
 
     with pytest.raises(FeishuWebhookError, match="timed out"):
         await provider.send(None, message())
 
     transport_client = FakeClient(error=httpx.ConnectError("https://secret.invalid/hook"))
-    provider = FeishuWebhookProvider("https://example.test/hook", client=transport_client)
+    provider = FeishuWebhookProvider(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test-token", client=transport_client
+    )
 
     with pytest.raises(FeishuWebhookError, match="request failed") as raised:
         await provider.send(None, message())

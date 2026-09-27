@@ -51,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app_settings = settings or get_settings()
     app_settings.validate_runtime_credentials()
+    app_settings.validate_notification_credentials()
     configure_logging(app_settings.log_level)
 
     @asynccontextmanager
