@@ -120,6 +120,14 @@ class DividendRepositoryMemory:
         for record in records:
             self.records[(record.symbol, record.date)] = record
 
+    async def replace_for_symbol(self, symbol, records) -> None:
+        self.calls += 1
+        self.records = {
+            key: value for key, value in self.records.items() if key[0] != symbol
+        }
+        for record in records:
+            self.records[(record.symbol, record.date)] = record
+
 
 class QuoteDividendProvider(FakeProvider):
     def __init__(self) -> None:
@@ -329,6 +337,39 @@ async def test_daily_sync_defaults_to_qfq() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daily_bootstrap_excludes_bars_after_completed_cutoff() -> None:
+    class BatchProvider(FakeProvider):
+        async def get_daily_bars_batch(self, symbols, *, adjustment, count):
+            assert tuple(symbols) == ("600519",)
+            assert adjustment is Adjustment.NONE
+            assert count == 10
+            return {
+                "600519": (
+                    bar("600519", 22),
+                    bar("600519", 23),
+                    bar("600519", 24),
+                )
+            }
+
+    repository = MemoryRepository()
+    service = DailyBarSyncService(provider=BatchProvider(), repository=repository)
+
+    result = await service.sync(
+        symbols=["600519"],
+        lookback_bars=2,
+        end=date(2026, 9, 23),
+        adjustment=Adjustment.NONE,
+    )
+
+    assert result.ok
+    assert result.items[0].fetched == 2
+    assert {record.trade_date for record in repository.records.values()} == {
+        date(2026, 9, 22),
+        date(2026, 9, 23),
+    }
+
+
+@pytest.mark.asyncio
 async def test_quote_sync_persists_idempotently_and_deduplicates_symbols() -> None:
     provider = QuoteDividendProvider()
     repository = QuoteRepositoryMemory()
@@ -360,3 +401,34 @@ async def test_dividend_sync_upserts_duplicate_events_and_reports_provider_failu
     assert outcomes["000001"].error is not None
     assert outcomes["000001"].error.code == "PROVIDER_TIMEOUT"
     assert repository.records[("600519", date(2026, 6, 30))].cash_amount == Decimal("2.10")
+
+
+@pytest.mark.asyncio
+async def test_dividend_sync_removes_events_no_longer_returned_by_provider() -> None:
+    provider = QuoteDividendProvider()
+    repository = DividendRepositoryMemory()
+    repository.records[("600519", date(2025, 6, 30))] = Dividend(
+        symbol="600519", date=date(2025, 6, 30), cash_amount="1.00"
+    )
+    service = DividendSyncService(provider=provider, repository=repository)
+
+    result = await service.sync(symbols=["600519"])
+
+    assert result.ok
+    assert ("600519", date(2025, 6, 30)) not in repository.records
+    assert repository.records[("600519", date(2026, 6, 30))].cash_amount == Decimal("2.10")
+
+
+@pytest.mark.asyncio
+async def test_dividend_sync_clears_snapshot_when_provider_returns_no_events() -> None:
+    provider = QuoteDividendProvider()
+    repository = DividendRepositoryMemory()
+    repository.records[("000001", date(2025, 6, 30))] = Dividend(
+        symbol="000001", date=date(2025, 6, 30), cash_amount="1.00"
+    )
+    service = DividendSyncService(provider=provider, repository=repository)
+
+    result = await service.sync(symbols=["000001"])
+
+    assert result.ok
+    assert not any(symbol == "000001" for symbol, _date in repository.records)

@@ -19,7 +19,7 @@ from app.db.session import get_db
 from app.main import create_app
 from app.models import DailyBar, QuoteSnapshot, Security, User, UserStatus
 from app.repositories.security import DIVIDEND_EVENTS_TABLE, DividendEventRecord, SecurityRepository
-from app.services.dividend_service import calculate_ttm_dividend_yield
+from app.services.dividend_service import DividendYieldService, calculate_ttm_dividend_yield
 
 
 @pytest_asyncio.fixture
@@ -187,6 +187,36 @@ async def test_repository_returns_dividend_events_with_date_filter(dividend_cont
         )
 
     assert [event.cash_amount for event in events] == [Decimal("1.10"), Decimal("0.90")]
+
+
+@pytest.mark.asyncio
+async def test_dividend_yield_uses_newer_daily_close_over_stale_quote(dividend_context) -> None:
+    _, session_factory, _ = dividend_context
+    async with session_factory() as session:
+        security = await session.get(Security, 1)
+        assert security is not None
+        session.add(
+            DailyBar(
+                security_id=security.id,
+                trade_date=date(2026, 9, 24),
+                open=Decimal("60"),
+                high=Decimal("61"),
+                low=Decimal("59"),
+                close=Decimal("60.00"),
+                volume=Decimal("100"),
+                amount=Decimal("6000"),
+                adjust_type="none",
+            )
+        )
+        await session.commit()
+
+        result = await DividendYieldService(SecurityRepository(session)).calculate_for_security(
+            security.id
+        )
+
+    assert result.price == Decimal("60.00")
+    assert result.price_source == "DAILY_BAR_CLOSE"
+    assert result.as_of == datetime(2026, 9, 24, 0, 0, tzinfo=UTC)
 
 
 async def test_dividend_yield_api_prefers_quote_and_returns_explanation(dividend_context) -> None:

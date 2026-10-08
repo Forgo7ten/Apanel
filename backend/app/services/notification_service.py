@@ -485,15 +485,28 @@ async def dispatch_pending_notifications(
     *,
     provider: NotificationProvider | None = None,
     limit: int = 100,
+    now: datetime | None = None,
+    recovery_window: timedelta = NOTIFICATION_PENDING_RECOVERY_WINDOW,
 ) -> dict[str, int]:
-    """Recover committed PENDING outbox rows in bounded batches."""
+    """Recover abandoned PENDING outbox rows in bounded batches.
+
+    Recent PENDING rows may still belong to an active worker whose provider
+    request has completed but whose terminal database commit has not. The
+    recovery scanner therefore honors the same age window as manual retry.
+    """
+
+    window = validate_pending_recovery_window(recovery_window)
+    cutoff = _utc_datetime(now or datetime.now(UTC)) - window
 
     ids = tuple(
         int(item)
         for item in (
             await session.execute(
                 select(Notification.id)
-                .where(Notification.status == NotificationStatus.PENDING)
+                .where(
+                    Notification.status == NotificationStatus.PENDING,
+                    Notification.created_at <= cutoff,
+                )
                 .order_by(Notification.created_at.asc(), Notification.id.asc())
                 .limit(limit)
             )

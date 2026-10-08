@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -83,6 +83,10 @@ class DividendRepository(Protocol):
     """Repository seam consumed by dividend synchronization and reads."""
 
     async def upsert_many(self, records: Sequence[Dividend]) -> None: ...
+
+    async def replace_for_symbol(
+        self, symbol: str, records: Sequence[Dividend]
+    ) -> None: ...
 
     async def list_by_symbol(
         self,
@@ -428,6 +432,37 @@ class SqlAlchemyDividendEventRepository:
                         ]
                     )
                 )
+
+    async def replace_for_symbol(
+        self, symbol: str, records: Sequence[Dividend]
+    ) -> None:
+        """Reconcile one provider snapshot, including removed historical events."""
+
+        canonical = normalize_symbol(symbol)
+        records = _unique_records(tuple(records), key=lambda record: (record.symbol, record.date))
+        if any(not isinstance(record, Dividend) for record in records):
+            raise PersistenceRecordError("dividend repository received an invalid record")
+        if any(record.symbol != canonical for record in records):
+            raise PersistenceRecordError("dividend repository received a mismatched symbol")
+        async with self._session_factory() as session:
+            async with session.begin():
+                security_id = (await _security_ids(session, (canonical,)))[canonical]
+                if records:
+                    await session.execute(
+                        self.build_upsert_statement(
+                            [
+                                {"security_id": security_id, "record": record}
+                                for record in records
+                            ]
+                        )
+                    )
+                statement = delete(DividendEventModel).where(
+                    DividendEventModel.security_id == security_id
+                )
+                dates = tuple(record.date for record in records)
+                if dates:
+                    statement = statement.where(DividendEventModel.date.not_in(dates))
+                await session.execute(statement)
 
     async def list_by_symbol(
         self,

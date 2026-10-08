@@ -7,7 +7,7 @@ import inspect
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, NoReturn
 from zoneinfo import ZoneInfo
 
@@ -22,7 +22,10 @@ from app.db.session import create_engine, dispose_engine
 from app.models import Security
 from app.services.data_bootstrap_service import SecurityDataBootstrapService
 from app.services.notification_service import dispatch_pending_notifications
-from app.services.trading_calendar_service import TradingCalendarService
+from app.services.trading_calendar_service import (
+    TradingCalendarService,
+    TradingCalendarUnavailable,
+)
 
 from .celery_app import celery_app
 from .contracts import (
@@ -59,6 +62,20 @@ class ScheduledTaskRetry(RuntimeError):
 
 def _today(settings: Settings) -> date:
     return datetime.now(ZoneInfo(settings.timezone)).date()
+
+
+def _bootstrap_completed_through(settings: Settings) -> date:
+    """Return the newest date safe for ad-hoc historical bootstrap.
+
+    API-triggered bootstrap can run while the market is open.  Reuse the EOD
+    stable-data cutoff so the current forming daily bar is never materialized
+    into technical indicators before the normal end-of-day pipeline.
+    """
+
+    now = datetime.now(ZoneInfo(settings.timezone))
+    current_minutes = now.hour * 60 + now.minute
+    eod_minutes = settings.eod_pipeline_hour * 60 + settings.eod_pipeline_minute
+    return now.date() if current_minutes >= eod_minutes else now.date() - timedelta(days=1)
 
 
 def _new_session_factory(settings: Settings) -> tuple[Any, async_sessionmaker[AsyncSession]]:
@@ -100,6 +117,44 @@ async def _close_optional(value: Any) -> None:
         await result
 
 
+async def _validate_missing_calendar_date(
+    trade_date: date,
+    *,
+    settings: Settings,
+    market_data_client: MarketDataHubClientProtocol | None,
+) -> str:
+    """Validate a reached date through the Hub when annual seed data is absent.
+
+    Annual exchange calendars are still the preferred source for future dates.
+    Once a date has actually been reached, however, the Hub can validate it
+    against the provider workday capability and persist the result.  This keeps
+    scheduled work fail-closed while avoiding a hard outage at a year boundary
+    when the next annual seed has not been deployed yet.
+    """
+
+    client = market_data_client
+    owns_client = client is None
+    if client is None:
+        client = MarketDataHubClient(
+            settings.market_data_hub_url,
+            internal_api_token=settings.internal_api_token,
+            timeout_seconds=settings.market_data_request_timeout_seconds,
+            quote_timeout_seconds=settings.market_data_quote_timeout_seconds,
+            daily_timeout_seconds=settings.market_data_daily_timeout_seconds,
+            bootstrap_timeout_seconds=settings.market_data_bootstrap_timeout_seconds,
+        )
+    try:
+        validation = await client.validate_calendar(trade_date=trade_date)
+    finally:
+        if owns_client:
+            with suppress(Exception):
+                await _close_optional(client)
+    status = str(validation.get("status", "UNKNOWN")).upper()
+    if status not in {"OPEN", "CLOSED"}:
+        raise PipelineConfigurationError("trading calendar actual validation is unknown")
+    return status
+
+
 async def execute_quote_refresh(
     *,
     symbols: tuple[str, ...] | list[str] | None = None,
@@ -123,9 +178,24 @@ async def execute_quote_refresh(
             if calendar_factory is None:
                 calendar_engine, calendar_factory = _new_session_factory(app_settings)
             async with calendar_factory() as calendar_session:
-                if not in_session or not await TradingCalendarService(calendar_session).is_open(
-                    now.date()
-                ):
+                if not in_session:
+                    return {
+                        "status": "skipped",
+                        "reason": "market_closed",
+                        "operation": "quote_refresh",
+                    }
+                try:
+                    is_open = await TradingCalendarService(calendar_session).is_open(now.date())
+                except TradingCalendarUnavailable:
+                    is_open = (
+                        await _validate_missing_calendar_date(
+                            now.date(),
+                            settings=app_settings,
+                            market_data_client=market_data_client,
+                        )
+                        == "OPEN"
+                    )
+                if not is_open:
                     return {
                         "status": "skipped",
                         "reason": "market_closed",
@@ -239,7 +309,18 @@ async def execute_eod_pipeline(
             if calendar_factory is None:
                 calendar_engine, calendar_factory = _new_session_factory(app_settings)
             async with calendar_factory() as calendar_session:
-                if not await TradingCalendarService(calendar_session).is_open(selected_date):
+                try:
+                    is_open = await TradingCalendarService(calendar_session).is_open(selected_date)
+                except TradingCalendarUnavailable:
+                    is_open = (
+                        await _validate_missing_calendar_date(
+                            selected_date,
+                            settings=app_settings,
+                            market_data_client=market_data_client,
+                        )
+                        == "OPEN"
+                    )
+                if not is_open:
                     return {
                         "status": "skipped",
                         "reason": "non_trading_day",
@@ -483,6 +564,7 @@ async def execute_security_bootstrap(
             symbol,
             adjustments=("qfq", "none") if app_settings.enable_none_analysis else ("qfq",),
             requests=requests,
+            completed_through=_bootstrap_completed_through(app_settings),
         )
         async with session_factory() as session:
             security = (

@@ -7,12 +7,16 @@ from datetime import date, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db.base import Base
+from app.core.errors import ApiError
 from app.indicators.parameters import (
+    MAX_INDICATOR_PERIOD,
+    MAX_MA_PERIODS,
     canonicalize_parameters,
     parameter_key,
     select_snapshot_variant,
@@ -55,6 +59,18 @@ def test_parameter_keys_are_canonical_and_legacy_rows_expand_to_one_variant() ->
     assert variants[0].key == parameter_key("RSI", {"period": 14})
     assert variants[0].values == {"value": 71.0}
     assert select_snapshot_variant(legacy, "RSI", {"period": 14}) == variants[0]
+
+
+def test_indicator_periods_are_bounded_by_market_data_bootstrap_contract() -> None:
+    with pytest.raises(ApiError, match=str(MAX_INDICATOR_PERIOD)):
+        canonicalize_parameters("MA", {"period": MAX_INDICATOR_PERIOD + 1})
+    with pytest.raises(ApiError, match=str(MAX_INDICATOR_PERIOD)):
+        canonicalize_parameters("RSI", {"period": MAX_INDICATOR_PERIOD + 1})
+
+
+def test_ma_period_count_is_bounded_to_avoid_quadratic_state_explosion() -> None:
+    with pytest.raises(ApiError, match=str(MAX_MA_PERIODS)):
+        canonicalize_parameters("MA", {"periods": list(range(1, MAX_MA_PERIODS + 2))})
 
 
 @pytest_asyncio.fixture

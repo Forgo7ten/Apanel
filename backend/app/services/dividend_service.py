@@ -8,10 +8,13 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.errors import ApiError
 from app.models import QuoteSnapshot
 from app.repositories.security import DividendEventRecord, SecurityRepository
+
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,12 +50,12 @@ class DividendYieldService:
         """Calculate yield using the newest quote, then a daily-close fallback."""
 
         quote = await self.repository.latest_quote(security_id)
-        if quote is not None:
+        daily_bar = await self.repository.latest_daily_bar(security_id)
+        if quote is not None and _quote_is_at_least_as_fresh(quote.timestamp, daily_bar):
             price = quote.price
             as_of = _utc_timestamp(quote.timestamp)
             price_source = "QUOTE"
         else:
-            daily_bar = await self.repository.latest_daily_bar(security_id)
             if daily_bar is None:
                 raise ApiError(
                     "PRICE_NOT_FOUND",
@@ -99,23 +102,20 @@ class DividendYieldService:
         quote_rows = (
             quotes if quotes is not None else await self.repository.latest_quotes_batch(ids)
         )
-        missing_quote_ids = tuple(
-            security_id for security_id in ids if security_id not in quote_rows
-        )
-        daily_bars = await self.repository.latest_daily_bars_batch(missing_quote_ids)
+        daily_bars = await self.repository.latest_daily_bars_batch(ids)
 
         price_data: dict[int, tuple[Decimal, datetime, str]] = {}
         results: dict[int, DividendYieldResult | ApiError] = {}
         for security_id in ids:
             quote = quote_rows.get(security_id)
-            if quote is not None:
+            daily_bar = daily_bars.get(security_id)
+            if quote is not None and _quote_is_at_least_as_fresh(quote.timestamp, daily_bar):
                 price_data[security_id] = (
                     quote.price,
                     _utc_timestamp(quote.timestamp),
                     "QUOTE",
                 )
                 continue
-            daily_bar = daily_bars.get(security_id)
             if daily_bar is None:
                 results[security_id] = ApiError(
                     "PRICE_NOT_FOUND",
@@ -231,6 +231,13 @@ def _utc_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
+
+
+def _quote_is_at_least_as_fresh(timestamp: datetime, daily_bar: Any | None) -> bool:
+    if daily_bar is None:
+        return True
+    aware = _utc_timestamp(timestamp)
+    return aware.astimezone(_SHANGHAI_TZ).date() >= daily_bar.trade_date
 
 
 def _to_decimal(value: Any, *, field: str) -> Decimal:

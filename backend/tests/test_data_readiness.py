@@ -8,16 +8,20 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
 from app.indicators.parameters import IndicatorRequest
-from app.models import DailyBar, Security
+from app.models import DailyBar, Security, TradingCalendar
 from app.services.data_readiness_service import DataReadinessService
 
 
 class FakeBootstrapService:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[str, ...], tuple[IndicatorRequest, ...]]] = []
+        self.calls: list[
+            tuple[str, tuple[str, ...], tuple[IndicatorRequest, ...], date | None]
+        ] = []
 
-    async def ensure_ready(self, symbol, *, adjustments, requests):
-        self.calls.append((symbol, tuple(adjustments), tuple(requests)))
+    async def ensure_ready(self, symbol, *, adjustments, requests, completed_through=None):
+        self.calls.append(
+            (symbol, tuple(adjustments), tuple(requests), completed_through)
+        )
         return None
 
 
@@ -69,7 +73,7 @@ async def test_readiness_bootstraps_only_missing_adjustments(tmp_path) -> None:
 
     assert result.bootstrapped_symbols == ("600519",)
     assert result.required_bars == {"600519": 34}
-    assert bootstrap.calls == [("600519", ("none",), ())]
+    assert bootstrap.calls == [("600519", ("none",), (), None)]
     await engine.dispose()
 
 
@@ -121,4 +125,73 @@ async def test_readiness_uses_custom_indicator_depth(tmp_path) -> None:
     assert result.required_bars == {"000001": 60}
     assert result.bootstrapped_symbols == ("000001",)
     assert bootstrap.calls[0][1] == ("qfq",)
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_readiness_bootstraps_when_recent_trading_day_has_a_gap(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'gap.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    start = date(2026, 8, 1)
+    open_dates = tuple(start + timedelta(days=index) for index in range(35))
+    missing_date = open_dates[20]
+    async with factory() as session:
+        security = Security(
+            symbol="600519",
+            name="贵州茅台",
+            market="SH",
+            exchange="SH",
+            security_type="STOCK",
+            status="ACTIVE",
+        )
+        session.add(security)
+        await session.flush()
+        for trade_date in open_dates:
+            session.add(
+                TradingCalendar(
+                    market="CN",
+                    trade_date=trade_date,
+                    expected_open=True,
+                    actual_open=True,
+                    status="OPEN",
+                    source="TEST",
+                    source_metadata={},
+                )
+            )
+            if trade_date == missing_date:
+                continue
+            session.add(
+                DailyBar(
+                    security_id=security.id,
+                    trade_date=trade_date,
+                    open=Decimal("100"),
+                    high=Decimal("100"),
+                    low=Decimal("100"),
+                    close=Decimal("100"),
+                    volume=100,
+                    amount=1000,
+                    adjust_type="qfq",
+                )
+            )
+        await session.commit()
+
+    bootstrap = FakeBootstrapService()
+    result = await DataReadinessService(
+        session_factory=factory,
+        bootstrap_service=bootstrap,
+        minimum_bars=1,
+    ).ensure_minimum_history(
+        ("600519",),
+        adjustments=("qfq",),
+        requests_by_symbol={"600519": ()},
+        completed_through=open_dates[-1],
+    )
+
+    assert result.required_bars == {"600519": 34}
+    assert result.bootstrapped_symbols == ("600519",)
+    assert bootstrap.calls == [
+        ("600519", ("qfq",), (), open_dates[-1])
+    ]
     await engine.dispose()

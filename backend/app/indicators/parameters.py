@@ -23,6 +23,8 @@ DEFAULT_RSI_PERIOD = 14
 DEFAULT_KDJ_PERIODS = {"period": 9, "k_period": 3, "d_period": 3}
 DEFAULT_BOLL_PARAMETERS = {"period": 20, "multiplier": 2.0}
 DEFAULT_MACD_PARAMETERS = {"fast_period": 12, "slow_period": 26, "signal_period": 9}
+MAX_INDICATOR_PERIOD = 10_000
+MAX_MA_PERIODS = 32
 
 INDICATOR_ALIASES = {
     "SMA": "MA",
@@ -169,6 +171,12 @@ def canonicalize_parameters(
             periods = sorted(
                 {_normalize_parameter_value("period", period) for period in raw_periods}
             )
+            if len(periods) > MAX_MA_PERIODS:
+                raise ApiError(
+                    "INVALID_INDICATOR_PARAMETERS",
+                    f"MA accepts at most {MAX_MA_PERIODS} distinct periods.",
+                    400,
+                )
             return {"periods": periods}
         return default_parameters(normalized_type) if fill_defaults else {}
 
@@ -460,7 +468,14 @@ def _normalize_parameter_value(key: str, value: Any) -> int | float:
                 f"Indicator parameter {key} must be a positive integer.",
                 400,
             )
-        return int(value)
+        normalized = int(value)
+        if normalized > MAX_INDICATOR_PERIOD:
+            raise ApiError(
+                "INVALID_INDICATOR_PARAMETERS",
+                f"Indicator parameter {key} must not exceed {MAX_INDICATOR_PERIOD}.",
+                400,
+            )
+        return normalized
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ApiError(
             "INVALID_INDICATOR_PARAMETERS",

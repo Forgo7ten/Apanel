@@ -16,7 +16,11 @@ from app.tasks.contracts import (
     PipelineStep,
     PipelineStepError,
 )
-from app.tasks.jobs import _retry_or_raise, execute_eod_pipeline
+from app.tasks.jobs import (
+    _retry_or_raise,
+    _validate_missing_calendar_date,
+    execute_eod_pipeline,
+)
 from app.tasks.pipeline import (
     EODPipeline,
     _sync_in_chunks,
@@ -248,6 +252,37 @@ def test_retry_uses_backoff_without_logging_exception_text() -> None:
 
     with pytest.raises(RetrySentinel):
         _retry_or_raise(FakeTask(), "eod_pipeline", RuntimeError("JWT=secret"))
+
+
+@pytest.mark.asyncio
+async def test_missing_annual_calendar_can_be_validated_after_date_is_reached() -> None:
+    class Client:
+        async def validate_calendar(self, *, trade_date):
+            assert trade_date == date(2027, 1, 4)
+            return {"status": "OPEN"}
+
+    status = await _validate_missing_calendar_date(
+        date(2027, 1, 4),
+        settings=Settings(),
+        market_data_client=Client(),
+    )
+
+    assert status == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_missing_annual_calendar_remains_fail_closed_when_actual_is_unknown() -> None:
+    class Client:
+        async def validate_calendar(self, *, trade_date):
+            assert trade_date == date(2027, 1, 4)
+            return {"status": "UNKNOWN"}
+
+    with pytest.raises(PipelineConfigurationError, match="calendar actual validation"):
+        await _validate_missing_calendar_date(
+            date(2027, 1, 4),
+            settings=Settings(),
+            market_data_client=Client(),
+        )
 
 
 def test_custom_default_steps_keep_alert_and_notification_boundaries_injected() -> None:

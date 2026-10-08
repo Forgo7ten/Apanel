@@ -161,6 +161,7 @@ def build_default_eod_steps(
             context.symbols,
             adjustments=adjustments,
             requests_by_symbol=requests_by_symbol,
+            completed_through=context.trade_date,
         )
         context.resources["history_readiness"] = readiness
         output: dict[str, Any] = {}

@@ -186,9 +186,13 @@ class DailyBarSyncService:
                 raise InvalidMarketDataError("start/end are required and must form a valid range")
             count = max(8, (end - start).days * 2 + 8)
         else:
-            if start is not None or end is not None or lookback_bars <= 0:
-                raise InvalidMarketDataError("lookback_bars is exclusive with start/end")
-            count = int(lookback_bars)
+            if start is not None or lookback_bars <= 0:
+                raise InvalidMarketDataError("lookback_bars is exclusive with start")
+            # A bootstrap may deliberately cap history at the latest completed
+            # trading day. Ask for a few extra rows so an in-progress current
+            # day returned by the provider cannot reduce the requested history
+            # depth after applying the cutoff.
+            count = int(lookback_bars) + (8 if end is not None else 0)
         canonical_symbols, results = _canonicalize_symbols(symbols)
         pending: dict[str, tuple[DailyBar, ...]] = {}
         revision_by_symbol: dict[str, str] = {}
@@ -222,6 +226,8 @@ class DailyBarSyncService:
                             tuple(by_symbol.get(symbol, ())),
                             selected_adjustment,
                         )
+                        if end is not None:
+                            bars = tuple(item for item in bars if item.trade_date <= end)
                         pending[symbol] = bars
                         changed_from = min(
                             (item.trade_date for item in existing), default=None
@@ -260,7 +266,10 @@ class DailyBarSyncService:
                 for symbol in chunk:
                     try:
                         raw = tuple(by_symbol.get(symbol, ()))
-                        if start is not None and end is not None:
+                        if lookback_bars is not None and end is not None:
+                            raw = tuple(item for item in raw if item.trade_date <= end)
+                            raw = raw[-int(lookback_bars) :]
+                        elif start is not None and end is not None:
                             raw = tuple(item for item in raw if start <= item.trade_date <= end)
                         bars = _validated_bars(symbol, raw, selected_adjustment)
                         pending[symbol] = bars
@@ -448,18 +457,23 @@ class DividendSyncService:
                 results[symbol] = SyncItemResult(
                     symbol=symbol, status="success", fetched=len(records)
                 )
-        records = tuple(record for values in pending.values() for record in values)
-        if records:
-            persisted = await _persist_with_isolation(records, self._repository.upsert_many)
-            for symbol, error in persisted.items():
-                previous = results[symbol]
-                results[symbol] = SyncItemResult(
-                    symbol=symbol,
-                    status="success" if error is None else "failed",
-                    fetched=previous.fetched,
-                    persisted=previous.fetched if error is None else 0,
-                    error=error,
-                )
+        for symbol, records in pending.items():
+            try:
+                await self._repository.replace_for_symbol(symbol, records)
+            except Exception as exc:
+                if _is_systemic_persistence_error(exc):
+                    raise
+                error = SyncError(code="PERSISTENCE_ERROR", message=_safe_message(exc))
+            else:
+                error = None
+            previous = results[symbol]
+            results[symbol] = SyncItemResult(
+                symbol=symbol,
+                status="success" if error is None else "failed",
+                fetched=previous.fetched,
+                persisted=previous.fetched if error is None else 0,
+                error=error,
+            )
         return SyncSummary(operation="dividend", items=tuple(results.values()))
 
 

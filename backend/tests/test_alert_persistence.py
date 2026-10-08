@@ -42,6 +42,7 @@ from app.services.notification_service import (
     NOTIFICATION_PENDING_RECOVERY_WINDOW,
     NOTIFICATION_PROVIDER_TIMEOUT,
     NotificationService,
+    dispatch_pending_notifications,
     validate_pending_recovery_window,
 )
 from app.services.settings_service import UserSettingsService
@@ -656,6 +657,49 @@ async def test_concurrent_retries_do_not_post_twice(alert_context) -> None:
 
     assert first_result.status == second_result.status == "SENT"
     assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_skips_recent_inflight_rows(alert_context) -> None:
+    session_factory = alert_context["session_factory"]
+    user = alert_context["user_one"]
+    security = alert_context["security"]
+    now = datetime(2026, 9, 24, 8, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        recent = Notification(
+            user_id=user.id,
+            security_id=security.id,
+            channel="FEISHU",
+            title="recent",
+            content=retry_message().to_dict(),
+            status="PENDING",
+            created_at=now - timedelta(minutes=1),
+        )
+        stale = Notification(
+            user_id=user.id,
+            security_id=security.id,
+            channel="FEISHU",
+            title="stale",
+            content=retry_message().to_dict(),
+            status="PENDING",
+            created_at=now - timedelta(minutes=10),
+        )
+        session.add_all([recent, stale])
+        await session.commit()
+
+        provider = FakeProvider()
+        summary = await dispatch_pending_notifications(
+            session,
+            provider=provider,
+            now=now,
+        )
+        await session.refresh(recent)
+        await session.refresh(stale)
+
+    assert provider.calls == 1
+    assert recent.status == "PENDING"
+    assert stale.status == "SENT"
+    assert summary == {"total": 1, "sent": 1, "failed": 0, "pending": 0}
 
 
 @pytest.mark.asyncio

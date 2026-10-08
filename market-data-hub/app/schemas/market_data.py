@@ -89,8 +89,8 @@ class DailySyncRequest(BaseModel):
     @model_validator(mode="after")
     def validate_mode(self) -> DailySyncRequest:
         if self.lookback_bars is not None:
-            if self.start is not None or self.end is not None:
-                raise ValueError("lookback_bars is exclusive with start/end")
+            if self.start is not None:
+                raise ValueError("lookback_bars is exclusive with start")
         elif self.start is None or self.end is None or self.start > self.end:
             raise ValueError("start/end are required and must form a valid range")
         return self

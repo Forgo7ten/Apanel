@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +30,11 @@ class _SessionContext:
 
 
 class _DividendFailingClient:
+    def __init__(self) -> None:
+        self.daily_calls = []
+
     async def sync_daily(self, **_kwargs):
+        self.daily_calls.append(dict(_kwargs))
         return SyncResult("daily", (SyncItem("600519", "success"),))
 
     async def sync_dividends(self, **_kwargs):
@@ -47,14 +52,22 @@ async def test_bootstrap_requires_dividend_sync_before_completion(monkeypatch) -
     monkeypatch.setattr(IndicatorService, "rebuild_history", no_indicators)
     monkeypatch.setattr(StateService, "rebuild_history", no_states)
 
+    client = _DividendFailingClient()
     service = SecurityDataBootstrapService(
         session_factory=_SessionFactory(),
-        market_data_client=_DividendFailingClient(),
+        market_data_client=client,
         minimum_bars=1,
     )
 
     with pytest.raises(RuntimeError, match="dividend bootstrap did not complete"):
-        await service.ensure_ready("600519", adjustments=("qfq",), requests=())
+        await service.ensure_ready(
+            "600519",
+            adjustments=("qfq",),
+            requests=(),
+            completed_through=date(2026, 9, 23),
+        )
+
+    assert client.daily_calls[0]["end"] == date(2026, 9, 23)
 
 
 class _FakeLock:
@@ -87,7 +100,8 @@ async def test_execute_bootstrap_marks_security_only_after_success(tmp_path, mon
         await session.commit()
         security_id = security.id
 
-    async def successful_bootstrap(self, symbol, **_kwargs):
+    async def successful_bootstrap(self, symbol, **kwargs):
+        assert kwargs["completed_through"] == date(2026, 9, 23)
         return BootstrapResult(
             symbol=symbol,
             adjustments=("qfq",),
@@ -98,6 +112,7 @@ async def test_execute_bootstrap_marks_security_only_after_success(tmp_path, mon
 
     monkeypatch.setattr(jobs, "RedisTaskLock", _FakeLock)
     monkeypatch.setattr(SecurityDataBootstrapService, "ensure_ready", successful_bootstrap)
+    monkeypatch.setattr(jobs, "_bootstrap_completed_through", lambda _settings: date(2026, 9, 23))
 
     settings = Settings(
         app_env="test",

@@ -201,6 +201,10 @@ class MarketDataHubClient:
         payload: dict[str, Any] = {"symbols": list(symbols), "adjustment": adjustment}
         if lookback_bars is not None:
             payload["lookback_bars"] = int(lookback_bars)
+            if start is not None:
+                raise ValueError("start is not supported in bootstrap mode")
+            if end is not None:
+                payload["end"] = end.isoformat()
             timeout = self.bootstrap_timeout_seconds
         else:
             if start is None or end is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from app.clients.market_data_hub import MarketDataHubClientProtocol
@@ -38,6 +39,7 @@ class SecurityDataBootstrapService:
         *,
         adjustments: tuple[str, ...] = ("qfq", "none"),
         requests: tuple[IndicatorRequest, ...] | None = None,
+        completed_through: date | None = None,
     ) -> BootstrapResult:
         bars = max(self.minimum_bars, required_history_bars(requests))
         indicator_count = 0
@@ -46,6 +48,7 @@ class SecurityDataBootstrapService:
             result = await self.market_data_client.sync_daily(
                 symbols=(symbol,),
                 lookback_bars=bars,
+                end=completed_through,
                 adjustment=adjustment,
             )
             if not result.ok:

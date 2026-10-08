@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.indicators.parameters import IndicatorRequest, required_history_bars
-from app.models import DailyBar, Security
+from app.models import DailyBar, Security, TradingCalendar
 from app.services.data_bootstrap_service import SecurityDataBootstrapService
 
 
@@ -46,6 +47,7 @@ class DataReadinessService:
         *,
         adjustments: Sequence[str],
         requests_by_symbol: Mapping[str, Sequence[IndicatorRequest] | None],
+        completed_through: date | None = None,
     ) -> HistoryReadinessResult:
         normalized_symbols = tuple(
             dict.fromkeys(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip())
@@ -63,13 +65,32 @@ class DataReadinessService:
             )
             for symbol in normalized_symbols
         }
-        counts = await self._bar_counts(normalized_symbols, normalized_adjustments)
+        histories = await self._bar_dates(
+            normalized_symbols,
+            normalized_adjustments,
+            completed_through=completed_through,
+        )
+        expected_open_dates: tuple[date, ...] = ()
+        if completed_through is not None:
+            recent_starts = [
+                dates[-required[symbol]]
+                for (symbol, _adjustment), dates in histories.items()
+                if len(dates) >= required[symbol]
+            ]
+            if recent_starts:
+                expected_open_dates = await self._open_dates(
+                    min(recent_starts), completed_through
+                )
         bootstrapped: list[str] = []
         for symbol in normalized_symbols:
             missing = tuple(
                 adjustment
                 for adjustment in normalized_adjustments
-                if counts.get((symbol, adjustment), 0) < required[symbol]
+                if not _history_is_ready(
+                    histories.get((symbol, adjustment), ()),
+                    required=required[symbol],
+                    expected_open_dates=expected_open_dates,
+                )
             )
             if not missing:
                 continue
@@ -77,6 +98,7 @@ class DataReadinessService:
                 symbol,
                 adjustments=missing,
                 requests=tuple(requests_by_symbol.get(symbol) or ()),
+                completed_through=completed_through,
             )
             bootstrapped.append(symbol)
         return HistoryReadinessResult(
@@ -85,27 +107,70 @@ class DataReadinessService:
             required_bars=required,
         )
 
-    async def _bar_counts(
+    async def _bar_dates(
         self,
         symbols: tuple[str, ...],
         adjustments: tuple[str, ...],
-    ) -> dict[tuple[str, str], int]:
+        *,
+        completed_through: date | None,
+    ) -> dict[tuple[str, str], tuple[date, ...]]:
+        async with self.session_factory() as session:
+            statement = (
+                select(Security.symbol, DailyBar.adjust_type, DailyBar.trade_date)
+                .join(DailyBar, DailyBar.security_id == Security.id)
+                .where(
+                    Security.symbol.in_(symbols),
+                    DailyBar.adjust_type.in_(adjustments),
+                )
+                .order_by(
+                    Security.symbol.asc(),
+                    DailyBar.adjust_type.asc(),
+                    DailyBar.trade_date.asc(),
+                )
+            )
+            if completed_through is not None:
+                statement = statement.where(DailyBar.trade_date <= completed_through)
+            rows = (await session.execute(statement)).all()
+        grouped: dict[tuple[str, str], list[date]] = {}
+        for symbol, adjustment, trade_date in rows:
+            grouped.setdefault(
+                (str(symbol).upper(), str(adjustment).lower()), []
+            ).append(trade_date)
+        return {key: tuple(values) for key, values in grouped.items()}
+
+    async def _open_dates(self, start: date, end: date) -> tuple[date, ...]:
         async with self.session_factory() as session:
             rows = (
                 await session.execute(
-                    select(Security.symbol, DailyBar.adjust_type, func.count(DailyBar.id))
-                    .join(DailyBar, DailyBar.security_id == Security.id)
+                    select(TradingCalendar.trade_date)
                     .where(
-                        Security.symbol.in_(symbols),
-                        DailyBar.adjust_type.in_(adjustments),
+                        TradingCalendar.market == "CN",
+                        TradingCalendar.trade_date >= start,
+                        TradingCalendar.trade_date <= end,
+                        TradingCalendar.status == "OPEN",
                     )
-                    .group_by(Security.symbol, DailyBar.adjust_type)
+                    .order_by(TradingCalendar.trade_date.asc())
                 )
-            ).all()
-        return {
-            (str(symbol).upper(), str(adjustment).lower()): int(count)
-            for symbol, adjustment, count in rows
-        }
+            ).scalars()
+            return tuple(rows)
+
+
+def _history_is_ready(
+    dates: Sequence[date],
+    *,
+    required: int,
+    expected_open_dates: Sequence[date],
+) -> bool:
+    if len(dates) < required:
+        return False
+    if not expected_open_dates:
+        return True
+    recent = tuple(dates[-required:])
+    recent_set = set(recent)
+    expected_recent = tuple(day for day in expected_open_dates if day >= recent[0])
+    if not expected_recent:
+        return True
+    return expected_recent[-1] in recent_set and all(day in recent_set for day in expected_recent)
 
 
 __all__ = ["DataReadinessService", "HistoryReadinessResult"]
