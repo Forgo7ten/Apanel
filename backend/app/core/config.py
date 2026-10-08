@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     feishu_webhook_allowed_hosts: str = "open.feishu.cn,open.larksuite.com"
     app_secrets_key: str | None = None
     app_secrets_key_version: str = "v1"
+    app_secrets_previous_keys: str | None = None
     legacy_webhook_fallback_enabled: bool = True
     quote_refresh_interval_minutes: int = Field(
         default=5,
@@ -201,6 +202,19 @@ class Settings(BaseSettings):
 
         if self.app_env.casefold() == "production" and not self.app_secrets_key:
             raise ValueError("Production requires APP_SECRETS_KEY for encrypted user secrets.")
+
+    def validate_market_data_credentials(self) -> None:
+        """Require the shared Hub token in production processes that call sync APIs."""
+
+        if self.app_env.casefold() == "production" and not self.internal_api_token:
+            raise ValueError("Production requires INTERNAL_API_TOKEN for Market Data Hub sync.")
+
+    def validate_worker_credentials(self) -> None:
+        """Validate secrets consumed by Celery worker tasks at process startup."""
+
+        self.validate_database_credentials()
+        self.validate_market_data_credentials()
+        self.validate_notification_credentials()
 
     def validate_runtime_credentials(self) -> None:
         """Validate all credentials required by the backend API process."""

@@ -38,7 +38,10 @@ class _DividendFailingClient:
         return SyncResult("daily", (SyncItem("600519", "success"),))
 
     async def sync_dividends(self, **_kwargs):
-        return SyncResult("dividend", (SyncItem("600519", "failed", error_code="PROVIDER_UNAVAILABLE"),))
+        return SyncResult(
+            "dividend",
+            (SyncItem("600519", "failed", error_code="PROVIDER_UNAVAILABLE"),),
+        )
 
 
 @pytest.mark.asyncio

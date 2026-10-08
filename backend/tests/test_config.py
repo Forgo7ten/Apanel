@@ -43,3 +43,33 @@ def test_infrastructure_validation_does_not_require_the_jwt_secret() -> None:
 
     with pytest.raises(ValueError, match="JWT secret"):
         settings.validate_auth_credentials()
+
+
+def test_production_worker_requires_market_data_token() -> None:
+    settings = Settings(
+        app_env="production",
+        database_url="postgresql+asyncpg://apanel:unique@db/apanel",
+        app_secrets_key="worker-secret-key",
+        internal_api_token=None,
+    )
+
+    with pytest.raises(ValueError, match="INTERNAL_API_TOKEN"):
+        settings.validate_worker_credentials()
+
+
+def test_production_worker_requires_user_secret_master_key() -> None:
+    settings = Settings(
+        app_env="production",
+        database_url="postgresql+asyncpg://apanel:unique@db/apanel",
+        app_secrets_key=None,
+        internal_api_token="worker-internal-token",
+    )
+
+    with pytest.raises(ValueError, match="APP_SECRETS_KEY"):
+        settings.validate_worker_credentials()
+
+
+def test_development_worker_keeps_optional_local_secrets() -> None:
+    settings = Settings(app_env="development")
+
+    settings.validate_worker_credentials()

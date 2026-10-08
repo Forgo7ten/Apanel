@@ -265,5 +265,7 @@ async def test_watch_detail_query_count_is_independent_of_stock_count(
     assert len(small.stocks) == 1
     assert len(large.stocks) == 100
     assert small_count == large_count
-    assert large_count <= 9
+    # bootstrap_ready adds one fixed batched read. Keep the regression contract
+    # focused on query-count independence rather than the previous exact budget.
+    assert large_count <= 10
     assert elapsed < 10

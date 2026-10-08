@@ -22,19 +22,32 @@ def test_all_alembic_revision_ids_fit_version_table_column() -> None:
         )
 
 
-def test_initial_schema_is_the_single_alembic_head() -> None:
+def test_alembic_revisions_form_one_complete_linear_chain() -> None:
     versions_dir = Path(__file__).parents[1] / "alembic" / "versions"
     paths = sorted(versions_dir.glob("*.py"))
-    assert [path.name for path in paths] == ["0001_initial_schema.py"]
+    revisions: dict[str, str | None] = {}
+    for path in paths:
+        spec = importlib.util.spec_from_file_location(f"apanel_{path.stem}", path)
+        assert spec is not None and spec.loader is not None
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        revisions[migration.revision] = migration.down_revision
 
-    path = paths[0]
-    spec = importlib.util.spec_from_file_location("apanel_0001_initial", path)
-    assert spec is not None and spec.loader is not None
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
+    assert revisions["0001_initial_schema"] is None
+    roots = {revision for revision, parent in revisions.items() if parent is None}
+    referenced = {parent for parent in revisions.values() if parent is not None}
+    heads = set(revisions) - referenced
+    assert roots == {"0001_initial_schema"}
+    assert len(heads) == 1
+    assert all(parent is None or parent in revisions for parent in revisions.values())
 
-    assert migration.revision == "0001_initial_schema"
-    assert migration.down_revision is None
+    seen: set[str] = set()
+    current = next(iter(heads))
+    while current is not None:
+        assert current not in seen, "Alembic revision chain contains a cycle"
+        seen.add(current)
+        current = revisions[current]
+    assert seen == set(revisions)
 
 
 def test_watch_schema_has_owner_bound_relations_and_uniqueness() -> None:

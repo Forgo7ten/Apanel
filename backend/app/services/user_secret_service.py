@@ -75,7 +75,11 @@ class UserSecretService:
         row = await self.repository.get(user_id, FEISHU_WEBHOOK_SECRET)
         if row is None:
             return None
-        return self.cipher.decrypt(row.ciphertext, aad=self._aad(user_id, FEISHU_WEBHOOK_SECRET))
+        return self.cipher.decrypt(
+            row.ciphertext,
+            aad=self._aad(user_id, FEISHU_WEBHOOK_SECRET),
+            key_version=row.key_version,
+        )
 
     async def clear_feishu_webhook(self, user_id: int) -> None:
         await self.repository.delete(user_id, FEISHU_WEBHOOK_SECRET)
