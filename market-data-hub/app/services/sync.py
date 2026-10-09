@@ -135,7 +135,7 @@ class SecuritySyncService:
             # The repository owns one transaction for this complete batch.  Do
             # not retry by symbol: that would turn a source-wide failure into
             # partial database state and make bootstrap success ambiguous.
-            await self._repository.upsert_many(tuple(records))
+            await self._repository.reconcile_snapshot(tuple(records))
         except Exception as exc:
             return _security_failure(
                 SyncError(code="PERSISTENCE_ERROR", message=_safe_message(exc))
@@ -228,16 +228,51 @@ class DailyBarSyncService:
                         )
                         if end is not None:
                             bars = tuple(item for item in bars if item.trade_date <= end)
-                        pending[symbol] = bars
+                        if existing and not bars:
+                            raise InvalidMarketDataError(
+                                "provider returned no bars during qfq revision rebuild"
+                            )
                         changed_from = min(
                             (item.trade_date for item in existing), default=None
                         ) or min((item.trade_date for item in bars), default=None)
+                        coverage_start = min(
+                            (item.trade_date for item in existing),
+                            default=min((item.trade_date for item in bars), default=None),
+                        )
+                        coverage_end = max(
+                            (item.trade_date for item in existing),
+                            default=max((item.trade_date for item in bars), default=None),
+                        )
+                        if bars and coverage_start is not None and coverage_end is not None:
+                            try:
+                                await self._repository.reconcile_revision(
+                                    symbol,
+                                    bars,
+                                    adjustment=selected_adjustment,
+                                    coverage_start=coverage_start,
+                                    coverage_end=coverage_end,
+                                )
+                            except Exception as exc:
+                                if _is_systemic_persistence_error(exc):
+                                    raise
+                                results[symbol] = SyncItemResult(
+                                    symbol=symbol,
+                                    status="failed",
+                                    fetched=len(bars),
+                                    error=SyncError(
+                                        code="PERSISTENCE_ERROR", message=_safe_message(exc)
+                                    ),
+                                    history_rebased=True,
+                                    changed_from=changed_from,
+                                )
+                                continue
                         if changed_from is not None:
                             rebase_from[symbol] = changed_from
                         results[symbol] = SyncItemResult(
                             symbol=symbol,
                             status="success",
                             fetched=len(bars),
+                            persisted=len(bars),
                             history_rebased=True,
                             changed_from=changed_from,
                         )
@@ -457,23 +492,18 @@ class DividendSyncService:
                 results[symbol] = SyncItemResult(
                     symbol=symbol, status="success", fetched=len(records)
                 )
-        for symbol, records in pending.items():
-            try:
-                await self._repository.replace_for_symbol(symbol, records)
-            except Exception as exc:
-                if _is_systemic_persistence_error(exc):
-                    raise
-                error = SyncError(code="PERSISTENCE_ERROR", message=_safe_message(exc))
-            else:
-                error = None
-            previous = results[symbol]
-            results[symbol] = SyncItemResult(
-                symbol=symbol,
-                status="success" if error is None else "failed",
-                fetched=previous.fetched,
-                persisted=previous.fetched if error is None else 0,
-                error=error,
-            )
+        records = tuple(record for values in pending.values() for record in values)
+        if records:
+            persisted = await _persist_with_isolation(records, self._repository.upsert_many)
+            for symbol, error in persisted.items():
+                previous = results[symbol]
+                results[symbol] = SyncItemResult(
+                    symbol=symbol,
+                    status="success" if error is None else "failed",
+                    fetched=previous.fetched,
+                    persisted=previous.fetched if error is None else 0,
+                    error=error,
+                )
         return SyncSummary(operation="dividend", items=tuple(results.values()))
 
 

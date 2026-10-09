@@ -82,6 +82,43 @@ class MemoryRepository:
             )
             self.records[key] = record
 
+    async def reconcile_snapshot(self, records) -> None:
+        await self.upsert_many(records)
+
+    async def reconcile_revision(
+        self, symbol, records, *, adjustment, coverage_start, coverage_end
+    ) -> None:
+        batch = tuple(records)
+        self.batches.append(batch)
+        dates = {record.trade_date for record in batch}
+        self.records = {
+            key: value
+            for key, value in self.records.items()
+            if not (
+                key[0] == symbol
+                and hasattr(value, "adjustment")
+                and value.adjustment is adjustment
+                and coverage_start <= value.trade_date <= coverage_end
+                and value.trade_date not in dates
+            )
+        }
+        for record in batch:
+            self.records[(record.symbol, record.trade_date)] = record
+
+    async def list_by_symbol(self, symbol, *, start=None, end=None, adjustment=Adjustment.QFQ):
+        rows = [
+            value
+            for value in self.records.values()
+            if getattr(value, "symbol", None) == symbol
+            and hasattr(value, "trade_date")
+            and value.adjustment is adjustment
+        ]
+        if start is not None:
+            rows = [row for row in rows if row.trade_date >= start]
+        if end is not None:
+            rows = [row for row in rows if row.trade_date <= end]
+        return tuple(sorted(rows, key=lambda row: row.trade_date))
+
 
 class SystemicRepository(MemoryRepository):
     async def upsert_many(self, records) -> None:
@@ -89,7 +126,7 @@ class SystemicRepository(MemoryRepository):
 
 
 class FailingSecurityRepository(MemoryRepository):
-    async def upsert_many(self, records) -> None:
+    async def reconcile_snapshot(self, records) -> None:
         self.batches.append(tuple(records))
         raise RuntimeError("security persistence failed")
 
@@ -117,14 +154,6 @@ class DividendRepositoryMemory:
 
     async def upsert_many(self, records) -> None:
         self.calls += 1
-        for record in records:
-            self.records[(record.symbol, record.date)] = record
-
-    async def replace_for_symbol(self, symbol, records) -> None:
-        self.calls += 1
-        self.records = {
-            key: value for key, value in self.records.items() if key[0] != symbol
-        }
         for record in records:
             self.records[(record.symbol, record.date)] = record
 
@@ -404,7 +433,7 @@ async def test_dividend_sync_upserts_duplicate_events_and_reports_provider_failu
 
 
 @pytest.mark.asyncio
-async def test_dividend_sync_removes_events_no_longer_returned_by_provider() -> None:
+async def test_dividend_sync_keeps_events_missing_from_non_authoritative_response() -> None:
     provider = QuoteDividendProvider()
     repository = DividendRepositoryMemory()
     repository.records[("600519", date(2025, 6, 30))] = Dividend(
@@ -415,12 +444,12 @@ async def test_dividend_sync_removes_events_no_longer_returned_by_provider() -> 
     result = await service.sync(symbols=["600519"])
 
     assert result.ok
-    assert ("600519", date(2025, 6, 30)) not in repository.records
+    assert ("600519", date(2025, 6, 30)) in repository.records
     assert repository.records[("600519", date(2026, 6, 30))].cash_amount == Decimal("2.10")
 
 
 @pytest.mark.asyncio
-async def test_dividend_sync_clears_snapshot_when_provider_returns_no_events() -> None:
+async def test_dividend_sync_keeps_history_when_provider_returns_no_events() -> None:
     provider = QuoteDividendProvider()
     repository = DividendRepositoryMemory()
     repository.records[("000001", date(2025, 6, 30))] = Dividend(
@@ -431,4 +460,53 @@ async def test_dividend_sync_clears_snapshot_when_provider_returns_no_events() -
     result = await service.sync(symbols=["000001"])
 
     assert result.ok
-    assert not any(symbol == "000001" for symbol, _date in repository.records)
+    assert ("000001", date(2025, 6, 30)) in repository.records
+
+
+@pytest.mark.asyncio
+async def test_qfq_revision_reconciles_removed_provider_dates() -> None:
+    class RevisionProvider(FakeProvider):
+        async def get_adjustment_revision(self, symbol):
+            return "r2"
+
+        async def get_daily_bars_batch(self, symbols, *, adjustment, count):
+            return {
+                "600519": tuple(
+                    replace(bar("600519", day), adjustment=Adjustment.QFQ)
+                    for day in (2, 4)
+                )
+            }
+
+    class AdjustmentRepository:
+        async def get(self, symbol):
+            return {"revision_hash": "r1"}
+
+        async def upsert(self, *args, **kwargs):
+            return None
+
+    repository = MemoryRepository()
+    repository.records[("600519", date(2026, 9, 2))] = replace(
+        bar("600519", 2), adjustment=Adjustment.QFQ
+    )
+    repository.records[("600519", date(2026, 9, 3))] = replace(
+        bar("600519", 3), adjustment=Adjustment.QFQ
+    )
+    repository.records[("600519", date(2026, 9, 4))] = replace(
+        bar("600519", 4), adjustment=Adjustment.QFQ
+    )
+    service = DailyBarSyncService(
+        provider=RevisionProvider(),
+        repository=repository,
+        adjustment_repository=AdjustmentRepository(),
+    )
+
+    result = await service.sync(
+        symbols=["600519"],
+        lookback_bars=3,
+        end=date(2026, 9, 4),
+        adjustment=Adjustment.QFQ,
+    )
+
+    assert result.ok
+    assert result.items[0].history_rebased is True
+    assert ("600519", date(2026, 9, 3)) not in repository.records

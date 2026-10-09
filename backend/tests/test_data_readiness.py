@@ -4,11 +4,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
 from app.indicators.parameters import IndicatorRequest
-from app.models import DailyBar, Security, TradingCalendar
+from app.models import DailyBar, Security
 from app.services.data_readiness_service import DataReadinessService
 
 
@@ -74,6 +75,9 @@ async def test_readiness_bootstraps_only_missing_adjustments(tmp_path) -> None:
     assert result.bootstrapped_symbols == ("600519",)
     assert result.required_bars == {"600519": 34}
     assert bootstrap.calls == [("600519", ("none",), (), None)]
+    async with factory() as session:
+        security = (await session.execute(select(Security))).scalar_one()
+        assert security.bootstrap_completed_at is not None
     await engine.dispose()
 
 
@@ -129,7 +133,7 @@ async def test_readiness_uses_custom_indicator_depth(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_readiness_bootstraps_when_recent_trading_day_has_a_gap(tmp_path) -> None:
+async def test_readiness_does_not_treat_suspension_as_missing_history(tmp_path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'gap.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -149,17 +153,6 @@ async def test_readiness_bootstraps_when_recent_trading_day_has_a_gap(tmp_path) 
         session.add(security)
         await session.flush()
         for trade_date in open_dates:
-            session.add(
-                TradingCalendar(
-                    market="CN",
-                    trade_date=trade_date,
-                    expected_open=True,
-                    actual_open=True,
-                    status="OPEN",
-                    source="TEST",
-                    source_metadata={},
-                )
-            )
             if trade_date == missing_date:
                 continue
             session.add(
@@ -190,8 +183,6 @@ async def test_readiness_bootstraps_when_recent_trading_day_has_a_gap(tmp_path) 
     )
 
     assert result.required_bars == {"600519": 34}
-    assert result.bootstrapped_symbols == ("600519",)
-    assert bootstrap.calls == [
-        ("600519", ("qfq",), (), open_dates[-1])
-    ]
+    assert result.bootstrapped_symbols == ()
+    assert bootstrap.calls == []
     await engine.dispose()

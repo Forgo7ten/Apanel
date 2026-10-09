@@ -27,6 +27,8 @@ class SecretCipher:
         self.key_version = key_version
         self._decryptors = {key_version: self._cipher}
         for version, previous_key in (decryption_keys or {}).items():
+            if str(version) == key_version:
+                raise ValueError("previous secret key versions must not redefine current version")
             if len(previous_key) != 32:
                 raise ValueError("secret encryption key must contain 32 bytes")
             self._decryptors[str(version)] = AESGCM(previous_key)

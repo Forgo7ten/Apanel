@@ -237,7 +237,7 @@ def _quote_is_at_least_as_fresh(timestamp: datetime, daily_bar: Any | None) -> b
     if daily_bar is None:
         return True
     aware = _utc_timestamp(timestamp)
-    return aware.astimezone(_SHANGHAI_TZ).date() >= daily_bar.trade_date
+    return aware.astimezone(_SHANGHAI_TZ).date() > daily_bar.trade_date
 
 
 def _to_decimal(value: Any, *, field: str) -> Decimal:

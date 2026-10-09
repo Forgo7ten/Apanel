@@ -225,23 +225,26 @@ def merge_indicator_requests(
     if requests is not None:
         raw_requests.extend(_coerce_requests(requests))
 
-    ma_periods: set[int] = set()
+    ma_requests: dict[tuple[int, ...], IndicatorRequest] = {}
     others: dict[tuple[str, str], IndicatorRequest] = {}
     for request in raw_requests:
         indicator_type = normalize_indicator_type(request.indicator_type)
         parameters = canonicalize_parameters(indicator_type, request.parameters)
         if indicator_type == "MA":
-            periods = parameters.get("periods")
-            if periods is None:
-                periods = [parameters["period"]]
-            ma_periods.update(int(period) for period in periods)
+            periods = tuple(sorted(set(_ma_periods(parameters))))
+            normalized = IndicatorRequest("MA", {"periods": list(periods)})
+            ma_requests[periods] = normalized
             continue
         normalized = IndicatorRequest(indicator_type, parameters)
         others[(indicator_type, normalized.key)] = normalized
 
-    merged: list[IndicatorRequest] = (
-        [IndicatorRequest("MA", {"periods": sorted(ma_periods)})] if ma_periods else []
-    )
+    # Keep exact MA requests as independent variants instead of collapsing
+    # every user's periods into one global bundle.  Do not remove subset
+    # variants: a two-period request may come from an explicit MA state alert
+    # and must survive even when a wider numeric MA column contains both
+    # periods.  StateService decides which explicit variants produce states,
+    # avoiding the old O(n^2) cross-product across unrelated numeric columns.
+    merged: list[IndicatorRequest] = sorted(ma_requests.values(), key=lambda item: item.key)
     merged.extend(sorted(others.values(), key=lambda item: (item.indicator_type, item.key)))
     return tuple(merged)
 

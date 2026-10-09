@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from app.core.config import Settings
+from app.indicators.parameters import IndicatorRequest
 from app.tasks.contracts import (
     EOD_STEP_ORDER,
     PipelineConfigurationError,
@@ -18,12 +19,15 @@ from app.tasks.contracts import (
 )
 from app.tasks.jobs import (
     _retry_or_raise,
+    _run_with_lock_lease,
     _validate_missing_calendar_date,
     execute_eod_pipeline,
 )
+from app.tasks.locks import TaskLockError
 from app.tasks.pipeline import (
     EODPipeline,
     _sync_in_chunks,
+    _sync_required_history_in_chunks,
     build_default_eod_steps,
     resolve_alert_runner,
 )
@@ -197,6 +201,91 @@ async def test_sync_in_chunks_never_reports_failed_items_as_ok() -> None:
 
 
 @pytest.mark.asyncio
+async def test_eod_history_sync_repairs_required_provider_windows_without_calendar_gaps() -> None:
+    from app.clients.market_data_hub import SyncItem, SyncResult
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def sync_daily(self, **kwargs):
+            self.calls.append(kwargs)
+            return SyncResult(
+                operation="daily",
+                items=tuple(SyncItem(symbol, "success") for symbol in kwargs["symbols"]),
+            )
+
+    client = Client()
+    context = PipelineContext(date(2026, 9, 24), "qfq", ("600519", "000001"))
+    context.resources["market_data_client"] = client
+    context.resources["settings"] = Settings(market_data_sync_batch_size=50)
+
+    result = await _sync_required_history_in_chunks(
+        context,
+        adjustment="qfq",
+        requests_by_symbol={
+            "600519": (),
+            "000001": (IndicatorRequest("MA", {"period": 60}),),
+        },
+        minimum_bars=1,
+    )
+
+    assert result["ok"] is True
+    assert [(call["symbols"], call["lookback_bars"], call["end"]) for call in client.calls] == [
+        (["600519"], 34, date(2026, 9, 24)),
+        (["000001"], 60, date(2026, 9, 24)),
+    ]
+
+
+
+
+@pytest.mark.asyncio
+async def test_adjustment_ready_treats_missing_target_bar_as_suspension_not_retry() -> None:
+    class ScalarRows:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Session:
+        async def execute(self, _statement):
+            return ScalarRows()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class Factory:
+        def __call__(self):
+            return SessionContext()
+
+    class Client:
+        pass
+
+    async def runner(_context):
+        return []
+
+    steps = build_default_eod_steps(
+        session_factory=Factory(),
+        market_data_client=Client(),
+        alert_runner=runner,
+        notification_runner=runner,
+    )
+    context = PipelineContext(date(2026, 9, 24), "qfq", ("600519",))
+    context.resources["analysis_adjustments"] = ("qfq",)
+
+    result = await steps[2].run(context)
+
+    assert result["ready_symbols"] == {"qfq": ()}
+    assert result["no_bar_symbols"] == {"qfq": ("600519",)}
+    assert context.resources.get("pipeline_issues", []) == []
+
+
+@pytest.mark.asyncio
 async def test_execute_eod_releases_lock_when_a_step_fails() -> None:
     class FakeLock:
         def __init__(self) -> None:
@@ -232,6 +321,30 @@ async def test_execute_eod_releases_lock_when_a_step_fails() -> None:
     assert lock.released == 1
 
 
+
+
+@pytest.mark.asyncio
+async def test_lock_guard_cancels_pipeline_work_when_lease_is_lost() -> None:
+    cancelled = False
+
+    class Lock:
+        async def wait_lost(self):
+            await _noop_async()
+
+    async def work():
+        nonlocal cancelled
+        try:
+            await __import__("asyncio").sleep(60)
+        except __import__("asyncio").CancelledError:
+            cancelled = True
+            raise
+
+    with pytest.raises(TaskLockError, match="lease was lost"):
+        await _run_with_lock_lease(Lock(), work())
+
+    assert cancelled is True
+
+
 def test_missing_alert_entrypoint_is_explicit_and_lazy() -> None:
     with patch("app.tasks.pipeline.importlib.import_module", side_effect=ModuleNotFoundError):
         with pytest.raises(PipelineConfigurationError, match="alert integration"):
@@ -255,11 +368,13 @@ def test_retry_uses_backoff_without_logging_exception_text() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_annual_calendar_can_be_validated_after_date_is_reached() -> None:
+async def test_missing_annual_calendar_backfills_recent_actual_dates() -> None:
+    calls: list[date] = []
+
     class Client:
         async def validate_calendar(self, *, trade_date):
-            assert trade_date == date(2027, 1, 4)
-            return {"status": "OPEN"}
+            calls.append(trade_date)
+            return {"status": "OPEN" if trade_date == date(2027, 1, 4) else "CLOSED"}
 
     status = await _validate_missing_calendar_date(
         date(2027, 1, 4),
@@ -268,14 +383,18 @@ async def test_missing_annual_calendar_can_be_validated_after_date_is_reached() 
     )
 
     assert status == "OPEN"
+    assert calls[0] == date(2027, 1, 4) - timedelta(days=14)
+    assert calls[-1] == date(2027, 1, 4)
+    assert len(calls) == 15
 
 
 @pytest.mark.asyncio
 async def test_missing_annual_calendar_remains_fail_closed_when_actual_is_unknown() -> None:
     class Client:
         async def validate_calendar(self, *, trade_date):
-            assert trade_date == date(2027, 1, 4)
-            return {"status": "UNKNOWN"}
+            return {
+                "status": "UNKNOWN" if trade_date == date(2027, 1, 4) else "CLOSED"
+            }
 
     with pytest.raises(PipelineConfigurationError, match="calendar actual validation"):
         await _validate_missing_calendar_date(

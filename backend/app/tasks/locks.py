@@ -45,6 +45,7 @@ class RedisTaskLock:
         self._token = secrets.token_urlsafe(32)
         self._acquired = False
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._lost_event = asyncio.Event()
 
     async def acquire(self) -> bool:
         """Attempt once and return false when another job owns the lock."""
@@ -60,6 +61,7 @@ class RedisTaskLock:
             raise TaskLockError("task lock acquire failed") from exc
         self._acquired = bool(acquired)
         if self._acquired:
+            self._lost_event.clear()
             self._heartbeat_task = asyncio.create_task(self._heartbeat())
         return self._acquired
 
@@ -93,12 +95,27 @@ class RedisTaskLock:
                 try:
                     renewed = await self.renew()
                 except TaskLockError:
-                    continue
+                    self._mark_lost()
+                    return
                 if not renewed:
-                    self._acquired = False
+                    self._mark_lost()
                     return
         except asyncio.CancelledError:
             raise
+
+
+    def _mark_lost(self) -> None:
+        self._acquired = False
+        self._lost_event.set()
+
+    async def wait_lost(self) -> None:
+        """Wait until renewal proves this lease can no longer protect work."""
+
+        await self._lost_event.wait()
+
+    def assert_owned(self) -> None:
+        if not self._acquired or self._lost_event.is_set():
+            raise TaskLockError("task lock lease was lost")
 
     async def release(self) -> None:
         """Release only when this lease still owns the key."""

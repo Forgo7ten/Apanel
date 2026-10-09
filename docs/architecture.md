@@ -89,7 +89,7 @@ best-effort enqueue bootstrap_security_data
         ↓
 Redis symbol lock 去重
         ↓
-Hub 同步足够历史 DailyBar（qfq；可选 none）+ Dividend
+Hub 同步足够历史 DailyBar（qfq；可选 none；ad-hoc bootstrap 永远不纳入本地“今天”的未确认日 K）+ Dividend
         ↓
 IndicatorService 历史物化
         ↓
@@ -100,7 +100,7 @@ bootstrap 只建立 observation 基础，不回放历史通知。EOD 是 enqueue
 
 ### 盘中 Quote
 
-Beat 只在 09:30–11:30、13:00–15:00 的候选时段产生任务；worker 还会检查 `trading_calendar`。实际监控 universe 是 Watch 股票与 enabled Alert-only 股票的并集。Backend 按 chunk 调 Hub，Hub 使用 eltdx 原生批量 snapshots。
+Beat 只在 09:30–11:30、13:00–15:00 的候选时段产生任务；worker 还会检查 `trading_calendar`。实际监控 universe 是 Watch 股票与 enabled Alert-only 股票的并集，并过滤为 `ACTIVE` 证券；已被 Security Master 标记为 `INACTIVE` 的历史证券不会继续进入调度 universe。Backend 按 chunk 调 Hub，Hub 使用 eltdx 原生批量 snapshots。
 
 ### 日终 EOD
 
@@ -109,7 +109,7 @@ TradingCalendar guard / Hub actual validation
         ↓
 minimum-history readiness（不足则同步 bootstrap，不评估历史 Alert）
         ↓
-Daily sync(qfq，按配置可同时 none)
+Daily history repair sync(qfq，按指标需求回补实际交易 K 线；按配置可同时 none)
         ↓
 Dividend sync
         ↓
@@ -124,7 +124,7 @@ Alert Edge evaluation + PENDING Notification（同事务）
 notification dispatcher → Feishu
 ```
 
-停牌/无目标日 bar 的证券不会拿上一交易日 observation 冒充当天数据；交易日日历缺失或 expected/actual 冲突时 EOD fail closed。逐证券同步失败不会阻塞已经健康的证券继续完成指标、状态、Alert 和通知：永久失败在最终结果中标记为 `completed_with_errors`；provider timeout/unavailable、持久化失败或目标日 bar 尚未就绪等可重试问题会在健康链路完成后触发 Celery retry。Pipeline issue 只保留 symbol、adjustment 和稳定错误码，不记录 provider 原始异常文本。
+停牌/无目标日 bar 的证券不会拿上一交易日 observation 冒充当天数据；当历史同步本身成功但目标日没有该证券 bar 时，按合法停牌/无当日 observation 处理并跳过该证券当天物化，不把整批 EOD 变成 retry。交易日日历缺失或 expected/actual 冲突时 EOD fail closed；年度 seed 缺口只会对已到达日期通过 Hub 回填一段实际交易日窗口。逐证券 provider timeout/unavailable 或持久化失败仍会在健康链路完成后触发 Celery retry。Pipeline issue 只保留 symbol、adjustment 和稳定错误码，不记录 provider 原始异常文本。
 
 ## 读取与写入职责
 
@@ -150,10 +150,10 @@ HTTP 读取路径与后台物化路径明确分离：
 
 行情表通过 `security_id` 关联 `securities`。日线唯一键是证券、交易日和复权类型；报价唯一键是证券和 UTC 时间戳；分红事件唯一键是证券和事件日期。repository 使用 PostgreSQL `ON CONFLICT` upsert，重复同步不会重复创建相同业务记录。
 
-指标和状态由 Backend 统一物化到共享表，并按 `adjust_type`、参数 identity 和交易日隔离。EOD 正常路径只物化最新交易日；历史 bootstrap 或 qfq corporate-action revision 变化时才回建受影响历史。提醒规则读取精确的 indicator parameter/field 或 state parameter identity。Edge 状态和 PENDING notification outbox 在同一事务中提交，之后由通知阶段/恢复任务投递。
+指标和状态由 Backend 统一物化到共享表，并按 `adjust_type`、参数 identity 和交易日隔离。EOD 正常路径只物化最新交易日；历史 bootstrap 或 qfq corporate-action revision 变化时才回建受影响历史。`bootstrap_completed_at` 只在真实 readiness/bootstrap 成功后写入；`0003_reset_bootstrap_readiness` 会清除早期迁移中未经数据验证的乐观标记，随后由正常 EOD/bootstrap 恢复可信状态。提醒规则读取精确的 indicator parameter/field 或 state parameter identity。Edge 状态和 PENDING notification outbox 在同一事务中提交，之后由通知阶段/恢复任务投递；外部 Webhook 边界采用 at-least-once 语义，provider 已成功但 terminal commit 前进程崩溃时仍可能产生重复发送。
 
 ## 错误与配置边界
 
 后端公共 API 使用 `success/data` 成功包和 `success/error` 错误包；行情数据中枢使用相同字段，一般请求错误时返回 `data: null`，但健康检查降级和部分同步失败会保留诊断数据。provider、数据库和参数错误在 API 层映射为稳定的错误码，不把底层连接细节直接返回给客户端。
 
-`APP_ENV=production` 时，Backend API 会校验 PostgreSQL 密码、JWT、Secure Cookie 与 `APP_SECRETS_KEY`；Worker/CLI 只校验自身真正需要的凭据。Market Data Hub 生产环境要求 `INTERNAL_API_TOKEN`。不同进程使用最小化配置校验，避免把 JWT 或用户密钥错误地要求给 migration/scheduler 等不消费它们的进程。
+`APP_ENV=production` 时，Backend API 会校验 PostgreSQL 密码、JWT、Secure Cookie 与完整的用户密钥 keyring；Worker 会校验数据库、内部行情 token 与完整的用户密钥 keyring。current/previous secret key 的编码、长度、JSON 结构或版本冲突都会在启动期 fail-fast。Market Data Hub 生产环境要求 `INTERNAL_API_TOKEN`。不同进程使用最小化配置校验，避免把 JWT 或用户密钥错误地要求给 migration/scheduler 等不消费它们的进程。

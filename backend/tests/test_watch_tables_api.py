@@ -335,6 +335,33 @@ async def test_watch_analysis_mutations_use_injected_bootstrap_scheduler(watch_c
     assert recorder.calls == ["600519", "600519", "600519"]
 
 
+
+
+async def test_inactive_security_is_hidden_from_search_and_cannot_be_added(
+    watch_context,
+) -> None:
+    client, session_factory, user_one, _ = watch_context
+    app = client._transport.app  # type: ignore[attr-defined]
+    _as_user(app, user_one)
+    async with session_factory() as session:
+        security = await session.get(Security, 2)
+        assert security is not None
+        security.status = "INACTIVE"
+        await session.commit()
+
+    search = await client.get("/api/v1/securities/search", params={"q": "平安"})
+    assert search.status_code == 200
+    assert search.json()["data"] == []
+
+    created = await client.post("/api/v1/watch-tables", json={"name": "退市过滤"})
+    table_id = created.json()["data"]["id"]
+    added = await client.post(
+        f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 2}
+    )
+    assert added.status_code == 409
+    assert added.json()["error"]["code"] == "SECURITY_INACTIVE"
+
+
 async def test_settings_and_public_security_contracts(watch_context) -> None:
     client, _, user_one, user_two = watch_context
     app = client._transport.app  # type: ignore[attr-defined]

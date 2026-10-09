@@ -16,6 +16,7 @@ from app.indicators.parameters import (
     IndicatorRequest,
     canonicalize_parameters,
     merge_indicator_requests,
+    required_history_bars,
 )
 from app.models import AlertRule, DailyBar, Security, TableColumn, WatchTableSymbol
 from app.services.data_bootstrap_service import SecurityDataBootstrapService
@@ -166,10 +167,11 @@ def build_default_eod_steps(
         context.resources["history_readiness"] = readiness
         output: dict[str, Any] = {}
         for adjustment in adjustments:
-            output[adjustment] = await _sync_in_chunks(
+            output[adjustment] = await _sync_required_history_in_chunks(
                 context,
-                "daily",
                 adjustment=adjustment,
+                requests_by_symbol=requests_by_symbol,
+                minimum_bars=minimum_bars,
             )
             _record_sync_issues(
                 context,
@@ -220,20 +222,11 @@ def build_default_eod_steps(
                 no_bar[adjustment] = tuple(
                     symbol for symbol in context.symbols if symbol not in found
                 )
-                for symbol in no_bar[adjustment]:
-                    if not _has_pipeline_issue(
-                        context, step="daily_sync", symbol=symbol, adjustment=adjustment
-                    ):
-                        _record_pipeline_issue(
-                            context,
-                            PipelineIssue(
-                                step="adjustment_ready",
-                                symbol=symbol,
-                                adjustment=adjustment,
-                                code="EOD_BAR_NOT_READY",
-                                retryable=True,
-                            ),
-                        )
+                # A successful history sync with no target-date bar is a
+                # legitimate per-security outcome (for example suspension).
+                # Downstream materialization simply excludes that symbol.
+                # Provider/persistence failures were already recorded by
+                # daily_sync and retain their retry policy.
         return {"ready_symbols": ready, "no_bar_symbols": no_bar}
 
     async def indicator_snapshots(context: PipelineContext) -> Mapping[str, Any]:
@@ -381,6 +374,78 @@ async def _sync_in_chunks(
         "retryable_symbols": retryable_symbols,
         "permanent_failures": permanent_failures,
         "items": tuple(items),
+    }
+
+
+async def _sync_required_history_in_chunks(
+    context: PipelineContext,
+    *,
+    adjustment: str,
+    requests_by_symbol: Mapping[str, Iterable[IndicatorRequest] | None],
+    minimum_bars: int,
+) -> dict[str, Any]:
+    """Refresh the latest required traded-bar window for every EOD symbol.
+
+    Re-fetching the provider's latest N actual bars repairs missed historical
+    writes without assuming that every exchange-open date must have a bar for
+    every security (suspensions are legitimate gaps in calendar dates).
+    """
+
+    client = context.resources.get("market_data_client")
+    settings = context.resources.get("settings")
+    if client is None:
+        raise PipelineConfigurationError("market data client is not configured")
+    batch_size = int(getattr(settings, "market_data_sync_batch_size", 50))
+    groups: dict[int, list[str]] = {}
+    for symbol in context.symbols:
+        lookback = max(
+            int(minimum_bars),
+            required_history_bars(requests_by_symbol.get(symbol)),
+        )
+        groups.setdefault(lookback, []).append(symbol)
+
+    items: list[Any] = []
+    for lookback, symbols in sorted(groups.items()):
+        for offset in range(0, len(symbols), batch_size):
+            result = await client.sync_daily(
+                symbols=symbols[offset : offset + batch_size],
+                lookback_bars=lookback,
+                end=context.trade_date,
+                adjustment=adjustment,
+            )
+            items.extend(getattr(result, "items", ()))
+    return _summarize_sync_items("daily", items)
+
+
+def _summarize_sync_items(operation: str, items: Iterable[Any]) -> dict[str, Any]:
+    materialized = tuple(items)
+    succeeded = sum(bool(getattr(item, "succeeded", False)) for item in materialized)
+    retryable_symbols = tuple(
+        dict.fromkeys(
+            str(item.symbol)
+            for item in materialized
+            if not getattr(item, "succeeded", False)
+            and getattr(item, "error_code", None)
+            in {"PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "PERSISTENCE_ERROR"}
+        )
+    )
+    permanent_failures = tuple(
+        dict.fromkeys(
+            str(item.symbol)
+            for item in materialized
+            if not getattr(item, "succeeded", False)
+            and str(item.symbol) not in retryable_symbols
+        )
+    )
+    return {
+        "operation": operation,
+        "total": len(materialized),
+        "succeeded": succeeded,
+        "failed": len(materialized) - succeeded,
+        "ok": succeeded == len(materialized),
+        "retryable_symbols": retryable_symbols,
+        "permanent_failures": permanent_failures,
+        "items": materialized,
     }
 
 
@@ -617,7 +682,10 @@ async def resolve_monitored_symbols(session_factory: Any) -> tuple[str, ...]:
     ids = union(watched, alerted).subquery()
     statement = (
         select(Security.symbol)
-        .where(Security.id.in_(select(ids.c.security_id)))
+        .where(
+            Security.id.in_(select(ids.c.security_id)),
+            Security.status == "ACTIVE",
+        )
         .order_by(Security.symbol.asc())
     )
     async with session_factory() as session:

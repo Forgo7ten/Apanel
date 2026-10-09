@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from app.tasks.locks import RENEW_LOCK_SCRIPT, RedisTaskLock
+from app.tasks.locks import RENEW_LOCK_SCRIPT, RedisTaskLock, TaskLockError
 
 
 class FakeRedis:
@@ -12,6 +12,7 @@ class FakeRedis:
         self.value = None
         self.ttl = None
         self.renewals = 0
+        self.fail_renewal = False
 
     async def set(self, _key, value, *, nx, ex):
         assert nx is True
@@ -25,6 +26,8 @@ class FakeRedis:
         if self.value != token:
             return 0
         if script == RENEW_LOCK_SCRIPT:
+            if self.fail_renewal:
+                raise ConnectionError("redis unavailable")
             self.ttl = int(args[0])
             self.renewals += 1
             return 1
@@ -60,3 +63,17 @@ async def test_lock_renewal_never_extends_another_owner() -> None:
     assert await lock.renew() is False
     await lock.release()
     assert redis.value == "new-owner"
+
+
+@pytest.mark.asyncio
+async def test_lock_marks_lease_lost_when_heartbeat_cannot_renew() -> None:
+    redis = FakeRedis()
+    lock = RedisTaskLock(redis, "task", ttl_seconds=1)
+
+    assert await lock.acquire() is True
+    redis.fail_renewal = True
+    await asyncio.wait_for(lock.wait_lost(), timeout=1.0)
+
+    with pytest.raises(TaskLockError, match="lease was lost"):
+        lock.assert_owned()
+    await lock.release()

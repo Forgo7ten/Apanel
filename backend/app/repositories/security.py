@@ -75,7 +75,10 @@ class SecurityRepository:
         pattern = f"%{query}%"
         statement = (
             select(Security)
-            .where(or_(Security.symbol.ilike(pattern), Security.name.ilike(pattern)))
+            .where(
+                Security.status == "ACTIVE",
+                or_(Security.symbol.ilike(pattern), Security.name.ilike(pattern)),
+            )
             .order_by(Security.symbol.asc())
             .limit(limit)
         )

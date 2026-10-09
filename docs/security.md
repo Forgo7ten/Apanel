@@ -47,7 +47,13 @@
 - Webhook 使用 AES-GCM 存入 `user_secrets`，AAD 绑定 user/secret type，数据库不再把新 token 明文写进 `user_settings.settings`。
 - `python -m app.cli migrate-user-secrets` 可把遗留 JSON 明文迁移到加密表；迁移前 NotificationService 保留只读 legacy fallback，迁移完成后应审计并清除所有旧值。
 - 迁移后运行 `python -m app.cli audit-user-secrets`；只有输出 `legacy_plaintext=0` 且 `release_b_ready=yes` 时，才把 `LEGACY_WEBHOOK_FALLBACK_ENABLED=false` 部署到 Backend/Worker，进入 Release B。审计只输出计数，不输出 URL/token。
-- `APP_SECRETS_KEY_VERSION` 用于记录密钥版本；轮换时把旧版本 key 通过 `APP_SECRETS_PREVIOUS_KEYS` JSON 映射提供给 Backend/Worker，再切换当前 key。历史 ciphertext 会按 `user_secrets.key_version` 选择解密 key；完成重加密后再移除旧 key。
+- `APP_SECRETS_KEY_VERSION` 用于记录密钥版本；轮换时把旧版本 key 通过 `APP_SECRETS_PREVIOUS_KEYS` JSON 映射提供给 Backend/Worker，再切换当前 key。历史 ciphertext 会按 `user_secrets.key_version` 选择解密 key；完成重加密后再移除旧 key。生产 Backend/Worker 会在启动期校验 current/previous key 的 URL-safe base64、32-byte 长度、JSON 结构和版本唯一性；previous key 不允许重复当前版本，错误配置直接 fail-fast。
+
+## 通知投递语义
+
+飞书 Webhook 当前采用 **at-least-once（至少一次）** 投递语义，而不是 exactly-once。`PENDING` outbox 会等待超过 provider timeout 与恢复窗口后才允许恢复发送，数据库 row lock 可以避免多个恢复 worker 同时重复 POST；但如果外部 Webhook 已返回成功、worker 却在 terminal DB commit 前崩溃，数据库无法证明外部是否已经收到该消息，后续恢复可能再次发送。
+
+Apanel 不会通过“发送前先标记 SENT”来伪造 exactly-once，因为那会把重复风险换成永久漏通知。Notification 内容保留稳定 `event_id`，供诊断以及未来接入支持幂等键的通知网关时使用。
 
 ## 内部行情接口
 

@@ -219,6 +219,39 @@ async def test_dividend_yield_uses_newer_daily_close_over_stale_quote(dividend_c
     assert result.as_of == datetime(2026, 9, 24, 0, 0, tzinfo=UTC)
 
 
+@pytest.mark.asyncio
+async def test_dividend_yield_prefers_same_day_daily_close_over_intraday_quote(
+    dividend_context,
+) -> None:
+    _, session_factory, _ = dividend_context
+    async with session_factory() as session:
+        security = await session.get(Security, 1)
+        assert security is not None
+        session.add(
+            DailyBar(
+                security_id=security.id,
+                trade_date=date(2026, 9, 23),
+                open=Decimal("55"),
+                high=Decimal("56"),
+                low=Decimal("54"),
+                close=Decimal("55.00"),
+                volume=Decimal("100"),
+                amount=Decimal("5500"),
+                adjust_type="none",
+            )
+        )
+        await session.commit()
+        service = DividendYieldService(SecurityRepository(session))
+
+        single = await service.calculate_for_security(security.id)
+        batch = await service.calculate_for_securities((security.id,))
+
+    assert single.price == Decimal("55.00")
+    assert single.price_source == "DAILY_BAR_CLOSE"
+    assert batch[security.id].price == Decimal("55.00")
+    assert batch[security.id].price_source == "DAILY_BAR_CLOSE"
+
+
 async def test_dividend_yield_api_prefers_quote_and_returns_explanation(dividend_context) -> None:
     client, _, _ = dividend_context
     response = await client.get("/api/v1/securities/600519/dividend-yield")

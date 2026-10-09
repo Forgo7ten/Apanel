@@ -104,7 +104,7 @@ BOLL 突破状态还需要当前和上一交易日价格；缺少价格时返回
 
 ## 计算需求与持久化边界
 
-实际计算需求不是一套全局固定参数，而是 Watch Table 列、enabled VALUE Alert 和 enabled STATE Alert 的并集。新增自定义 RSI/BOLL/MACD 参数或 MA state 周期组合后，bootstrap/EOD 会把对应 variant 纳入计算；`parameter_key` 用于稳定区分同一 indicator type 的多个参数组合。
+实际计算需求不是一套全局固定参数，而是 Watch Table 列、enabled VALUE Alert 和 enabled STATE Alert 的并集。新增自定义 RSI/BOLL/MACD 参数或 MA state 周期组合后，bootstrap/EOD 会把对应 variant 纳入计算；`parameter_key` 用于稳定区分同一 indicator type 的多个参数组合。MA 不再把所有用户、所有表格的独立周期合成一个全局大 bundle：单周期数值列、明确的两周期状态组合和多周期数值列都按精确参数保持独立 variant，避免状态请求因为被更大数值 bundle 覆盖而丢失。StateService 只对明确的两周期 MA variant（以及遗留大 bundle 中的默认 MA5/10）物化 MA pair 状态，避免无关 MA 数值列产生 O(n²) 状态组合。
 
 内置指标使用 `calculate_series()` 线性遍历历史序列；StateService 直接消费已物化 snapshot，不再重复触发 IndicatorService 全历史重算。GET `/indicators*` 与 `/states*` 都是只读读取，缺数据应由后台 bootstrap/EOD 修复，而不是由 HTTP GET 隐式写库。
 

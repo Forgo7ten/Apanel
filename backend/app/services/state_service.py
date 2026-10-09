@@ -7,13 +7,17 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date
-from itertools import combinations
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
-from app.indicators.parameters import IndicatorVariant, select_snapshot_variant, snapshot_variants
+from app.indicators.parameters import (
+    DEFAULT_MA_PERIODS,
+    IndicatorVariant,
+    select_snapshot_variant,
+    snapshot_variants,
+)
 from app.models import (
     IndicatorSnapshot as IndicatorSnapshotModel,
 )
@@ -407,13 +411,27 @@ def _state_variant_pairs(
     current_variants = snapshot_variants(current_model)
     previous_variants = snapshot_variants(previous_model) if previous_model is not None else ()
     if indicator_type == "MA":
+        emitted: set[tuple[int, int]] = set()
         for current_variant in current_variants:
             periods = current_variant.parameters.get("periods")
             if not isinstance(periods, list):
                 one = current_variant.parameters.get("period")
                 periods = [one] if one is not None else []
             normalized_periods = sorted({int(period) for period in periods})
-            for short, long in combinations(normalized_periods, 2):
+            pairs: tuple[tuple[int, int], ...]
+            if len(normalized_periods) == 2:
+                pairs = ((normalized_periods[0], normalized_periods[1]),)
+            elif set(DEFAULT_MA_PERIODS).issubset(normalized_periods):
+                # Legacy snapshots may contain one merged MA bundle.  Preserve
+                # the built-in MA5/10 state without recreating every possible
+                # cross-product from unrelated numeric MA columns.
+                pairs = ((DEFAULT_MA_PERIODS[0], DEFAULT_MA_PERIODS[1]),)
+            else:
+                pairs = ()
+            for short, long in pairs:
+                if (short, long) in emitted:
+                    continue
+                emitted.add((short, long))
                 params = {"short_period": short, "long_period": long}
                 current = _project_ma_pair(current_variant, short, long)
                 previous = _find_ma_pair(previous_variants, short, long)

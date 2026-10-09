@@ -1,5 +1,7 @@
 """Runtime configuration for the backend service."""
 
+import base64
+import json
 from functools import lru_cache
 from urllib.parse import unquote, urlsplit
 
@@ -198,10 +200,35 @@ class Settings(BaseSettings):
             )
 
     def validate_notification_credentials(self) -> None:
-        """Require the user-secret master key only in processes that handle secrets."""
+        """Fail fast on malformed user-secret key rotation configuration."""
 
-        if self.app_env.casefold() == "production" and not self.app_secrets_key:
+        if self.app_env.casefold() != "production":
+            return
+        if not self.app_secrets_key:
             raise ValueError("Production requires APP_SECRETS_KEY for encrypted user secrets.")
+        _decode_secret_key(self.app_secrets_key, "APP_SECRETS_KEY")
+        current_version = self.app_secrets_key_version.strip()
+        if not current_version:
+            raise ValueError("APP_SECRETS_KEY_VERSION must not be empty.")
+        if not self.app_secrets_previous_keys:
+            return
+        try:
+            payload = json.loads(self.app_secrets_previous_keys)
+        except Exception as exc:
+            raise ValueError("APP_SECRETS_PREVIOUS_KEYS must be a JSON object.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("APP_SECRETS_PREVIOUS_KEYS must be a JSON object.")
+        for version, encoded in payload.items():
+            normalized_version = str(version).strip()
+            if not normalized_version:
+                raise ValueError("Previous secret key versions must not be empty.")
+            if normalized_version == current_version:
+                raise ValueError(
+                    "APP_SECRETS_PREVIOUS_KEYS must not redefine the current key version."
+                )
+            if not isinstance(encoded, str):
+                raise ValueError("Previous secret keys must be URL-safe base64 strings.")
+            _decode_secret_key(encoded, f"APP_SECRETS_PREVIOUS_KEYS[{normalized_version}]")
 
     def validate_market_data_credentials(self) -> None:
         """Require the shared Hub token in production processes that call sync APIs."""
@@ -221,6 +248,18 @@ class Settings(BaseSettings):
 
         self.validate_database_credentials()
         self.validate_auth_credentials()
+
+
+def _decode_secret_key(value: str, name: str) -> bytes:
+    try:
+        raw = value.encode("ascii")
+        raw += b"=" * (-len(raw) % 4)
+        decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
+    except Exception as exc:
+        raise ValueError(f"{name} must be URL-safe base64.") from exc
+    if len(decoded) != 32:
+        raise ValueError(f"{name} must decode to exactly 32 bytes.")
+    return decoded
 
 
 @lru_cache(maxsize=1)

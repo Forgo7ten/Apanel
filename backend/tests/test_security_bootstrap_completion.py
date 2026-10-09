@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -71,6 +71,26 @@ async def test_bootstrap_requires_dividend_sync_before_completion(monkeypatch) -
         )
 
     assert client.daily_calls[0]["end"] == date(2026, 9, 23)
+
+
+
+
+def test_ad_hoc_bootstrap_never_admits_current_day_by_clock_time(monkeypatch) -> None:
+    class BeforeCutoff(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 24, 15, 19, tzinfo=tz)
+
+    class AfterCutoff(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 24, 15, 21, tzinfo=tz)
+
+    settings = Settings(timezone="Asia/Shanghai", eod_pipeline_hour=15, eod_pipeline_minute=20)
+    monkeypatch.setattr(jobs, "datetime", BeforeCutoff)
+    assert jobs._bootstrap_completed_through(settings) == date(2026, 9, 23)
+    monkeypatch.setattr(jobs, "datetime", AfterCutoff)
+    assert jobs._bootstrap_completed_through(settings) == date(2026, 9, 23)
 
 
 class _FakeLock:

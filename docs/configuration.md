@@ -51,7 +51,7 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | `LEGACY_WEBHOOK_FALLBACK_ENABLED` | `true` | Release A 兼容开关；完成迁移审计后可设为 `false` 禁用 legacy JSON 明文读取 |
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | `open.feishu.cn,open.larksuite.com` | 飞书/Lark Webhook hostname allowlist |
 
-Compose 只把 `APP_SECRETS_KEY*` 注入 `backend` 与 `worker`。`scheduler`、`frontend`、`market-data-hub` 和 `security-bootstrap` 不需要也不应获得该密钥。生产 API 启动时若缺少 master key 会失败。
+Compose 只把 `APP_SECRETS_KEY*` 注入 `backend` 与 `worker`。`scheduler`、`frontend`、`market-data-hub` 和 `security-bootstrap` 不需要也不应获得该密钥。生产 Backend/Worker 会在启动时校验 current/previous key 的 URL-safe base64、解码后 32-byte 长度、previous JSON 结构和版本唯一性；`APP_SECRETS_PREVIOUS_KEYS` 不得包含与 `APP_SECRETS_KEY_VERSION` 相同的版本。错误配置会直接阻止进程启动，而不是延迟到发送 Webhook 时才暴露。
 
 ## 基础设施超时
 

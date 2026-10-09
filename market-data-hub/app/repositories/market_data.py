@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -55,11 +55,23 @@ class SecurityRepository(Protocol):
 
     async def upsert_many(self, records: Sequence[Security]) -> None: ...
 
+    async def reconcile_snapshot(self, records: Sequence[Security]) -> None: ...
+
 
 class DailyBarRepository(Protocol):
     """Repository seam consumed by daily-bar synchronization services."""
 
     async def upsert_many(self, records: Sequence[DailyBar]) -> None: ...
+
+    async def reconcile_revision(
+        self,
+        symbol: str,
+        records: Sequence[DailyBar],
+        *,
+        adjustment: Adjustment | str,
+        coverage_start: date,
+        coverage_end: date,
+    ) -> None: ...
 
     async def list_by_symbol(
         self,
@@ -83,10 +95,6 @@ class DividendRepository(Protocol):
     """Repository seam consumed by dividend synchronization and reads."""
 
     async def upsert_many(self, records: Sequence[Dividend]) -> None: ...
-
-    async def replace_for_symbol(
-        self, symbol: str, records: Sequence[Dividend]
-    ) -> None: ...
 
     async def list_by_symbol(
         self,
@@ -239,22 +247,48 @@ class SqlAlchemySecurityRepository:
         )
 
     async def upsert_many(self, records: Sequence[Security]) -> None:
-        records = tuple(records)
+        records = self._validated_records(records)
         if not records:
             return
-        if any(not isinstance(record, Security) for record in records):
-            raise PersistenceRecordError("security repository received an invalid record")
-        records = _unique_records(records, key=lambda record: record.symbol)
-        parameters_per_record = len(_security_values(records[0]))
-        batch_size = max(1, _ASYNCPG_MAX_BIND_PARAMETERS // parameters_per_record)
         async with self._session_factory() as session:
             async with session.begin():
-                # asyncpg rejects prepared statements with more than 32,767
-                # bind arguments. Keep the full-universe sync atomic while
-                # executing bounded statements inside the same transaction.
-                for offset in range(0, len(records), batch_size):
-                    batch = records[offset : offset + batch_size]
-                    await session.execute(self.build_upsert_statement(batch))
+                await self._upsert_in_session(session, records)
+
+    async def reconcile_snapshot(self, records: Sequence[Security]) -> None:
+        """Persist one authoritative universe and inactivate missing symbols atomically."""
+
+        records = self._validated_records(records)
+        if not records:
+            raise PersistenceRecordError("security snapshot must not be empty")
+        active_symbols = tuple(record.symbol for record in records)
+        async with self._session_factory() as session:
+            async with session.begin():
+                await self._upsert_in_session(session, records)
+                await session.execute(
+                    update(SecurityModel)
+                    .where(
+                        SecurityModel.status == "ACTIVE",
+                        SecurityModel.symbol.not_in(active_symbols),
+                    )
+                    .values(status="INACTIVE")
+                )
+
+    def _validated_records(self, records: Sequence[Security]) -> tuple[Security, ...]:
+        records = tuple(records)
+        if any(not isinstance(record, Security) for record in records):
+            raise PersistenceRecordError("security repository received an invalid record")
+        return _unique_records(records, key=lambda record: record.symbol)
+
+    async def _upsert_in_session(
+        self, session: AsyncSession, records: Sequence[Security]
+    ) -> None:
+        parameters_per_record = len(_security_values(records[0]))
+        batch_size = max(1, _ASYNCPG_MAX_BIND_PARAMETERS // parameters_per_record)
+        # asyncpg rejects prepared statements with more than 32,767 bind
+        # arguments. Keep reconciliation atomic while executing bounded SQL.
+        for offset in range(0, len(records), batch_size):
+            batch = records[offset : offset + batch_size]
+            await session.execute(self.build_upsert_statement(batch))
 
     async def get_by_symbol(self, symbol: str) -> Security | None:
         canonical_symbol = normalize_symbol(symbol)
@@ -293,27 +327,79 @@ class SqlAlchemyDailyBarRepository:
         )
 
     async def upsert_many(self, records: Sequence[DailyBar]) -> None:
-        records = tuple(records)
+        records = self._validated_records(records)
         if not records:
             return
-        if any(not isinstance(record, DailyBar) for record in records):
-            raise PersistenceRecordError("daily-bar repository received an invalid record")
-        records = _unique_records(
-            records,
-            key=lambda record: (record.symbol, record.trade_date, record.adjustment),
-        )
         symbols = tuple(dict.fromkeys(record.symbol for record in records))
         async with self._session_factory() as session:
             async with session.begin():
                 security_ids = await _security_ids(session, symbols)
+                await self._upsert_in_session(session, records, security_ids)
+
+    async def reconcile_revision(
+        self,
+        symbol: str,
+        records: Sequence[DailyBar],
+        *,
+        adjustment: Adjustment | str,
+        coverage_start: date,
+        coverage_end: date,
+    ) -> None:
+        """Replace the prior qfq revision inside its known coverage atomically."""
+
+        canonical = normalize_symbol(symbol)
+        selected = normalize_adjustment(adjustment)
+        records = self._validated_records(records)
+        if not records:
+            raise PersistenceRecordError("revised daily-bar snapshot must not be empty")
+        if any(
+            record.symbol != canonical or record.adjustment is not selected for record in records
+        ):
+            raise PersistenceRecordError("revised daily-bar snapshot does not match target")
+        if coverage_start > coverage_end:
+            raise PersistenceRecordError("daily-bar revision coverage is invalid")
+        async with self._session_factory() as session:
+            async with session.begin():
+                security_ids = await _security_ids(session, (canonical,))
+                await self._upsert_in_session(session, records, security_ids)
+                dates = tuple(record.trade_date for record in records)
                 await session.execute(
-                    self.build_upsert_statement(
-                        [
-                            {"security_id": security_ids[record.symbol], "record": record}
-                            for record in records
-                        ]
+                    delete(DailyBarModel).where(
+                        DailyBarModel.security_id == security_ids[canonical],
+                        DailyBarModel.adjust_type == selected.value,
+                        DailyBarModel.trade_date >= coverage_start,
+                        DailyBarModel.trade_date <= coverage_end,
+                        DailyBarModel.trade_date.not_in(dates),
                     )
                 )
+
+    def _validated_records(self, records: Sequence[DailyBar]) -> tuple[DailyBar, ...]:
+        records = tuple(records)
+        if any(not isinstance(record, DailyBar) for record in records):
+            raise PersistenceRecordError("daily-bar repository received an invalid record")
+        return _unique_records(
+            records,
+            key=lambda record: (record.symbol, record.trade_date, record.adjustment),
+        )
+
+    async def _upsert_in_session(
+        self,
+        session: AsyncSession,
+        records: Sequence[DailyBar],
+        security_ids: dict[str, int],
+    ) -> None:
+        parameters_per_record = len(_daily_values(security_ids[records[0].symbol], records[0]))
+        batch_size = max(1, _ASYNCPG_MAX_BIND_PARAMETERS // parameters_per_record)
+        for offset in range(0, len(records), batch_size):
+            batch = records[offset : offset + batch_size]
+            await session.execute(
+                self.build_upsert_statement(
+                    [
+                        {"security_id": security_ids[record.symbol], "record": record}
+                        for record in batch
+                    ]
+                )
+            )
 
     async def list_by_symbol(
         self,
@@ -432,37 +518,6 @@ class SqlAlchemyDividendEventRepository:
                         ]
                     )
                 )
-
-    async def replace_for_symbol(
-        self, symbol: str, records: Sequence[Dividend]
-    ) -> None:
-        """Reconcile one provider snapshot, including removed historical events."""
-
-        canonical = normalize_symbol(symbol)
-        records = _unique_records(tuple(records), key=lambda record: (record.symbol, record.date))
-        if any(not isinstance(record, Dividend) for record in records):
-            raise PersistenceRecordError("dividend repository received an invalid record")
-        if any(record.symbol != canonical for record in records):
-            raise PersistenceRecordError("dividend repository received a mismatched symbol")
-        async with self._session_factory() as session:
-            async with session.begin():
-                security_id = (await _security_ids(session, (canonical,)))[canonical]
-                if records:
-                    await session.execute(
-                        self.build_upsert_statement(
-                            [
-                                {"security_id": security_id, "record": record}
-                                for record in records
-                            ]
-                        )
-                    )
-                statement = delete(DividendEventModel).where(
-                    DividendEventModel.security_id == security_id
-                )
-                dates = tuple(record.date for record in records)
-                if dates:
-                    statement = statement.where(DividendEventModel.date.not_in(dates))
-                await session.execute(statement)
 
     async def list_by_symbol(
         self,

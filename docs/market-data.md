@@ -31,7 +31,7 @@ Hub 不再要求每个 Provider 实现一个“大而全”的 `MarketDataProvid
 
 `ProviderRouting` 在应用启动时解析并校验每个 capability 的实际 Provider。v1 中 Quote、Daily Bar、Dividend 都固定到 `eltdx`；Security Master 使用 eltdx 主源 + AKShare 整批 fallback。
 
-证券 universe 仍以 eltdx 为主：eltdx 失败或返回空批次时才使用 AKShare 完整批次 fallback。对于疑似受到 TDX 代码表字段宽度截断的 ETF 名称，Hub 会 best-effort 读取 AKShare 完整批次，并且只在 market/type 都一致的同一 symbol 上采用更长的显示名称；不会借此增加、删除或替换 eltdx 的证券 universe。名称补全失败时仍返回 eltdx 批次。
+证券 universe 仍以 eltdx 为主：eltdx 失败或返回空批次时才使用 AKShare 完整批次 fallback。成功的 Security Master 批次视为 authoritative snapshot：本批次仍存在的证券会 upsert 为 `ACTIVE`，此前存在但本批次缺失的证券只标记为 `INACTIVE`，不会物理删除历史记录。对于疑似受到 TDX 代码表字段宽度截断的 ETF 名称，Hub 会 best-effort 读取 AKShare 完整批次，并且只在 market/type 都一致的同一 symbol 上采用更长的显示名称；不会借此增加或替换 eltdx 的证券 universe。名称补全失败时仍返回 eltdx 批次。
 
 ## eltdx 生命周期
 
@@ -76,9 +76,9 @@ client.bars.get(
 
 `KlineBar.volume_lots` 写入 Apanel `DailyBar.volume`，`amount` 写入成交额。Hub 会校验返回的 `adjust_mode` 与请求一致。Quote 使用 `get_snapshots([...])` 原生批量能力；Daily Bar 正常 EOD 使用小 `count`，历史 bootstrap 使用需求驱动的 `lookback_bars`，不再为单日同步遍历固定 64 页。
 
-Hub 还保存每只证券的 qfq corporate-action revision hash。revision 变化时会重新获取已有 coverage 对应的 qfq 历史，并在同步 item 中返回 `history_rebased/changed_from`，Backend 从变化起点重建指标/状态。
+Hub 还保存每只证券的 qfq corporate-action revision hash。revision 变化时会重新获取已有 coverage 对应的 qfq 历史，并在同一事务内对账该 coverage：新结果 upsert，provider 在新 revision 下不再返回的旧 qfq 日期会删除。同步 item 返回 `history_rebased/changed_from`，Backend 从变化起点重建指标/状态。
 
-技术指标仍属于 Backend。MA、Projected MA、RSI、KDJ、BOLL、MACD 都按 `qfq` / `none` 独立物化；盘中 Quote 不参与日线指标重算。正常 EOD 按目标日期请求一个受限 count，再在 Hub 端过滤目标范围；首次 bootstrap 按 `lookback_bars` 拉取需求驱动的历史长度。
+技术指标仍属于 Backend。MA、Projected MA、RSI、KDJ、BOLL、MACD 都按 `qfq` / `none` 独立物化；盘中 Quote 不参与日线指标重算。正常 EOD 会按每只证券当前指标需求重新拉取最新所需的实际交易 K 线窗口，并以目标交易日作为上界；这样可以自动补回此前同步失败造成的历史缺口，同时不会把停牌这种合法的日历空档误判成缺失数据。首次 bootstrap 同样按 `lookback_bars` 拉取需求驱动的历史长度；API/配置触发的 ad-hoc bootstrap 永远把上界放在本地今天之前，只有正常 EOD 流水线负责物化当日已完成的日线 observation。
 
 ## 现金分红
 
@@ -96,7 +96,7 @@ Dividend.cash_amount = 每股现金金额
 cash_per_share = c1_value / 10
 ```
 
-零现金记录和非现金分红 category 会被忽略；同一日期多条现金分红在 Adapter 内聚合。Backend 的 TTM Dividend Yield 继续按“过去 12 个月实际每股现金派息总额 / 当前价格”计算。
+零现金记录和非现金分红 category 会被忽略；同一日期多条现金分红在 Adapter 内聚合。eltdx 当前接口没有携带“完整历史快照”证明，因此普通分红同步只做幂等 upsert，不会因为一次成功但不完整/空响应而删除历史事件。Backend 的 TTM Dividend Yield 继续按“过去 12 个月实际每股现金派息总额 / 当前价格”计算。
 
 ## AKShare fallback
 
@@ -113,7 +113,7 @@ eltdx 的 TDX 7709 使用原生 TCP；本项目不通过运行时代理环境变
 
 Quote 通过 eltdx `get_snapshots([...])` 原生批量获取；Daily Bar 通过批量 codes + `count` 获取；Dividend 等无原生批量能力的路径使用有界并发。Backend 在调用 Hub 前再按 `MARKET_DATA_SYNC_BATCH_SIZE` chunk，因此不会把用户监控 universe 直接塞进一个无限大请求。
 
-同步结果保留逐证券 `SyncItemResult`。单只证券停牌、无目标 bar 或业务校验失败不会抹掉同批其他证券的成功结果；transport/provider 不可用等 retryable failure 才会驱动 Celery 重试策略。
+同步结果保留逐证券 `SyncItemResult`。单只证券停牌、无目标 bar 或业务校验失败不会抹掉同批其他证券的成功结果；transport/provider 不可用等 retryable failure 才会驱动 Celery 重试策略。Daily Bar PostgreSQL 写入还会按 asyncpg 32,767 bind 参数上限继续拆 SQL 批次，但保持在同一事务内。
 
 ## 同步与持久化
 

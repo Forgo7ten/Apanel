@@ -18,13 +18,16 @@ from app.indicators.parameters import (
     MAX_INDICATOR_PERIOD,
     MAX_MA_PERIODS,
     canonicalize_parameters,
+    merge_indicator_requests,
     parameter_key,
+    required_history_bars,
     select_snapshot_variant,
     snapshot_variants,
 )
 from app.models import (
     DailyBar,
     IndicatorSnapshot,
+    IndicatorState,
     Security,
     TableColumn,
     TradingCalendar,
@@ -71,6 +74,40 @@ def test_indicator_periods_are_bounded_by_market_data_bootstrap_contract() -> No
 def test_ma_period_count_is_bounded_to_avoid_quadratic_state_explosion() -> None:
     with pytest.raises(ApiError, match=str(MAX_MA_PERIODS)):
         canonicalize_parameters("MA", {"periods": list(range(1, MAX_MA_PERIODS + 2))})
+
+
+
+
+def test_distributed_ma_requests_do_not_collapse_into_one_oversized_bundle() -> None:
+    merged = merge_indicator_requests(
+        [("MA", {"period": period}) for period in range(1, 34)]
+    )
+    ma_requests = [item for item in merged if item.indicator_type == "MA"]
+
+    assert max(len(item.parameters["periods"]) for item in ma_requests) <= MAX_MA_PERIODS
+    assert {
+        period
+        for item in ma_requests
+        for period in item.parameters["periods"]
+    } >= set(range(1, 34))
+    assert required_history_bars(merged) >= 33
+
+
+def test_explicit_ma_pair_survives_when_wider_numeric_bundle_contains_it() -> None:
+    merged = merge_indicator_requests(
+        [
+            ("MA", {"periods": [5, 20]}),
+            ("MA", {"periods": [5, 10, 20]}),
+        ]
+    )
+
+    ma_parameters = {
+        tuple(item.parameters["periods"])
+        for item in merged
+        if item.indicator_type == "MA"
+    }
+    assert (5, 20) in ma_parameters
+    assert (5, 10, 20) in ma_parameters
 
 
 @pytest_asyncio.fixture
@@ -126,6 +163,30 @@ async def multi_parameter_context(
     await engine.dispose()
 
 
+
+
+async def test_many_independent_ma_columns_do_not_create_cross_product_states(
+    multi_parameter_context,
+) -> None:
+    requests = [("MA", {"period": period}) for period in range(1, 34)]
+    async with multi_parameter_context() as session:
+        await IndicatorService(session).calculate("600519", requests=requests)
+        await StateService(session).calculate("600519")
+        states = list(
+            (
+                await session.execute(
+                    select(IndicatorState).where(IndicatorState.indicator_type == "MA")
+                )
+            ).scalars()
+        )
+
+    assert states
+    assert {
+        (item.parameters["short_period"], item.parameters["long_period"])
+        for item in states
+    } == {(5, 10)}
+
+
 async def test_calculation_persists_one_v2_row_per_type_with_all_requested_variants(
     multi_parameter_context,
 ) -> None:
@@ -156,8 +217,10 @@ async def test_calculation_persists_one_v2_row_per_type_with_all_requested_varia
         rsi = next(item for item in latest_rows if item.indicator_type == "RSI")
         boll = next(item for item in latest_rows if item.indicator_type == "BOLL")
         assert ma.parameters["_format"] == 2
-        assert len(ma.parameters["variants"]) == 1
-        assert list(ma.parameters["variants"].values())[0] == {"periods": [5, 10, 20]}
+        assert len(ma.parameters["variants"]) == 3
+        assert {
+            tuple(value["periods"]) for value in ma.parameters["variants"].values()
+        } == {(5, 10), (5,), (20,)}
         assert len(rsi.parameters["variants"]) == 2
         assert len(boll.parameters["variants"]) == 2
         assert set(rsi.values) == set(rsi.parameters["variants"])
@@ -254,10 +317,12 @@ async def test_pipeline_collects_column_parameters_and_keeps_default_requests() 
         item.indicator_type == "BOLL" and item.parameters == {"period": 20, "multiplier": 3.0}
         for item in collected["600519"]
     )
-    assert any(
-        item.indicator_type == "MA" and item.parameters == {"periods": [5, 10, 20]}
+    ma_parameters = {
+        tuple(item.parameters["periods"])
         for item in collected["600000"]
-    )
+        if item.indicator_type == "MA"
+    }
+    assert ma_parameters == {(5, 10), (20,)}
 
 
 def test_alert_target_selects_the_exact_parameter_variant() -> None:

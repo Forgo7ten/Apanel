@@ -108,6 +108,8 @@ class AlertService:
         security = await self.session.get(Security, payload.security_id)
         if security is None:
             raise ApiError("SECURITY_NOT_FOUND", "Security was not found.", 404)
+        if security.status != "ACTIVE":
+            raise ApiError("SECURITY_INACTIVE", "Security is not active.", 409)
         fields = _condition_fields(
             condition_type=payload.condition_type,
             state_id=payload.state_id,
@@ -152,6 +154,8 @@ class AlertService:
         security = await self.session.get(Security, security_id)
         if security is None:
             raise ApiError("SECURITY_NOT_FOUND", "Security was not found.", 404)
+        if security.status != "ACTIVE":
+            raise ApiError("SECURITY_INACTIVE", "Security is not active.", 409)
         condition_type = updates.get("condition_type", rule.condition_type)
         if "state_id" in updates and "state_code" not in updates:
             state_id, state_code = updates["state_id"], None

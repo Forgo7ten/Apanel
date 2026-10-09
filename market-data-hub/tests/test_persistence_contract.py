@@ -252,3 +252,68 @@ async def test_security_sync_rolls_back_a_real_sqlalchemy_batch_on_a_later_const
     with engine.connect() as connection:
         assert connection.execute(select(SecurityModel)).all() == []
     engine.dispose()
+
+
+async def test_daily_repository_chunks_large_batches_below_asyncpg_bind_limit() -> None:
+    class Result:
+        def all(self):
+            return [(index + 1, str(600000 + index)) for index in range(10)]
+
+    class DailyRecordingSession(RecordingSession):
+        async def execute(self, statement):
+            self.statements.append(statement)
+            if getattr(statement, "is_select", False):
+                return Result()
+            return None
+
+    session = DailyRecordingSession()
+    repository = SqlAlchemyDailyBarRepository(RecordingSessionFactory(session))
+    records = [
+        DailyBar(
+            symbol=str(600000 + symbol_index),
+            trade_date=date(2026, 1, 1 + day_index),
+            open=Decimal("10"),
+            high=Decimal("11"),
+            low=Decimal("9"),
+            close=Decimal("10.5"),
+            volume=Decimal("100"),
+            adjustment=Adjustment.QFQ,
+        )
+        for symbol_index in range(10)
+        for day_index in range(20)
+    ]
+
+    await repository.upsert_many(records)
+
+    writes = [
+        statement
+        for statement in session.statements
+        if not getattr(statement, "is_select", False)
+    ]
+    assert writes
+    assert all(
+        len(statement.compile(dialect=postgresql.dialect()).params) <= 32767
+        for statement in writes
+    )
+
+
+async def test_security_reconcile_marks_missing_active_symbols_inactive() -> None:
+    session = RecordingSession()
+    repository = SqlAlchemySecurityRepository(RecordingSessionFactory(session))
+
+    await repository.reconcile_snapshot(
+        [
+            Security(
+                symbol="600519",
+                name="贵州茅台",
+                market="SH",
+                security_type="STOCK",
+            )
+        ]
+    )
+
+    assert len(session.statements) == 2
+    update_sql = str(session.statements[1].compile(dialect=postgresql.dialect()))
+    assert update_sql.startswith("UPDATE securities SET status=")
+    assert "securities.status =" in update_sql
+    assert "securities.symbol NOT IN" in update_sql

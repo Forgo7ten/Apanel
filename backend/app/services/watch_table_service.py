@@ -357,6 +357,8 @@ class WatchTableService:
         security = await self.security_repository.get_by_id(security_id)
         if security is None:
             raise ApiError("SECURITY_NOT_FOUND", "Security was not found.", 404)
+        if security.status != "ACTIVE":
+            raise ApiError("SECURITY_INACTIVE", "Security is not active.", 409)
         if await self.repository.find_symbol(table.id, security.id) is not None:
             raise ApiError("WATCH_STOCK_EXISTS", "Security is already in this watch table.", 409)
         membership = WatchTableSymbol(

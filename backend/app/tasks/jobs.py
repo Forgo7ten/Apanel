@@ -34,7 +34,7 @@ from .contracts import (
     PipelineError,
     PipelineRetryableDataError,
 )
-from .locks import RedisTaskLock
+from .locks import RedisTaskLock, TaskLockError
 from .pipeline import (
     EODPipeline,
     build_default_eod_steps,
@@ -52,6 +52,9 @@ class ScheduledTaskError(RuntimeError):
         super().__init__(f"scheduled task failed: {operation}")
 
 
+CALENDAR_ACTUAL_BACKFILL_DAYS = 14
+
+
 class ScheduledTaskRetry(RuntimeError):
     """Safe error stored in Celery retry metadata."""
 
@@ -65,17 +68,17 @@ def _today(settings: Settings) -> date:
 
 
 def _bootstrap_completed_through(settings: Settings) -> date:
-    """Return the newest date safe for ad-hoc historical bootstrap.
+    """Keep ad-hoc bootstrap strictly behind the current local date.
 
-    API-triggered bootstrap can run while the market is open.  Reuse the EOD
-    stable-data cutoff so the current forming daily bar is never materialized
-    into technical indicators before the normal end-of-day pipeline.
+    A clock time cannot prove that the provider's current-day bar is final.
+    The EOD pipeline is the only path allowed to materialize today's daily
+    observation; ad-hoc bootstrap always caps provider history before today.
+    On weekends/holidays the provider cutoff naturally resolves to the most
+    recent traded bar before that date.
     """
 
     now = datetime.now(ZoneInfo(settings.timezone))
-    current_minutes = now.hour * 60 + now.minute
-    eod_minutes = settings.eod_pipeline_hour * 60 + settings.eod_pipeline_minute
-    return now.date() if current_minutes >= eod_minutes else now.date() - timedelta(days=1)
+    return now.date() - timedelta(days=1)
 
 
 def _new_session_factory(settings: Settings) -> tuple[Any, async_sessionmaker[AsyncSession]]:
@@ -106,6 +109,40 @@ def _ensure_ok(value: Any, operation: str) -> dict[str, Any]:
     if result.get("ok") is not True:
         raise PipelineError(f"{operation} did not complete")
     return result
+
+
+async def _run_with_lock_lease(lock: Any, operation: Any) -> Any:
+    """Cancel protected work immediately when a renewable lease is lost."""
+
+    wait_lost = getattr(lock, "wait_lost", None)
+    if not callable(wait_lost):
+        return await operation
+    operation_task = asyncio.create_task(operation)
+    lost_task = asyncio.create_task(wait_lost())
+    try:
+        done, _pending = await asyncio.wait(
+            {operation_task, lost_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done:
+            result = await operation_task
+            _assert_lock_owned(lock)
+            return result
+        operation_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await operation_task
+        raise TaskLockError("task lock lease was lost")
+    finally:
+        if not lost_task.done():
+            lost_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lost_task
+
+
+def _assert_lock_owned(lock: Any) -> None:
+    check = getattr(lock, "assert_owned", None)
+    if callable(check):
+        check()
 
 
 async def _close_optional(value: Any) -> None:
@@ -143,16 +180,27 @@ async def _validate_missing_calendar_date(
             daily_timeout_seconds=settings.market_data_daily_timeout_seconds,
             bootstrap_timeout_seconds=settings.market_data_bootstrap_timeout_seconds,
         )
+    target_status = "UNKNOWN"
     try:
-        validation = await client.validate_calendar(trade_date=trade_date)
+        # Backfill a bounded actual-calendar window so StateService can prove
+        # continuity across weekends/holidays after an annual seed gap.  This
+        # path runs only when the local target date itself is unavailable.
+        start = trade_date - timedelta(days=CALENDAR_ACTUAL_BACKFILL_DAYS)
+        for offset in range(CALENDAR_ACTUAL_BACKFILL_DAYS + 1):
+            candidate = start + timedelta(days=offset)
+            validation = await client.validate_calendar(trade_date=candidate)
+            status = str(validation.get("status", "UNKNOWN")).upper()
+            if status not in {"OPEN", "CLOSED"}:
+                raise PipelineConfigurationError(
+                    "trading calendar actual validation is unknown"
+                )
+            if candidate == trade_date:
+                target_status = status
     finally:
         if owns_client:
             with suppress(Exception):
                 await _close_optional(client)
-    status = str(validation.get("status", "UNKNOWN")).upper()
-    if status not in {"OPEN", "CLOSED"}:
-        raise PipelineConfigurationError("trading calendar actual validation is unknown")
-    return status
+    return target_status
 
 
 async def execute_quote_refresh(
@@ -251,6 +299,7 @@ async def execute_quote_refresh(
         totals = {"total": 0, "succeeded": 0, "failed": 0}
         batch_size = app_settings.market_data_sync_batch_size
         for offset in range(0, len(normalized_symbols), batch_size):
+            _assert_lock_owned(task_lock)
             result = await client.sync_quotes(
                 symbols=normalized_symbols[offset : offset + batch_size]
             )
@@ -422,7 +471,7 @@ async def execute_eod_pipeline(
                 ),
             },
         )
-        result = await EODPipeline(steps).run(context)
+        result = await _run_with_lock_lease(task_lock, EODPipeline(steps).run(context))
         retryable_issues = tuple(issue for issue in result.issues if issue.retryable)
         if retryable_issues:
             raise PipelineRetryableDataError(retryable_issues)
@@ -556,7 +605,7 @@ async def execute_security_bootstrap(
             from app.tasks.pipeline import collect_indicator_requests
 
             requests = (await collect_indicator_requests(session, (symbol,))).get(symbol)
-        result = await SecurityDataBootstrapService(
+        bootstrap = SecurityDataBootstrapService(
             session_factory=session_factory,
             market_data_client=client,
             minimum_bars=app_settings.analysis_bootstrap_min_bars,
@@ -566,6 +615,7 @@ async def execute_security_bootstrap(
             requests=requests,
             completed_through=_bootstrap_completed_through(app_settings),
         )
+        result = await _run_with_lock_lease(task_lock, bootstrap)
         async with session_factory() as session:
             security = (
                 await session.execute(
