@@ -15,10 +15,12 @@ class UserSecretRepository:
     async def get(self, user_id: int, secret_type: str) -> UserSecret | None:
         return (
             await self.session.execute(
-                select(UserSecret).where(
+                select(UserSecret)
+                .where(
                     UserSecret.user_id == user_id,
                     UserSecret.secret_type == secret_type,
                 )
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
 

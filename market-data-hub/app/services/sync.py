@@ -10,6 +10,7 @@ from typing import Literal
 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from app.domain.deduplication import unique_facts
 from app.domain.market_data import (
     Adjustment,
     DailyBar,
@@ -135,7 +136,10 @@ class SecuritySyncService:
             # The repository owns one transaction for this complete batch.  Do
             # not retry by symbol: that would turn a source-wide failure into
             # partial database state and make bootstrap success ambiguous.
-            await self._repository.reconcile_snapshot(tuple(records))
+            if getattr(self._provider, "authoritative_universe", False):
+                await self._repository.reconcile_snapshot(tuple(records), authoritative=True)
+            else:
+                await self._repository.reconcile_snapshot(tuple(records))
         except Exception as exc:
             return _security_failure(
                 SyncError(code="PERSISTENCE_ERROR", message=_safe_message(exc))
@@ -194,11 +198,28 @@ class DailyBarSyncService:
             # depth after applying the cutoff.
             count = int(lookback_bars) + (8 if end is not None else 0)
         canonical_symbols, results = _canonicalize_symbols(symbols)
+        reserve = getattr(self._repository, "reserve_sync", None)
+        fenced_upsert = getattr(self._repository, "upsert_fenced", None)
+        fenced = callable(reserve) and callable(fenced_upsert)
+        generations = (
+            await reserve(canonical_symbols, adjustment=selected_adjustment) if fenced else None
+        )
+        provider_name = str(getattr(self._provider, "name", "provider"))
         pending: dict[str, tuple[DailyBar, ...]] = {}
         revision_by_symbol: dict[str, str] = {}
         rebase_from: dict[str, date] = {}
         batch_method = getattr(self._provider, "get_daily_bars_batch", None)
         revision_method = getattr(self._provider, "get_adjustment_revision", None)
+        window_method = getattr(self._provider, "get_daily_bars_window", None)
+
+        async def fetch_batch(symbols, requested_count):
+            if callable(window_method):
+                return await window_method(
+                    symbols, adjustment=selected_adjustment, count=requested_count, end=end
+                )
+            return await batch_method(
+                symbols, adjustment=selected_adjustment, count=requested_count
+            )
 
         normal_symbols = list(canonical_symbols)
         if (
@@ -213,14 +234,29 @@ class DailyBarSyncService:
                     revision = await revision_method(symbol)
                     revision_by_symbol[symbol] = revision
                     state = await self._adjustment_repository.get(symbol)
-                    if state is not None and state.get("revision_hash") != revision:
+                    existing = ()
+                    if state is None:
                         existing = await self._repository.list_by_symbol(
                             symbol, adjustment=selected_adjustment
                         )
-                        full_count = max(count, len(existing) + 32, 400)
-                        by_symbol = await batch_method(
-                            (symbol,), adjustment=selected_adjustment, count=full_count
+                    if (state is not None and state.get("revision_hash") != revision) or existing:
+                        existing = existing or await self._repository.list_by_symbol(
+                            symbol, adjustment=selected_adjustment
                         )
+                        full_count = max(count, len(existing) + 32, 400)
+                        if (
+                            end is not None
+                            and existing
+                            and end < max(b.trade_date for b in existing)
+                        ):
+                            raise InvalidMarketDataError(
+                                "qfq revision cannot use a historical cutoff before stored coverage"
+                            )
+                        by_symbol = await fetch_batch((symbol,), full_count)
+                        if symbol not in by_symbol:
+                            raise ProviderUnavailableError(
+                                "provider omitted requested revision symbol"
+                            )
                         bars = _validated_bars(
                             symbol,
                             tuple(by_symbol.get(symbol, ())),
@@ -244,6 +280,20 @@ class DailyBarSyncService:
                             default=max((item.trade_date for item in bars), default=None),
                         )
                         if bars and coverage_start is not None and coverage_end is not None:
+                            days = {bar.trade_date for bar in bars}
+                            if min(days) > coverage_start or max(days) < coverage_end:
+                                raise InvalidMarketDataError(
+                                    "qfq revision returned incomplete coverage"
+                                )
+                            missing = {bar.trade_date for bar in existing} - days
+                            if missing and not getattr(
+                                self._provider, "authoritative_history", False
+                            ):
+                                raise InvalidMarketDataError(
+                                    "qfq revision deletion needs an authoritative source"
+                                )
+                            if await revision_method(symbol) != revision:
+                                raise ProviderUnavailableError("qfq revision changed during fetch")
                             try:
                                 await self._repository.reconcile_revision(
                                     symbol,
@@ -251,6 +301,15 @@ class DailyBarSyncService:
                                     adjustment=selected_adjustment,
                                     coverage_start=coverage_start,
                                     coverage_end=coverage_end,
+                                    **(
+                                        {
+                                            "generations": generations,
+                                            "revision_hash": revision,
+                                            "provider_name": provider_name,
+                                        }
+                                        if fenced
+                                        else {}
+                                    ),
                                 )
                             except Exception as exc:
                                 if _is_systemic_persistence_error(exc):
@@ -287,11 +346,7 @@ class DailyBarSyncService:
             for offset in range(0, len(normal_symbols), self._batch_size):
                 chunk = normal_symbols[offset : offset + self._batch_size]
                 try:
-                    by_symbol = await batch_method(
-                        chunk,
-                        adjustment=selected_adjustment,
-                        count=count,
-                    )
+                    by_symbol = await fetch_batch(chunk, count)
                 except Exception as exc:
                     for symbol in chunk:
                         results[symbol] = SyncItemResult(
@@ -300,13 +355,22 @@ class DailyBarSyncService:
                     continue
                 for symbol in chunk:
                     try:
-                        raw = tuple(by_symbol.get(symbol, ()))
-                        if lookback_bars is not None and end is not None:
-                            raw = tuple(item for item in raw if item.trade_date <= end)
+                        if symbol not in by_symbol:
+                            raise ProviderUnavailableError(
+                                "provider omitted requested daily-bar symbol"
+                            )
+                        # Validate/deduplicate/sort BEFORE clipping; otherwise a
+                        # trailing duplicate can hide a conflicting earlier row.
+                        raw = _validated_bars(
+                            symbol, tuple(by_symbol[symbol]), selected_adjustment
+                        )
+                        if lookback_bars is not None:
+                            if end is not None:
+                                raw = tuple(item for item in raw if item.trade_date <= end)
                             raw = raw[-int(lookback_bars) :]
                         elif start is not None and end is not None:
                             raw = tuple(item for item in raw if start <= item.trade_date <= end)
-                        bars = _validated_bars(symbol, raw, selected_adjustment)
+                        bars = raw
                         pending[symbol] = bars
                         results[symbol] = SyncItemResult(
                             symbol=symbol, status="success", fetched=len(bars)
@@ -340,11 +404,37 @@ class DailyBarSyncService:
                         symbol=symbol, status="failed", error=_sync_error(exc)
                     )
 
+        # The revision sampled before I/O must still describe the fetched data.
+        if selected_adjustment is Adjustment.QFQ and callable(revision_method):
+            for symbol in tuple(pending):
+                previous_revision = revision_by_symbol.get(symbol)
+                if previous_revision is None:
+                    continue
+                try:
+                    if await revision_method(symbol) != previous_revision:
+                        raise ProviderUnavailableError("qfq revision changed during fetch")
+                except Exception as exc:
+                    pending.pop(symbol)
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="failed", error=_sync_error(exc)
+                    )
+
+        async def persist_records(records):
+            if fenced:
+                await fenced_upsert(
+                    records,
+                    generations=generations,
+                    revisions=revision_by_symbol,
+                    provider_name=provider_name,
+                )
+            else:
+                await self._repository.upsert_many(records)
+
         records = tuple(bar for bars in pending.values() for bar in bars)
         if records:
             persisted = await _persist_with_isolation(
                 records,
-                self._repository.upsert_many,
+                persist_records,
                 key=lambda record: record.symbol,
             )
             for symbol, error in persisted.items():
@@ -359,7 +449,11 @@ class DailyBarSyncService:
                     changed_from=previous.changed_from,
                 )
 
-        if selected_adjustment is Adjustment.QFQ and self._adjustment_repository is not None:
+        if (
+            not fenced
+            and selected_adjustment is Adjustment.QFQ
+            and self._adjustment_repository is not None
+        ):
             for symbol in canonical_symbols:
                 item = results.get(symbol)
                 if item is None or not item.succeeded:
@@ -395,6 +489,33 @@ class DailyBarSyncService:
                         history_rebased=previous.history_rebased,
                         changed_from=previous.changed_from,
                     )
+        if fenced:
+            good = [
+                symbol
+                for symbol in canonical_symbols
+                if results.get(symbol) and results[symbol].succeeded
+            ]
+            try:
+                await self._repository.complete_sync(
+                    good,
+                    adjustment=selected_adjustment,
+                    generations=generations,
+                    history_depth=lookback_bars or 0,
+                )
+            except Exception as exc:
+                if _is_systemic_persistence_error(exc):
+                    raise
+                for symbol in good:
+                    previous = results[symbol]
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol,
+                        status="failed",
+                        fetched=previous.fetched,
+                        persisted=previous.persisted,
+                        error=SyncError("PERSISTENCE_ERROR", "sync completion was superseded"),
+                        history_rebased=previous.history_rebased,
+                        changed_from=previous.changed_from,
+                    )
         return SyncSummary(operation="daily_bar", items=tuple(results.values()))
 
 
@@ -417,20 +538,40 @@ class QuoteSyncService:
                 chunk = canonical_symbols[offset : offset + self._batch_size]
                 try:
                     records = tuple(await batch_method(chunk))
-                    by_symbol = {
-                        record.symbol: _validated_quote(record.symbol, record) for record in records
-                    }
-                    for symbol in chunk:
-                        if symbol not in by_symbol:
-                            raise InvalidMarketDataError(f"provider returned no quote for {symbol}")
-                        pending[symbol] = by_symbol[symbol]
-                        results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
+                    by_symbol: dict[str, list[Quote]] = {}
+                    for record in records:
+                        if not isinstance(record, Quote) or record.symbol not in chunk:
+                            raise InvalidMarketDataError("provider returned an unexpected quote")
+                        by_symbol.setdefault(record.symbol, []).append(record)
                 except Exception as exc:
                     for symbol in chunk:
-                        if symbol not in pending:
-                            results[symbol] = SyncItemResult(
-                                symbol=symbol, status="failed", error=_sync_error(exc)
-                            )
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol, status="failed", error=_sync_error(exc)
+                        )
+                    continue
+                for symbol in chunk:
+                    if symbol not in by_symbol:
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol,
+                            status="failed",
+                            error=SyncError(
+                                "PROVIDER_UNAVAILABLE", "provider omitted requested quote"
+                            ),
+                        )
+                        continue
+                    try:
+                        candidates = unique_facts(
+                            by_symbol[symbol], key=lambda record: record.timestamp
+                        )
+                    except InvalidMarketDataError as exc:
+                        results[symbol] = SyncItemResult(
+                            symbol=symbol, status="failed", error=_sync_error(exc)
+                        )
+                        continue
+                    # An explicit source timestamp can order quotes; response
+                    # position cannot. Equal-time conflicts remain failures.
+                    pending[symbol] = candidates[-1]
+                    results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
         else:
             for symbol in canonical_symbols:
                 try:
@@ -549,8 +690,11 @@ def _validated_dividends(
             raise InvalidMarketDataError(
                 f"provider returned dividend for {value.symbol}, requested {symbol}"
             )
-        unique[(value.symbol, value.date)] = value
-    return tuple(unique.values())
+        identity = (value.symbol, value.date)
+        if identity in unique and unique[identity] != value:
+            raise InvalidMarketDataError("conflicting dividend totals for one identity")
+        unique[identity] = value
+    return tuple(unique[identity] for identity in sorted(unique))
 
 
 def _require_security(value: object) -> Security:
@@ -574,8 +718,11 @@ def _validated_bars(
             )
         if value.adjustment is not adjustment:
             raise InvalidMarketDataError("provider returned a different adjustment mode")
-        unique[(value.symbol, value.trade_date, value.adjustment)] = value
-    return tuple(unique.values())
+        identity = (value.symbol, value.trade_date, value.adjustment)
+        if identity in unique and unique[identity] != value:
+            raise InvalidMarketDataError("conflicting daily bars for one identity")
+        unique[identity] = value
+    return tuple(unique[identity] for identity in sorted(unique))
 
 
 async def _persist_with_isolation(

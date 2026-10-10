@@ -5,7 +5,7 @@ from functools import lru_cache
 from typing import Annotated
 from urllib.parse import unquote, urlsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 KNOWN_DEFAULT_DATABASE_PASSWORDS = frozenset(
@@ -36,10 +36,9 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     app_env: str = Field(
         default="development",
-        validation_alias=AliasChoices("APP_ENV", "ENVIRONMENT"),
+        validation_alias="APP_ENV",
         description="Runtime environment, for example development or production.",
     )
-    environment: str | None = None
     database_url: str = Field(
         default="postgresql+asyncpg://apanel:apanel@localhost:5432/apanel",
         description="SQLAlchemy async database URL for future market storage.",
@@ -56,7 +55,7 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     eltdx_hosts: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(),
-        validation_alias=AliasChoices("ELTDX_HOSTS", "ELTDX_SERVERS"),
+        validation_alias="ELTDX_HOSTS",
         description=(
             "Optional CSV/JSON list of eltdx host:port endpoints; empty uses eltdx defaults."
         ),
@@ -75,47 +74,28 @@ class Settings(BaseSettings):
     security_master_fallback_provider: str = Field(
         default="akshare",
         min_length=1,
-        validation_alias=AliasChoices(
-            "SECURITY_MASTER_FALLBACK_PROVIDER",
-            "SECURITY_FALLBACK_PROVIDER",
-        ),
+        validation_alias="SECURITY_MASTER_FALLBACK_PROVIDER",
         description="Security metadata fallback name; use none to disable fallback.",
     )
     akshare_security_timeout_seconds: float = Field(
         default=90.0,
         gt=0,
-        validation_alias=AliasChoices(
-            "AKSHARE_SECURITY_TIMEOUT_SECONDS",
-            "SECURITY_MASTER_FALLBACK_TIMEOUT_SECONDS",
-            "AKSHARE_TIMEOUT_SECONDS",
-        ),
+        validation_alias="AKSHARE_SECURITY_TIMEOUT_SECONDS",
         description="Total timeout for the complete AKShare security batch.",
     )
     akshare_min_stock_count: int = Field(
         default=1000,
         gt=0,
-        validation_alias=AliasChoices(
-            "AKSHARE_MIN_STOCK_COUNT",
-            "SECURITY_MASTER_MIN_STOCK_COUNT",
-            "SECURITY_MASTER_FALLBACK_MIN_STOCK_COUNT",
-        ),
+        validation_alias="AKSHARE_MIN_STOCK_COUNT",
     )
     akshare_min_etf_count: int = Field(
         default=1,
         gt=0,
-        validation_alias=AliasChoices(
-            "AKSHARE_MIN_ETF_COUNT",
-            "SECURITY_MASTER_MIN_ETF_COUNT",
-            "SECURITY_MASTER_FALLBACK_MIN_ETF_COUNT",
-        ),
+        validation_alias="AKSHARE_MIN_ETF_COUNT",
     )
     internal_api_token: str | None = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "INTERNAL_API_TOKEN",
-            "INTERNAL_SYNC_TOKEN",
-            "MARKET_DATA_INTERNAL_TOKEN",
-        ),
+        validation_alias="INTERNAL_API_TOKEN",
         description="Shared secret for internal write endpoints.",
     )
     log_level: str = "INFO"
@@ -157,34 +137,6 @@ class Settings(BaseSettings):
         if not normalized:
             raise ValueError("security_master_fallback_provider must not be empty")
         return normalized
-
-    @model_validator(mode="before")
-    @classmethod
-    def map_security_master_aliases(cls, value: object) -> object:
-        """Accept stable semantic aliases when constructing Settings directly."""
-
-        if not isinstance(value, dict):
-            return value
-        data = dict(value)
-        aliases = {
-            "security_master_fallback_timeout_seconds": "akshare_security_timeout_seconds",
-            "akshare_timeout_seconds": "akshare_security_timeout_seconds",
-            "security_master_min_stock_count": "akshare_min_stock_count",
-            "security_master_min_etf_count": "akshare_min_etf_count",
-        }
-        for alias, canonical in aliases.items():
-            if alias in data and canonical not in data:
-                data[canonical] = data[alias]
-        return data
-
-    @model_validator(mode="after")
-    def normalize_environment(self) -> "Settings":
-        """Make the legacy environment name follow the canonical app_env."""
-
-        if self.environment and self.app_env == "development":
-            self.app_env = self.environment
-        self.environment = self.app_env
-        return self
 
     def validate_runtime_credentials(self) -> None:
         """Reject known development database credentials in production."""

@@ -6,23 +6,22 @@ import importlib
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, union
+from sqlalchemy import func, select, union
 
 from app.clients.market_data_hub import MarketDataHubClientProtocol
 from app.core.errors import ApiError
 from app.indicators.parameters import (
     IndicatorRequest,
-    canonicalize_parameters,
-    merge_indicator_requests,
     required_history_bars,
 )
-from app.models import AlertRule, DailyBar, Security, TableColumn, WatchTableSymbol
+from app.models import AlertRule, DailyBar, Security, User, UserStatus, WatchTable, WatchTableSymbol
+from app.services.analysis_demand import collect_indicator_requests
+from app.services.analysis_service import AnalysisService
 from app.services.data_bootstrap_service import SecurityDataBootstrapService
 from app.services.data_readiness_service import DataReadinessService
-from app.services.indicator_service import IndicatorService
-from app.services.state_service import StateService
 
 from .contracts import (
     EOD_STEP_ORDER,
@@ -145,6 +144,7 @@ def build_default_eod_steps(
 
     async def daily_sync(context: PipelineContext) -> Mapping[str, Any]:
         context.resources.setdefault("market_data_client", market_data_client)
+        context.resources.setdefault("session_factory", session_factory)
         adjustments = tuple(context.resources.get("analysis_adjustments", (context.adjustment,)))
         settings = context.resources.get("settings")
         minimum_bars = int(getattr(settings, "analysis_bootstrap_min_bars", 400))
@@ -165,6 +165,13 @@ def build_default_eod_steps(
             completed_through=context.trade_date,
         )
         context.resources["history_readiness"] = readiness
+        for symbol, code in readiness.failed_symbols.items():
+            _record_pipeline_issue(
+                context,
+                PipelineIssue(
+                    step="daily_sync", symbol=symbol, adjustment=None, code=code, retryable=True
+                ),
+            )
         output: dict[str, Any] = {}
         for adjustment in adjustments:
             output[adjustment] = await _sync_required_history_in_chunks(
@@ -217,7 +224,18 @@ def build_default_eod_steps(
                     .scalars()
                     .all()
                 )
-                found = tuple(str(item) for item in rows)
+                found = tuple(
+                    str(item)
+                    for item in rows
+                    if not (
+                        _has_pipeline_issue(
+                            context, step="daily_sync", symbol=str(item), adjustment=adjustment
+                        )
+                        or _has_pipeline_issue(
+                            context, step="daily_sync", symbol=str(item), adjustment=None
+                        )
+                    )
+                )
                 ready[adjustment] = found
                 no_bar[adjustment] = tuple(
                     symbol for symbol in context.symbols if symbol not in found
@@ -240,30 +258,42 @@ def build_default_eod_steps(
         )
         daily_results = context.artifacts.get("daily_sync", {})
         counts: dict[str, dict[str, int]] = {}
+        state_counts: dict[str, dict[str, int]] = {}
+        eligible = []
         for adjustment, symbols in ready_by_adjustment.items():
-            counts[adjustment] = {}
-            rebase_by_symbol = (
+            counts[adjustment], state_counts[adjustment] = {}, {}
+            rebased = (
                 _rebase_dates(daily_results.get(adjustment))
                 if isinstance(daily_results, Mapping)
                 else {}
             )
             for symbol in symbols:
-                async with session_factory() as session:
-                    service = IndicatorService(session)
-                    if symbol in rebase_by_symbol:
-                        rows = await service.rebuild_history(
+                try:
+                    async with session_factory() as session:
+                        result = await AnalysisService(session).materialize(
                             symbol,
                             adjustment=adjustment,
+                            end=context.trade_date,
                             requests=requests_by_symbol.get(symbol),
-                            start=rebase_by_symbol[symbol],
+                            force_history=bool(context.resources.get("force_history"))
+                            or symbol in rebased,
                         )
-                    else:
-                        rows = await service.materialize_latest(
-                            symbol,
+                    counts[adjustment][symbol] = result.indicators
+                    state_counts[adjustment][symbol] = result.states
+                    eligible.append((symbol, adjustment))
+                except ApiError as error:
+                    _record_pipeline_issue(
+                        context,
+                        PipelineIssue(
+                            step="indicator_snapshots",
+                            symbol=symbol,
                             adjustment=adjustment,
-                            requests=requests_by_symbol.get(symbol),
-                        )
-                counts[adjustment][symbol] = len(rows)
+                            code=error.code,
+                            retryable=error.status_code >= 500,
+                        ),
+                    )
+        context.resources["published_state_counts"] = state_counts
+        context.resources["eligible_analysis_streams"] = tuple(eligible)
         return counts
 
     async def delta(context: PipelineContext) -> Any:
@@ -272,42 +302,58 @@ def build_default_eod_steps(
         return context.artifacts.get("indicator_snapshots", {})
 
     async def states(context: PipelineContext) -> Mapping[str, Any]:
-        if session_factory is None:
-            raise PipelineConfigurationError("state session factory is not configured")
-        readiness = context.artifacts.get("adjustment_ready", {})
-        ready_by_adjustment = (
-            readiness.get("ready_symbols", {}) if isinstance(readiness, Mapping) else {}
-        )
-        daily_results = context.artifacts.get("daily_sync", {})
-        counts: dict[str, dict[str, int]] = {}
-        for adjustment, symbols in ready_by_adjustment.items():
-            counts[adjustment] = {}
-            rebase_by_symbol = (
-                _rebase_dates(daily_results.get(adjustment))
-                if isinstance(daily_results, Mapping)
-                else {}
-            )
-            for symbol in symbols:
-                async with session_factory() as session:
-                    service = StateService(session)
-                    if symbol in rebase_by_symbol:
-                        rows = await service.rebuild_history(
-                            symbol, adjustment=adjustment, start=rebase_by_symbol[symbol]
-                        )
-                    else:
-                        rows = await service.materialize_latest(symbol, adjustment=adjustment)
-                counts[adjustment][symbol] = len(rows)
+        # Indicator + State already committed atomically per stream. This step
+        # exposes the checkpoint and only marks fully completed bootstrap rows.
+        counts = context.resources.get("published_state_counts", {})
+        adjustments = tuple(context.resources.get("analysis_adjustments", (context.adjustment,)))
+        eligible = set(context.resources.get("eligible_analysis_streams", ()))
+        unavailable = context.resources.get("dividend_unavailable_symbols", ())
+        completed = [
+            symbol
+            for symbol in context.symbols
+            if symbol not in unavailable and all((symbol, mode) in eligible for mode in adjustments)
+        ]
+        if completed:
+            async with session_factory() as session:
+                from sqlalchemy import update
+
+                await session.execute(
+                    update(Security)
+                    .where(Security.symbol.in_(completed))
+                    .values(bootstrap_completed_at=datetime.now(UTC))
+                )
+                await session.commit()
         return counts
 
     async def alerts(context: PipelineContext) -> Any:
         if notification_provider is not None:
             context.resources.setdefault("notification_provider", notification_provider)
         runner = alert_runner or resolve_alert_runner()
-        return await _invoke_integration(runner, context)
+        result = await _invoke_integration(runner, context)
+        for evaluation in result or ():
+            if getattr(evaluation, "error_code", None):
+                _record_pipeline_issue(
+                    context,
+                    PipelineIssue(
+                        step="alerts", symbol="*", code=evaluation.error_code, retryable=False
+                    ),
+                )
+        return result
 
     async def notifications(context: PipelineContext) -> Any:
         runner = notification_runner or resolve_notification_runner()
-        return await _invoke_integration(runner, context)
+        result = await _invoke_integration(runner, context)
+        if isinstance(result, Mapping) and result.get("failed", 0):
+            _record_pipeline_issue(
+                context,
+                PipelineIssue(
+                    step="notifications",
+                    symbol="*",
+                    code="NOTIFICATION_DELIVERY_FAILED",
+                    retryable=False,
+                ),
+            )
+        return result
 
     return (
         PipelineStep("daily_sync", daily_sync),
@@ -361,8 +407,7 @@ async def _sync_in_chunks(
         dict.fromkeys(
             str(item.symbol)
             for item in items
-            if not getattr(item, "succeeded", False)
-            and str(item.symbol) not in retryable_symbols
+            if not getattr(item, "succeeded", False) and str(item.symbol) not in retryable_symbols
         )
     )
     return {
@@ -396,22 +441,43 @@ async def _sync_required_history_in_chunks(
     if client is None:
         raise PipelineConfigurationError("market data client is not configured")
     batch_size = int(getattr(settings, "market_data_sync_batch_size", 50))
-    groups: dict[int, list[str]] = {}
+    latest_by_symbol = {}
+    factory = context.resources.get("session_factory")
+    if factory is not None and not context.resources.get("force_history"):
+        async with factory() as session:
+            latest_by_symbol = dict(
+                (
+                    await session.execute(
+                        select(Security.symbol, func.max(DailyBar.trade_date))
+                        .join(DailyBar, DailyBar.security_id == Security.id)
+                        .where(
+                            Security.symbol.in_(context.symbols),
+                            DailyBar.adjust_type == adjustment,
+                            DailyBar.trade_date <= context.trade_date,
+                        )
+                        .group_by(Security.symbol)
+                    )
+                ).all()
+            )
+    groups: dict[tuple[str, int | date], list[str]] = {}
     for symbol in context.symbols:
-        lookback = max(
-            int(minimum_bars),
-            required_history_bars(requests_by_symbol.get(symbol)),
-        )
-        groups.setdefault(lookback, []).append(symbol)
-
+        previous = latest_by_symbol.get(symbol)
+        if previous is not None:
+            key = ("start", previous - timedelta(days=7))
+        else:
+            key = (
+                "lookback_bars",
+                max(int(minimum_bars), required_history_bars(requests_by_symbol.get(symbol))),
+            )
+        groups.setdefault(key, []).append(symbol)
     items: list[Any] = []
-    for lookback, symbols in sorted(groups.items()):
+    for (mode, value), symbols in sorted(groups.items(), key=lambda pair: str(pair[0])):
         for offset in range(0, len(symbols), batch_size):
             result = await client.sync_daily(
                 symbols=symbols[offset : offset + batch_size],
-                lookback_bars=lookback,
                 end=context.trade_date,
                 adjustment=adjustment,
+                **{mode: value},
             )
             items.extend(getattr(result, "items", ()))
     return _summarize_sync_items("daily", items)
@@ -433,8 +499,7 @@ def _summarize_sync_items(operation: str, items: Iterable[Any]) -> dict[str, Any
         dict.fromkeys(
             str(item.symbol)
             for item in materialized
-            if not getattr(item, "succeeded", False)
-            and str(item.symbol) not in retryable_symbols
+            if not getattr(item, "succeeded", False) and str(item.symbol) not in retryable_symbols
         )
     )
     return {
@@ -567,6 +632,11 @@ async def _run_alert_service(service: Callable[..., Any], context: PipelineConte
             provider=provider,
             observation_date=context.trade_date,
             dividend_unavailable_symbols=context.resources.get("dividend_unavailable_symbols"),
+            **(
+                {"eligible_streams": context.resources["eligible_analysis_streams"]}
+                if "eligible_analysis_streams" in context.resources
+                else {}
+            ),
         )
 
     return await _run_in_session(context.resources["session_factory"], invoke)
@@ -634,21 +704,28 @@ def _notification_ids(value: Any) -> tuple[int, ...]:
     for result in results:
         if isinstance(result, Mapping):
             triggered = result.get("triggered")
-            notification_id = result.get("notification_id")
+            single_id = result.get("notification_id")
+            batch = result.get("notification_ids")
         else:
             triggered = getattr(result, "triggered", None)
-            notification_id = getattr(result, "notification_id", None)
+            single_id = getattr(result, "notification_id", None)
+            batch = getattr(result, "notification_ids", None)
         if not isinstance(triggered, bool):
             raise PipelineDataError("alert evaluation result is invalid")
-        if triggered and notification_id is None:
+        ids = tuple(batch) if batch else (() if single_id is None else (single_id,))
+        if single_id is not None and single_id not in ids:
+            raise PipelineDataError("notification batch identity is inconsistent")
+        if triggered and not ids:
             raise PipelineDataError("triggered alert has no notification record")
-        if not triggered and notification_id is not None:
+        if not triggered and ids:
             raise PipelineDataError("inactive alert has a notification record")
-        if notification_id is not None:
+        for notification_id in ids:
             try:
                 normalized_id = int(notification_id)
             except (TypeError, ValueError) as exc:
                 raise PipelineDataError("notification record id is invalid") from exc
+            if isinstance(notification_id, bool) or normalized_id <= 0:
+                raise PipelineDataError("notification record id is invalid")
             if normalized_id in notification_ids:
                 raise PipelineDataError("alert batch contains duplicate notification records")
             notification_ids.append(normalized_id)
@@ -677,8 +754,17 @@ async def resolve_monitored_symbols(session_factory: Any) -> tuple[str, ...]:
 
     if session_factory is None:
         raise PipelineConfigurationError("scheduler session factory is not configured")
-    watched = select(WatchTableSymbol.security_id)
-    alerted = select(AlertRule.security_id).where(AlertRule.enabled.is_(True))
+    watched = (
+        select(WatchTableSymbol.security_id)
+        .join(WatchTable)
+        .join(User)
+        .where(User.status == UserStatus.ACTIVE)
+    )
+    alerted = (
+        select(AlertRule.security_id)
+        .join(User)
+        .where(AlertRule.enabled.is_(True), User.status == UserStatus.ACTIVE)
+    )
     ids = union(watched, alerted).subquery()
     statement = (
         select(Security.symbol)
@@ -693,95 +779,6 @@ async def resolve_monitored_symbols(session_factory: Any) -> tuple[str, ...]:
         return tuple(str(symbol) for symbol in result.scalars())
 
 
-# Compatibility alias for tests/extensions written against the old name.
-resolve_watched_symbols = resolve_monitored_symbols
-
-
-async def collect_indicator_requests(
-    session: Any,
-    symbols: Iterable[str],
-) -> dict[str, tuple[IndicatorRequest, ...]]:
-    """Collect shared calculation demand from all columns using each symbol.
-
-    Columns are configuration, not an ownership boundary for the shared
-    indicator data.  We therefore union every table's requests for a symbol;
-    the watch-table service still enforces user ownership when projecting the
-    result back to a caller.
-    """
-
-    normalized_symbols = tuple(str(symbol).strip().upper() for symbol in symbols)
-    if not normalized_symbols:
-        return {}
-    statement = (
-        select(Security.symbol, TableColumn.indicator_type, TableColumn.parameters)
-        .join(WatchTableSymbol, WatchTableSymbol.security_id == Security.id)
-        .join(TableColumn, TableColumn.watch_table_id == WatchTableSymbol.watch_table_id)
-        .where(
-            Security.symbol.in_(normalized_symbols),
-            TableColumn.indicator_type.is_not(None),
-        )
-    )
-    result = await session.execute(statement)
-    raw_by_symbol: dict[str, list[IndicatorRequest]] = {symbol: [] for symbol in normalized_symbols}
-    for symbol, indicator_type, parameters in result.all():
-        if not indicator_type:
-            continue
-        raw_parameters = dict(parameters or {})
-        raw_parameters = {
-            key: value
-            for key, value in raw_parameters.items()
-            if str(key).strip().lower() != "field"
-        }
-        try:
-            canonical = canonicalize_parameters(indicator_type, raw_parameters, fill_defaults=True)
-        except ApiError:
-            logger.warning(
-                "scheduled_indicator_column_ignored",
-                extra={
-                    "event": "scheduled_indicator_column_ignored",
-                    "indicator_type": indicator_type,
-                },
-            )
-            continue
-        raw_by_symbol.setdefault(str(symbol), []).append(
-            IndicatorRequest(str(indicator_type), canonical)
-        )
-    alert_rows = await session.execute(
-        select(
-            Security.symbol,
-            AlertRule.condition_type,
-            AlertRule.indicator_type,
-            AlertRule.parameters,
-        )
-        .join(AlertRule, AlertRule.security_id == Security.id)
-        .where(Security.symbol.in_(normalized_symbols), AlertRule.enabled.is_(True))
-    )
-    for row in alert_rows.all():
-        if len(row) != 4:
-            # Compatibility with lightweight test/session adapters that only
-            # implement the historical table-column projection.
-            continue
-        symbol, condition_type, indicator_type, parameters = row
-        if not indicator_type or str(indicator_type).upper() == "DIVIDEND_YIELD":
-            continue
-        raw = dict(parameters or {})
-        if condition_type == "STATE" and str(indicator_type).upper() == "MA":
-            short = raw.get("short_period")
-            long = raw.get("long_period")
-            raw = {"periods": [short, long]} if short and long else {}
-        try:
-            canonical = canonicalize_parameters(indicator_type, raw, fill_defaults=True)
-        except ApiError:
-            continue
-        raw_by_symbol.setdefault(str(symbol), []).append(
-            IndicatorRequest(str(indicator_type), canonical)
-        )
-
-    return {
-        symbol: merge_indicator_requests(requests) for symbol, requests in raw_by_symbol.items()
-    }
-
-
 __all__ = [
     "ALERT_ENTRYPOINTS",
     "EODPipeline",
@@ -792,5 +789,4 @@ __all__ = [
     "resolve_alert_runner",
     "resolve_notification_runner",
     "resolve_monitored_symbols",
-    "resolve_watched_symbols",
 ]

@@ -1,4 +1,4 @@
-"""Typed user settings API projections with forward-compatible extras."""
+"""Typed user settings API projections; current fields only."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class IndicatorSettingsUpdate(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     defaults: list[str] | None = None
     parameters: dict[str, dict[str, Any]] | None = None
 
 
 class DisplaySettingsUpdate(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     density: Literal["compact", "comfortable"] | None = None
     show_states: bool | None = None
@@ -25,22 +25,17 @@ class DisplaySettingsUpdate(BaseModel):
 
 
 class NotificationSettingsUpdate(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     # Omitted = keep existing secret; explicit null = clear.
     feishu_webhook: str | None = None
 
 
 class UserSettingsUpdateRequest(BaseModel):
-    """Partial settings payload with typed v1 keys and forward-compatible extras.
+    """Current typed settings request; no historic wrapper is accepted."""
 
-    ``settings`` remains available for legacy clients that wrapped the payload
-    in one object.  New clients should send the typed top-level fields.
-    """
+    model_config = ConfigDict(extra="forbid")
 
-    model_config = ConfigDict(extra="allow")
-
-    settings: dict[str, Any] | None = None
     adjust_type: Literal["qfq", "none"] | None = None
     indicator_settings: IndicatorSettingsUpdate | None = None
     display_settings: DisplaySettingsUpdate | None = None

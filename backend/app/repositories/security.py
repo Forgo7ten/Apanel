@@ -28,7 +28,8 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import Base
-from app.models import DailyBar, IndicatorSnapshot, IndicatorState, QuoteSnapshot, Security
+from app.models import DailyBar, IndicatorSnapshot, QuoteSnapshot, Security
+from app.schemas.state_row import StateRow
 
 _dividend_events_table = Base.metadata.tables.get("dividend_events")
 if _dividend_events_table is None:
@@ -141,7 +142,7 @@ class SecurityRepository:
         return (
             await self.session.execute(
                 select(DailyBar)
-                .where(DailyBar.security_id == security_id)
+                .where(DailyBar.security_id == security_id, DailyBar.adjust_type == "none")
                 .order_by(
                     DailyBar.trade_date.desc(),
                     case((DailyBar.adjust_type == "none", 0), else_=1),
@@ -171,7 +172,7 @@ class SecurityRepository:
                 )
                 .label("row_number"),
             )
-            .where(DailyBar.security_id.in_(ids))
+            .where(DailyBar.security_id.in_(ids), DailyBar.adjust_type == "none")
             .subquery()
         )
         rows = (
@@ -266,9 +267,7 @@ class SecurityRepository:
         *,
         adjust_type: str | None = None,
     ) -> date | None:
-        statement = select(func.max(DailyBar.trade_date)).where(
-            DailyBar.security_id == security_id
-        )
+        statement = select(func.max(DailyBar.trade_date)).where(DailyBar.security_id == security_id)
         if adjust_type is not None:
             statement = statement.where(DailyBar.adjust_type == adjust_type)
         return (await self.session.execute(statement)).scalar_one_or_none()
@@ -366,78 +365,17 @@ class SecurityRepository:
             result[row.security_id].append(row)
         return result
 
-    async def current_states(
-        self, security_id: int, *, adjustment: str = "qfq"
-    ) -> list[IndicatorState]:
-        latest_date = (
-            await self.session.execute(
-                select(IndicatorState.trade_date)
-                .where(
-                    IndicatorState.security_id == security_id,
-                    IndicatorState.adjust_type == adjustment,
-                )
-                .order_by(IndicatorState.trade_date.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if latest_date is None:
-            return []
-        return list(
-            (
-                await self.session.execute(
-                    select(IndicatorState)
-                    .where(
-                        IndicatorState.security_id == security_id,
-                        IndicatorState.trade_date == latest_date,
-                        IndicatorState.status == "ACTIVE",
-                        IndicatorState.adjust_type == adjustment,
-                    )
-                    .order_by(IndicatorState.id.asc())
-                )
-            ).scalars()
-        )
+    async def current_states(self, security_id: int, *, adjustment: str = "qfq") -> list[StateRow]:
+        return (await self.current_states_batch([security_id], adjustment=adjustment))[security_id]
 
     async def current_states_batch(
-        self, security_ids: Iterable[int], *, adjustment: str = "qfq"
-    ) -> dict[int, list[IndicatorState]]:
-        """Return active states from each requested security's newest date."""
+        self, security_ids: Iterable[int], *, adjustment: str = "qfq", active_only: bool = True
+    ) -> dict[int, list[StateRow]]:
+        from app.repositories.state_event import StateEventRepository
 
-        ids = _unique_ids(security_ids)
-        result = {security_id: [] for security_id in ids}
-        if not ids:
-            return result
-        latest_dates = (
-            select(
-                IndicatorState.security_id,
-                func.max(IndicatorState.trade_date).label("latest_date"),
-            )
-            .where(
-                IndicatorState.security_id.in_(ids),
-                IndicatorState.adjust_type == adjustment,
-            )
-            .group_by(IndicatorState.security_id)
-            .subquery()
+        return await StateEventRepository(self.session).current_many(
+            security_ids, adjustment=adjustment, active_only=active_only
         )
-        rows = (
-            await self.session.execute(
-                select(IndicatorState)
-                .join(
-                    latest_dates,
-                    and_(
-                        IndicatorState.security_id == latest_dates.c.security_id,
-                        IndicatorState.trade_date == latest_dates.c.latest_date,
-                    ),
-                )
-                .where(
-                    IndicatorState.status == "ACTIVE",
-                    IndicatorState.adjust_type == adjustment,
-                )
-                .order_by(IndicatorState.security_id.asc(), IndicatorState.id.asc())
-            )
-        ).scalars()
-        for row in rows:
-            result[row.security_id].append(row)
-        return result
 
 
 def _decimal(value: Any) -> Decimal:

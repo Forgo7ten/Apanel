@@ -16,7 +16,11 @@ class UserSettingsRepository:
 
     async def get_for_user(self, user_id: int) -> UserSetting | None:
         return (
-            await self.session.execute(select(UserSetting).where(UserSetting.user_id == user_id))
+            await self.session.execute(
+                select(UserSetting)
+                .where(UserSetting.user_id == user_id)
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
 
 

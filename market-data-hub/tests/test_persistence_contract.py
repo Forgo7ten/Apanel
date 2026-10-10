@@ -42,6 +42,12 @@ class RecordingSession:
     async def execute(self, statement):
         self.statements.append(statement)
 
+        class Result:
+            def all(self):
+                return []
+
+        return Result()
+
 
 class RecordingSessionFactory:
     def __init__(self, session):
@@ -205,8 +211,9 @@ async def test_security_repository_chunks_large_batches_below_asyncpg_bind_limit
 
 
 @pytest.mark.asyncio
-async def test_security_sync_rolls_back_a_real_sqlalchemy_batch_on_a_later_constraint_failure(
-) -> None:
+async def test_security_sync_rolls_back_a_real_sqlalchemy_batch_on_a_later_constraint_failure() -> (
+    None
+):
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -256,15 +263,21 @@ async def test_security_sync_rolls_back_a_real_sqlalchemy_batch_on_a_later_const
 
 async def test_daily_repository_chunks_large_batches_below_asyncpg_bind_limit() -> None:
     class Result:
+        def __init__(self, rows=()):
+            self.rows = rows
+
         def all(self):
-            return [(index + 1, str(600000 + index)) for index in range(10)]
+            return self.rows
+
+        def scalars(self):
+            return self
 
     class DailyRecordingSession(RecordingSession):
         async def execute(self, statement):
             self.statements.append(statement)
-            if getattr(statement, "is_select", False):
-                return Result()
-            return None
+            if getattr(statement, "is_select", False) and "securities" in str(statement):
+                return Result([(index + 1, str(600000 + index)) for index in range(10)])
+            return Result()
 
     session = DailyRecordingSession()
     repository = SqlAlchemyDailyBarRepository(RecordingSessionFactory(session))
@@ -286,18 +299,15 @@ async def test_daily_repository_chunks_large_batches_below_asyncpg_bind_limit() 
     await repository.upsert_many(records)
 
     writes = [
-        statement
-        for statement in session.statements
-        if not getattr(statement, "is_select", False)
+        statement for statement in session.statements if not getattr(statement, "is_select", False)
     ]
     assert writes
     assert all(
-        len(statement.compile(dialect=postgresql.dialect()).params) <= 32767
-        for statement in writes
+        len(statement.compile(dialect=postgresql.dialect()).params) <= 32767 for statement in writes
     )
 
 
-async def test_security_reconcile_marks_missing_active_symbols_inactive() -> None:
+async def test_authoritative_security_reconcile_marks_missing_active_symbols_inactive() -> None:
     session = RecordingSession()
     repository = SqlAlchemySecurityRepository(RecordingSessionFactory(session))
 
@@ -309,11 +319,12 @@ async def test_security_reconcile_marks_missing_active_symbols_inactive() -> Non
                 market="SH",
                 security_type="STOCK",
             )
-        ]
+        ],
+        authoritative=True,
     )
 
-    assert len(session.statements) == 2
-    update_sql = str(session.statements[1].compile(dialect=postgresql.dialect()))
+    assert len(session.statements) == 3
+    update_sql = str(session.statements[2].compile(dialect=postgresql.dialect()))
     assert update_sql.startswith("UPDATE securities SET status=")
     assert "securities.status =" in update_sql
     assert "securities.symbol NOT IN" in update_sql

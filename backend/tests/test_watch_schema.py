@@ -33,11 +33,11 @@ def test_alembic_revisions_form_one_complete_linear_chain() -> None:
         spec.loader.exec_module(migration)
         revisions[migration.revision] = migration.down_revision
 
-    assert revisions["0001_initial_schema"] is None
+    assert revisions == {"0001_fresh_schema": None}
     roots = {revision for revision, parent in revisions.items() if parent is None}
     referenced = {parent for parent in revisions.values() if parent is not None}
     heads = set(revisions) - referenced
-    assert roots == {"0001_initial_schema"}
+    assert roots == {"0001_fresh_schema"}
     assert len(heads) == 1
     assert all(parent is None or parent in revisions for parent in revisions.values())
 
@@ -65,6 +65,4 @@ def test_watch_schema_has_owner_bound_relations_and_uniqueness() -> None:
         constraint.name == "uq_watch_table_symbols_table_security"
         for constraint in symbols.constraints
     )
-    assert any(
-        constraint.name == "uq_user_settings_user_id" for constraint in settings.constraints
-    )
+    assert any(constraint.name == "uq_user_settings_user_id" for constraint in settings.constraints)

@@ -21,6 +21,8 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.core.config import get_settings  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app import models as _models  # noqa: E402,F401
+# Hub-owned dividend facts have a backend Core read projection, also owned by migrations.
+from app.repositories.security import DIVIDEND_EVENTS_TABLE as _dividends  # noqa: E402,F401
 
 config = context.config
 target_metadata = Base.metadata

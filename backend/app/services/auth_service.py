@@ -52,7 +52,7 @@ class IssuedTokens:
 def normalize_identifier(value: str) -> str:
     """Normalize user-facing identifiers for lookups and ownership checks."""
 
-    return value.strip().casefold()
+    return value.strip().lower()
 
 
 def utc_now() -> datetime:
@@ -126,6 +126,7 @@ async def register_user(
             ):
                 invalid_invitation = True
             elif invitation is not None:
+                await _reserve_login_identifiers(session, request.username, invitation.email)
                 user = User(
                     username=request.username.strip(),
                     email=invitation.email,
@@ -160,13 +161,15 @@ async def authenticate_and_issue_tokens(
     """Authenticate an active account and create an access/refresh pair."""
 
     identifier = normalize_identifier(request.username)
-    user = (
-        await session.execute(
-            select(User).where(
-                or_(func.lower(User.username) == identifier, func.lower(User.email) == identifier)
-            )
-        )
-    ).scalar_one_or_none()
+    clauses = {
+        "username": func.lower(User.username) == identifier,
+        "email": func.lower(User.email) == identifier,
+    }
+    clause = clauses.get(request.identifier_type, or_(*clauses.values()))
+    matches = list((await session.execute(select(User).where(clause).limit(2))).scalars())
+    # Legacy cross-field collisions need an explicit identifier_type. Preserve
+    # the ordinary invalid-credentials response and password timing boundary.
+    user = matches[0] if len(matches) == 1 else None
     password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
     password_valid = verify_password(request.password, password_hash)
     if user is None or not password_valid or user.status != UserStatus.ACTIVE:
@@ -300,6 +303,7 @@ async def bootstrap_admin(
         ).scalar_one_or_none()
         if existing_admin is not None:
             raise ApiError("ADMIN_ALREADY_EXISTS", "An administrator already exists.", 409)
+        await _reserve_login_identifiers(session, username, email)
         user = User(
             username=username.strip(),
             email=normalize_identifier(email),
@@ -313,6 +317,33 @@ async def bootstrap_admin(
         except IntegrityError as exc:
             raise ApiError("INVALID_REQUEST", "Username or email is already in use.", 409) from exc
     return user
+
+
+async def _reserve_login_identifiers(session: AsyncSession, username: str, email: str) -> None:
+    """Application writers serialize the shared username/email namespace."""
+    identifiers = sorted({normalize_identifier(username), normalize_identifier(email)})
+    if session.get_bind().dialect.name == "postgresql":
+        for identifier in identifiers:
+            key = int.from_bytes(
+                hashlib.sha256(("apanel:login:" + identifier).encode()).digest()[:8],
+                "big",
+                signed=True,
+            )
+            await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+    conflict = (
+        await session.execute(
+            select(User.id)
+            .where(
+                or_(
+                    func.lower(User.username).in_(identifiers),
+                    func.lower(User.email).in_(identifiers),
+                )
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if conflict is not None:
+        raise ApiError("INVALID_REQUEST", "Username or email is already in use.", 409)
 
 
 async def _issue_tokens(session: AsyncSession, user: User, *, settings: Settings) -> IssuedTokens:

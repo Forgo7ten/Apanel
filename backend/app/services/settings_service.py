@@ -30,13 +30,9 @@ class UserSettingsService:
     async def get(self, user_id: int) -> UserSettingsData:
         setting = await self.repository.get_for_user(user_id)
         settings = _public_settings(setting.settings if setting is not None else {})
-        legacy_configured = (
-            get_settings().legacy_webhook_fallback_enabled
-            and _legacy_webhook(setting.settings if setting is not None else {}) is not None
-        )
-        settings.setdefault("notification_settings", {})["feishu_webhook_configured"] = (
-            await self.secret_service.configured(user_id) or legacy_configured
-        )
+        settings.setdefault("notification_settings", {})[
+            "feishu_webhook_configured"
+        ] = await self.secret_service.configured(user_id)
         return UserSettingsData(
             settings=settings,
             created_at=setting.created_at if setting is not None else None,
@@ -45,24 +41,28 @@ class UserSettingsService:
 
     async def update(self, user_id: int, updates: dict[str, Any]) -> UserSettingsData:
         normalized_updates, webhook = _normalize_updates(updates)
-        setting = await self.repository.get_for_user(user_id)
-        if setting is None:
-            setting = UserSetting(user_id=user_id, settings=normalized_updates)
-            self.session.add(setting)
-        else:
-            setting.settings = _merge_settings(
-                _strip_legacy_webhook(setting.settings), normalized_updates
-            )
         try:
+            await self.secret_service.lock_owner(user_id)
+            setting = await self.repository.get_for_user(user_id)
+            existing = _public_settings(setting.settings if setting is not None else {})
             if webhook is not _WEBHOOK_MISSING:
                 if webhook is None:
                     await self.secret_service.clear_feishu_webhook(user_id)
                 else:
                     await self.secret_service.set_feishu_webhook(user_id, webhook)
+            merged = _merge_settings(existing, normalized_updates)
+            if setting is None:
+                setting = UserSetting(user_id=user_id, settings=merged)
+                self.session.add(setting)
+            else:
+                setting.settings = merged
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
             raise ApiError("SETTINGS_UPDATE_FAILED", "Settings could not be updated.", 409) from exc
+        except BaseException:
+            await self.session.rollback()
+            raise
         await self.session.refresh(setting)
         return await self.get(user_id)
 
@@ -81,6 +81,8 @@ def _merge_settings(existing: dict[str, Any], updates: dict[str, Any]) -> dict[s
 
 def _normalize_updates(updates: dict[str, Any]) -> tuple[dict[str, Any], object]:
     normalized = dict(updates)
+    if any(key in normalized for key in ("settings", "notification", "feishu_webhook")):
+        raise ApiError("INVALID_SETTINGS", "Use the current typed settings fields.", 400)
     if "adjust_type" in normalized:
         adjustment = str(normalized["adjust_type"]).strip().lower()
         if adjustment not in _ALLOWED_ADJUSTMENTS:
@@ -103,10 +105,12 @@ def _normalize_updates(updates: dict[str, Any]) -> tuple[dict[str, Any], object]
                 if normalized_type == "DIVIDEND_YIELD":
                     canonical[normalized_type] = {}
                 else:
+                    if not isinstance(raw, dict):
+                        raise ApiError(
+                            "INVALID_SETTINGS", "Indicator parameters must be an object.", 400
+                        )
                     canonical[normalized_type] = canonicalize_parameters(
-                        normalized_type,
-                        _legacy_parameter_aliases(normalized_type, raw),
-                        fill_defaults=True,
+                        normalized_type, raw, fill_defaults=True
                     )
             indicator_settings["parameters"] = canonical
         normalized["indicator_settings"] = indicator_settings
@@ -121,86 +125,39 @@ def _normalize_updates(updates: dict[str, Any]) -> tuple[dict[str, Any], object]
                 raise ApiError("INVALID_SETTINGS", f"{key} must be boolean.", 400)
         normalized["display_settings"] = display
 
+    notification = normalized.get("notification_settings")
     webhook: object = _WEBHOOK_MISSING
-    nested = normalized.get("notification_settings")
-    if not isinstance(nested, dict):
-        nested = normalized.pop("notification", None)
-    if isinstance(nested, dict):
-        nested = dict(nested)
-        if "feishu_webhook" in nested:
-            raw = nested.pop("feishu_webhook")
-            if raw is None:
-                webhook = None
-            else:
-                allowed = tuple(
-                    host.strip()
-                    for host in get_settings().feishu_webhook_allowed_hosts.split(",")
-                    if host.strip()
-                )
-                try:
-                    webhook = validate_feishu_webhook_url(raw, allowed_hosts=allowed)
-                except ValueError as exc:
-                    raise ApiError(
-                        "INVALID_WEBHOOK_URL", "Feishu webhook URL is invalid.", 400
-                    ) from exc
-        nested.pop("feishu_webhook_configured", None)
-        normalized["notification_settings"] = nested
-    if "feishu_webhook" in normalized:
-        raw = normalized.pop("feishu_webhook")
-        if raw is None:
-            webhook = None
-        else:
-            allowed = tuple(
-                host.strip()
-                for host in get_settings().feishu_webhook_allowed_hosts.split(",")
-                if host.strip()
-            )
+    if notification is not None:
+        if not isinstance(notification, dict):
+            raise ApiError("INVALID_SETTINGS", "Notification settings must be an object.", 400)
+        notification = dict(notification)
+        if "feishu_webhook_configured" in notification:
+            raise ApiError("INVALID_SETTINGS", "Webhook configuration status is read-only.", 400)
+        supplied = notification.pop("feishu_webhook", _WEBHOOK_MISSING)
+        if supplied is not _WEBHOOK_MISSING:
+            webhook = supplied
+        allowed = get_settings().feishu_webhook_allowed_hosts.split(",")
+        if webhook is not _WEBHOOK_MISSING:
             try:
-                webhook = validate_feishu_webhook_url(raw, allowed_hosts=allowed)
+                webhook = (
+                    None
+                    if webhook is None
+                    else validate_feishu_webhook_url(webhook, allowed_hosts=allowed)
+                )
             except ValueError as exc:
                 raise ApiError(
                     "INVALID_WEBHOOK_URL", "Feishu webhook URL is invalid.", 400
                 ) from exc
+        normalized["notification_settings"] = notification
     return normalized, webhook
 
 
-def _legacy_parameter_aliases(indicator: str, raw: Any) -> dict[str, Any]:
-    values = dict(raw) if isinstance(raw, dict) else {}
-    if indicator == "MA" and ("short" in values or "long" in values):
-        periods = [values[key] for key in ("short", "long") if key in values]
-        return {"periods": periods}
-    if indicator == "BOLL" and "stddev" in values:
-        values["multiplier"] = values.pop("stddev")
-    if indicator == "MACD":
-        aliases = {"fast": "fast_period", "slow": "slow_period", "signal": "signal_period"}
-        for old, new in aliases.items():
-            if old in values:
-                values[new] = values.pop(old)
-    return values
-
-
-def _legacy_webhook(settings: dict[str, Any]) -> str | None:
-    nested = settings.get("notification_settings") if isinstance(settings, dict) else None
-    if not isinstance(nested, dict):
-        nested = settings.get("notification") if isinstance(settings, dict) else None
-    raw = nested.get("feishu_webhook") if isinstance(nested, dict) else None
-    return raw.strip() if isinstance(raw, str) and raw.strip() else None
-
-
-def _strip_legacy_webhook(settings: dict[str, Any]) -> dict[str, Any]:
-    result = dict(settings or {})
-    for key in ("notification_settings", "notification"):
-        nested = result.get(key)
-        if isinstance(nested, dict):
-            nested = dict(nested)
-            nested.pop("feishu_webhook", None)
-            result[key] = nested
-    result.pop("feishu_webhook", None)
-    return result
-
-
 def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    public = _strip_legacy_webhook(settings)
+    # Defense in depth: never expose or re-persist a raw credential even when
+    # an administrative/database writer produced an invalid JSON payload.
+    public = dict(settings)
+    public.pop("feishu_webhook", None)
+    public.pop("notification", None)
     nested = public.get("notification_settings")
     if not isinstance(nested, dict):
         nested = {}
@@ -208,7 +165,6 @@ def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:
     nested.pop("feishu_webhook", None)
     nested.pop("feishu_webhook_configured", None)
     public["notification_settings"] = nested
-    public.pop("notification", None)
     return public
 
 

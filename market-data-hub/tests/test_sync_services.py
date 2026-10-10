@@ -175,7 +175,9 @@ class QuoteDividendProvider(FakeProvider):
         }
         self.dividends = {
             "600519": (
-                Dividend(symbol="600519", date=date(2026, 6, 30), cash_amount="2"),
+                # Same-batch duplicates must agree. Corrections arrive as a
+                # separate authoritative response, not an order-dependent winner.
+                Dividend(symbol="600519", date=date(2026, 6, 30), cash_amount="2.10"),
                 Dividend(symbol="600519", date=date(2026, 6, 30), cash_amount="2.10"),
             ),
             "000001": (),
@@ -466,14 +468,15 @@ async def test_dividend_sync_keeps_history_when_provider_returns_no_events() -> 
 @pytest.mark.asyncio
 async def test_qfq_revision_reconciles_removed_provider_dates() -> None:
     class RevisionProvider(FakeProvider):
+        authoritative_history = True
+
         async def get_adjustment_revision(self, symbol):
             return "r2"
 
         async def get_daily_bars_batch(self, symbols, *, adjustment, count):
             return {
                 "600519": tuple(
-                    replace(bar("600519", day), adjustment=Adjustment.QFQ)
-                    for day in (2, 4)
+                    replace(bar("600519", day), adjustment=Adjustment.QFQ) for day in (2, 4)
                 )
             }
 

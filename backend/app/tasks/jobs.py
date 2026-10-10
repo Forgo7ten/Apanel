@@ -133,6 +133,10 @@ async def _run_with_lock_lease(lock: Any, operation: Any) -> Any:
             await operation_task
         raise TaskLockError("task lock lease was lost")
     finally:
+        if not operation_task.done():
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
         if not lost_task.done():
             lost_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -191,9 +195,7 @@ async def _validate_missing_calendar_date(
             validation = await client.validate_calendar(trade_date=candidate)
             status = str(validation.get("status", "UNKNOWN")).upper()
             if status not in {"OPEN", "CLOSED"}:
-                raise PipelineConfigurationError(
-                    "trading calendar actual validation is unknown"
-                )
+                raise PipelineConfigurationError("trading calendar actual validation is unknown")
             if candidate == trade_date:
                 target_status = status
     finally:
@@ -296,25 +298,29 @@ async def execute_quote_refresh(
                 daily_timeout_seconds=app_settings.market_data_daily_timeout_seconds,
                 bootstrap_timeout_seconds=app_settings.market_data_bootstrap_timeout_seconds,
             )
-        totals = {"total": 0, "succeeded": 0, "failed": 0}
-        batch_size = app_settings.market_data_sync_batch_size
-        for offset in range(0, len(normalized_symbols), batch_size):
-            _assert_lock_owned(task_lock)
-            result = await client.sync_quotes(
-                symbols=normalized_symbols[offset : offset + batch_size]
-            )
-            totals["total"] += result.total
-            totals["succeeded"] += result.succeeded
-            totals["failed"] += result.failed
-            if result.retryable_symbols:
-                raise PipelineError("quote synchronization has retryable failures")
-        return {
-            "status": "completed",
-            "operation": "quote_refresh",
-            "symbols": len(normalized_symbols),
-            **totals,
-            "ok": totals["failed"] == 0,
-        }
+
+        async def protected_refresh():
+            totals = {"total": 0, "succeeded": 0, "failed": 0}
+            batch_size = app_settings.market_data_sync_batch_size
+            for offset in range(0, len(normalized_symbols), batch_size):
+                _assert_lock_owned(task_lock)
+                result = await client.sync_quotes(
+                    symbols=normalized_symbols[offset : offset + batch_size]
+                )
+                totals["total"] += result.total
+                totals["succeeded"] += result.succeeded
+                totals["failed"] += result.failed
+                if result.retryable_symbols:
+                    raise PipelineError("quote synchronization has retryable failures")
+            return {
+                "status": "completed",
+                "operation": "quote_refresh",
+                "symbols": len(normalized_symbols),
+                **totals,
+                "ok": totals["failed"] == 0,
+            }
+
+        return await _run_with_lock_lease(task_lock, protected_refresh())
     finally:
         if task_lock is not None:
             with suppress(Exception):
@@ -345,6 +351,7 @@ async def execute_eod_pipeline(
     notification_runner: Any | None = None,
     delta_runner: Any | None = None,
     notification_provider: Any | None = None,
+    force_history: bool = False,
 ) -> dict[str, Any]:
     """Run the strict seven-step EOD sequence under one distributed lease."""
 
@@ -466,6 +473,7 @@ async def execute_eod_pipeline(
                 "session_factory": session_factory,
                 "market_data_client": client,
                 "notification_provider": notification_provider,
+                "force_history": force_history,
                 "analysis_adjustments": (
                     ("qfq", "none") if app_settings.enable_none_analysis else (adjustment,)
                 ),
@@ -540,6 +548,7 @@ def run_eod_pipeline(
     trade_date: str | None = None,
     adjustment: str = "qfq",
     symbols: list[str] | None = None,
+    force_history: bool = False,
 ) -> dict[str, Any]:
     """Celery entrypoint for the post-close indicator/state/alert pipeline."""
 
@@ -549,6 +558,7 @@ def run_eod_pipeline(
             execute_eod_pipeline(
                 trade_date=selected_date,
                 adjustment=adjustment,
+                force_history=force_history,
                 symbols=None if symbols is None else tuple(symbols),
             )
         )
@@ -618,9 +628,7 @@ async def execute_security_bootstrap(
         result = await _run_with_lock_lease(task_lock, bootstrap)
         async with session_factory() as session:
             security = (
-                await session.execute(
-                    select(Security).where(Security.symbol == result.symbol)
-                )
+                await session.execute(select(Security).where(Security.symbol == result.symbol))
             ).scalar_one_or_none()
             if security is None:
                 raise RuntimeError("security bootstrap target was not found")
@@ -688,6 +696,44 @@ def dispatch_pending_notifications_task(task: Task) -> dict[str, int]:
         return asyncio.run(execute_pending_notification_dispatch())
     except Exception as exc:
         _retry_or_raise(task, "notification_dispatch", exc)
+
+
+async def execute_analysis_reconciliation(*, settings=None, session_factory=None, runner=None):
+    from app.services.analysis_recovery import pending_analysis_symbols, recovery_trade_date
+
+    app_settings = settings or get_settings()
+    engine = None
+    if session_factory is None:
+        engine, session_factory = _new_session_factory(app_settings)
+    try:
+        async with session_factory() as session:
+            trade_date = await recovery_trade_date(session, app_settings)
+        if trade_date is None:
+            return {"status": "skipped", "reason": "calendar_unavailable"}
+        monitored = await resolve_monitored_symbols(session_factory)
+        modes = ("qfq", "none") if app_settings.enable_none_analysis else ("qfq",)
+        async with session_factory() as session:
+            symbols = await pending_analysis_symbols(session, monitored, modes, trade_date)
+        if not symbols:
+            return {"status": "skipped", "reason": "no_pending_analysis"}
+        execute = runner or execute_eod_pipeline
+        return await execute(
+            trade_date=trade_date,
+            symbols=symbols,
+            settings=app_settings,
+            session_factory=session_factory,
+        )
+    finally:
+        if engine is not None:
+            await dispose_engine(engine)
+
+
+@celery_app.task(bind=True, name="apanel.tasks.reconcile_analysis", max_retries=None)
+def reconcile_analysis_task(task: Task):
+    try:
+        return asyncio.run(execute_analysis_reconciliation())
+    except Exception as exc:
+        _retry_or_raise(task, "analysis_reconciliation", exc)
 
 
 # Descriptive aliases for callers that prefer an explicit task suffix.

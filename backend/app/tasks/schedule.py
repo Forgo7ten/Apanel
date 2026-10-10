@@ -43,6 +43,17 @@ def build_beat_schedule(settings: Any) -> dict[str, dict[str, Any]]:
             "schedule": crontab(minute="*/5"),
             "options": {"queue": "default"},
         },
+        "reconcile-pending-analysis": {
+            "task": "apanel.tasks.reconcile_analysis",
+            "schedule": crontab(minute="*/10"),
+            "options": {"queue": "pipeline"},
+        },
+        "repair-weekly-history": {
+            "task": "apanel.tasks.run_eod_pipeline",
+            "schedule": crontab(minute="40", hour="23", day_of_week="fri"),
+            "kwargs": {"force_history": True},
+            "options": {"queue": "pipeline"},
+        },
         "run-end-of-day-pipeline": {
             "task": "apanel.tasks.run_eod_pipeline",
             "schedule": crontab(

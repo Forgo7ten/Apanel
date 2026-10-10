@@ -9,6 +9,7 @@ from collections.abc import Iterable, Mapping
 from datetime import date
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
@@ -19,12 +20,15 @@ from app.indicators.parameters import (
     snapshot_variants,
 )
 from app.models import (
-    IndicatorSnapshot as IndicatorSnapshotModel,
+    AnalysisStream,
 )
 from app.models import (
-    IndicatorState,
+    IndicatorSnapshot as IndicatorSnapshotModel,
 )
 from app.repositories.indicator_state import IndicatorStateRepository
+from app.repositories.state_event import StateEventRepository
+from app.schemas.state_row import StateRow
+from app.services.analysis_control import lock_analysis_reads, lock_analysis_stream
 from app.services.history_window import MAX_STATE_HISTORY_ROWS, resolve_history_window
 from app.services.indicator_service import (
     DEFAULT_HISTORY_ADJUSTMENT,
@@ -57,33 +61,87 @@ class StateService:
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
         start: date | None = None,
         latest_only: bool = False,
-    ) -> list[IndicatorState]:
+        end: date | None = None,
+        commit: bool = True,
+        persist: bool = True,
+        max_rows: int | None = None,
+        state_filter: str | None = None,
+        parameter_filter: str | None = None,
+        indicator_filter: str | None = None,
+    ) -> list[StateRow]:
         adjustment = _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
+        if persist:
+            stream = await lock_analysis_stream(self.session, security.id, adjustment)
+            if stream.state_through is None:
+                # First publication must establish an entire defensible
+                # timeline, even if a caller requested only the latest day.
+                start, latest_only = None, False
+        else:
+            stream = await self.session.get(AnalysisStream, (security.id, adjustment))
         calendar = TradingCalendarService(self.session)
 
         persist_from = start
-        read_from = start
-        if start is not None:
-            previous_for_start = (await calendar.previous_open_dates((start,))).get(start)
-            if previous_for_start is not None:
-                read_from = previous_for_start
-
+        if latest_only:
+            query = select(func.max(IndicatorSnapshotModel.trade_date)).where(
+                IndicatorSnapshotModel.security_id == security.id,
+                IndicatorSnapshotModel.adjust_type == adjustment,
+            )
+            if end is not None:
+                query = query.where(IndicatorSnapshotModel.trade_date <= end)
+            persist_from = (await self.session.execute(query)).scalar_one_or_none()
+            if persist_from is None:
+                raise ApiError("STATE_DATA_NOT_FOUND", "No indicator data is available.", 404)
+        read_from = persist_from
+        seed_date = None
+        if persist_from is not None:
+            # Public history bounds may start on a weekend/holiday. Resolve the
+            # predecessor of the first actual observation, not of the requested
+            # calendar date (which cannot itself be proven OPEN).
+            first_query = select(func.min(IndicatorSnapshotModel.trade_date)).where(
+                IndicatorSnapshotModel.security_id == security.id,
+                IndicatorSnapshotModel.adjust_type == adjustment,
+                IndicatorSnapshotModel.trade_date >= persist_from,
+            )
+            if end is not None:
+                first_query = first_query.where(IndicatorSnapshotModel.trade_date <= end)
+            first_date = (await self.session.execute(first_query)).scalar_one_or_none()
+            if first_date is not None:
+                seed_date = (await calendar.previous_open_dates((first_date,))).get(first_date)
+            if seed_date is not None:
+                read_from = seed_date
         snapshots = await self.repository.list_snapshots(
             security.id,
             adjustment=adjustment,
             start=read_from,
+            end=end,
         )
         if not snapshots:
             raise ApiError("STATE_DATA_NOT_FOUND", "No indicator data is available.", 404)
-
-        await self._persist_definitions()
-        existing_states = await self.repository.list_states(security.id, adjustment=adjustment)
+        if persist:
+            await self._persist_definitions()
+        if seed_date is None:
+            seed_states = []
+        elif stream is not None and stream.state_through is not None:
+            seed_states = await StateEventRepository(self.session).seed_at(
+                security.id, adjustment, seed_date
+            )
+        else:
+            seed_states = []
+        seed_states = [
+            row
+            for row in seed_states
+            if (state_filter is None or row.state_code == state_filter)
+            and (parameter_filter is None or row.parameter_key == parameter_filter)
+            and (indicator_filter is None or row.indicator_type == indicator_filter)
+        ]
         existing_by_key = {
-            (item.trade_date, item.state_code, item.parameter_key): item for item in existing_states
+            (item.trade_date, item.state_code, item.parameter_key): item for item in seed_states
         }
         computed_status_by_key: dict[tuple[date, str, str], StateStatus] = {}
-        bars = await self.repository.get_daily_bars(security.id, adjustment=adjustment)
+        bars = await self.repository.get_daily_bars(
+            security.id, adjustment=adjustment, start=read_from, end=end
+        )
         close_by_date = {item.trade_date: float(item.close) for item in bars}
 
         by_date: dict[date, dict[str, IndicatorSnapshotModel]] = defaultdict(dict)
@@ -98,9 +156,13 @@ class StateService:
         else:
             dates_to_persist = set(dates)
         engine = StateEngine(registry=self.registry)
-        persisted: list[IndicatorState] = []
+        persisted: list[StateRow] = []
+        known_targets = {(row.state_code, row.parameter_key): row for row in seed_states}
 
         for trade_date in dates:
+            if trade_date not in dates_to_persist:
+                continue
+            date_offset = len(persisted)
             expected_previous_date = previous_open_by_date.get(trade_date)
             current_by_indicator = by_date[trade_date]
             previous_by_indicator = (
@@ -109,6 +171,10 @@ class StateService:
                 else {}
             )
             for definition in self.registry.definitions():
+                if state_filter is not None and definition.code != state_filter:
+                    continue
+                if indicator_filter is not None and definition.indicator_type != indicator_filter:
+                    continue
                 current_model = current_by_indicator.get(definition.indicator_type)
                 if current_model is None:
                     continue
@@ -121,6 +187,8 @@ class StateService:
                     if current_variant is None:
                         continue
                     state_key = state_parameter_key(definition.code, state_parameters)
+                    if parameter_filter is not None and state_key != parameter_filter:
+                        continue
                     current = _to_domain_snapshot(current_model, current_variant)
                     if current is None:
                         continue
@@ -166,15 +234,12 @@ class StateService:
                             )
                         continue
 
-                    prior_row = existing_by_key.get(
-                        (expected_previous_date, definition.code, state_key)
-                    )
-                    prior_status = (
-                        _state_status(prior_row.status) if prior_row is not None else None
-                    )
+                    previous_key = (expected_previous_date, definition.code, state_key)
+                    prior_status = computed_status_by_key.get(previous_key)
                     if prior_status is None:
-                        prior_status = computed_status_by_key.get(
-                            (expected_previous_date, definition.code, state_key)
+                        prior_row = existing_by_key.get(previous_key)
+                        prior_status = (
+                            _state_status(prior_row.status) if prior_row is not None else None
                         )
                     previous_active = (
                         False
@@ -193,7 +258,7 @@ class StateService:
                         previous_active=previous_active,
                     )
 
-                    if prior_status is StateStatus.UNKNOWN and (result.active or result.reason):
+                    if result.reason:
                         computed_status_by_key[(trade_date, definition.code, state_key)] = (
                             StateStatus.UNKNOWN
                         )
@@ -216,7 +281,7 @@ class StateService:
                     computed_status_by_key[(trade_date, definition.code, state_key)] = result.status
                     if trade_date not in dates_to_persist:
                         continue
-                    state = await self.repository.upsert_state(
+                    state = StateRow(
                         security_id=security.id,
                         trade_date=trade_date,
                         state_code=result.code,
@@ -229,7 +294,13 @@ class StateService:
                             "name": result.name,
                             "level": result.level,
                             "active": result.active,
-                            "transition": result.transition,
+                            "transition": bool(
+                                result.transition
+                                and (
+                                    definition.metadata.get("mode") == "edge"
+                                    or prior_status is StateStatus.INACTIVE
+                                )
+                            ),
                             "reason": result.reason,
                             "values": dict(result.values),
                             "value_context": _state_value_context(
@@ -243,7 +314,54 @@ class StateService:
                         },
                     )
                     persisted.append(state)
-        await self.session.commit()
+            present = {(row.state_code, row.parameter_key) for row in persisted[date_offset:]}
+            for target, old in tuple(known_targets.items()):
+                if target in present:
+                    continue
+                unknown = StateRow(
+                    security_id=security.id,
+                    trade_date=trade_date,
+                    state_code=old.state_code,
+                    indicator_type=old.indicator_type,
+                    status="UNKNOWN",
+                    parameters=dict(old.parameters),
+                    parameter_key=old.parameter_key,
+                    adjust_type=adjustment,
+                    metadata={
+                        "name": old.metadata_json.get("name", old.state_code),
+                        "level": old.metadata_json.get("level", "INFO"),
+                        "active": False,
+                        "transition": False,
+                        "reason": "missing_current_indicator",
+                        "values": {},
+                        "definition": old.metadata_json.get("definition", {}),
+                    },
+                )
+                persisted.append(unknown)
+                computed_status_by_key[(trade_date, *target)] = StateStatus.UNKNOWN
+            known_targets.update(
+                {(row.state_code, row.parameter_key): row for row in persisted[date_offset:]}
+            )
+            if max_rows is not None and len(persisted) > max_rows:
+                raise ApiError(
+                    "HISTORY_RESULT_TOO_LARGE", "Narrow the history range or parameter filter.", 413
+                )
+        if not persist:
+            return persisted
+        assert stream is not None
+        through = end or dates[-1]
+        await StateEventRepository(self.session).publish(
+            stream,
+            persisted,
+            start=persist_from,
+            through=through,
+        )
+        # The direct StateService materialization entry point shares the same
+        # initialization watermark as AnalysisService. Without this write
+        # freshly computed history looks permanently uninitialized.
+        stream.state_through = max(stream.state_through or through, through)
+        if commit:
+            await self.session.commit()
         return persisted
 
     async def _persist_unknown_state(
@@ -258,7 +376,7 @@ class StateService:
         current: IndicatorSnapshot,
         reason: str,
         expected_previous_date: date | None,
-    ) -> IndicatorState:
+    ) -> StateRow:
         metadata: dict[str, Any] = {
             "name": definition.name,
             "level": definition.level,
@@ -270,7 +388,7 @@ class StateService:
         }
         if expected_previous_date is not None:
             metadata["expected_previous_trade_date"] = expected_previous_date.isoformat()
-        return await self.repository.upsert_state(
+        return StateRow(
             security_id=security_id,
             trade_date=trade_date,
             state_code=definition.code,
@@ -288,35 +406,40 @@ class StateService:
         *,
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
         start: date | None = None,
-    ) -> list[IndicatorState]:
-        return await self.calculate(symbol, adjustment=adjustment, start=start, latest_only=False)
+        end: date | None = None,
+        commit: bool = True,
+    ) -> list[StateRow]:
+        return await self.calculate(
+            symbol, adjustment=adjustment, start=start, end=end, commit=commit, latest_only=False
+        )
 
     async def materialize_latest(
         self,
         symbol: str,
         *,
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
-    ) -> list[IndicatorState]:
-        return await self.calculate(symbol, adjustment=adjustment, latest_only=True)
+        end: date | None = None,
+        commit: bool = True,
+    ) -> list[StateRow]:
+        return await self.calculate(
+            symbol, adjustment=adjustment, end=end, commit=commit, latest_only=True
+        )
 
     async def current(
         self,
         symbol: str,
         *,
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
-    ) -> list[IndicatorState]:
+    ) -> list[StateRow]:
         adjustment = _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
-        latest_date = await self.repository.latest_state_date(security.id, adjustment=adjustment)
-        if latest_date is None:
-            raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
-        return await self.repository.list_states(
-            security.id,
-            start=latest_date,
-            end=latest_date,
-            active_only=True,
-            adjustment=adjustment,
+        await lock_analysis_reads(self.session, [security.id], adjustment)
+        rows = await StateEventRepository(self.session).current_many(
+            [security.id], adjustment=adjustment
         )
+        if not rows[security.id]:
+            raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
+        return [row for row in rows[security.id] if row.status == "ACTIVE"]
 
     async def history(
         self,
@@ -328,34 +451,58 @@ class StateService:
         state_code: str | None = None,
         parameter_key: str | None = None,
         indicator_type: str | None = None,
-    ) -> list[IndicatorState]:
+    ) -> list[StateRow]:
         adjustment = _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
         normalized_indicator = (
             str(indicator_type).strip().upper() if indicator_type is not None else None
         )
-        latest_date = await self.repository.latest_state_date(
-            security.id,
-            adjustment=adjustment,
-            state_code=state_code,
-            parameter_key=parameter_key,
-            indicator_type=normalized_indicator,
+        await lock_analysis_reads(self.session, [security.id], adjustment)
+        stream = await self.session.get(AnalysisStream, (security.id, adjustment))
+        if stream is None or stream.state_through is None:
+            raise ApiError("STATE_EVENTS_NOT_READY", "State event history is not initialized.", 409)
+        if stream.published_revision >= 0 and stream.dirty_from is not None:
+            raise ApiError("ANALYSIS_REBUILD_PENDING", "Historical analysis is being rebuilt.", 503)
+        rows = (
+            await StateEventRepository(self.session).current_many(
+                [security.id],
+                adjustment=adjustment,
+                state_code=state_code,
+                parameter_key=parameter_key,
+            )
+        )[security.id]
+        latest_date = max(
+            (
+                row.trade_date
+                for row in rows
+                if normalized_indicator is None or row.indicator_type == normalized_indicator
+            ),
+            default=None,
         )
         if latest_date is None:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
         resolved_start, resolved_end = resolve_history_window(
             start=start, end=end, latest_date=latest_date
         )
-        persisted = await self.repository.list_states(
-            security.id,
+        persisted = await self.calculate(
+            symbol,
+            adjustment=adjustment,
             start=resolved_start,
             end=resolved_end,
-            adjustment=adjustment,
-            state_code=state_code,
-            parameter_key=parameter_key,
-            indicator_type=normalized_indicator,
-            limit=MAX_STATE_HISTORY_ROWS + 1,
+            persist=False,
+            commit=False,
+            max_rows=MAX_STATE_HISTORY_ROWS,
+            state_filter=state_code,
+            parameter_filter=parameter_key,
+            indicator_filter=normalized_indicator,
         )
+        persisted = [
+            row
+            for row in persisted
+            if (state_code is None or row.state_code == state_code)
+            and (parameter_key is None or row.parameter_key == parameter_key)
+            and (normalized_indicator is None or row.indicator_type == normalized_indicator)
+        ]
         if not persisted:
             raise ApiError("STATE_DATA_NOT_FOUND", "No state data is available.", 404)
         if len(persisted) > MAX_STATE_HISTORY_ROWS:
@@ -373,9 +520,14 @@ class StateService:
         return security
 
     async def _persist_definitions(self) -> None:
+        existing = {
+            row.state_code: row
+            for row in await self.repository.list_state_definitions(enabled_only=False)
+        }
+        updates = []
         for definition in self.registry.definitions():
             metadata = _json_value(definition.metadata)
-            await self.repository.upsert_state_definition(
+            payload = dict(
                 state_code=definition.code,
                 indicator_type=definition.indicator_type,
                 name=definition.name,
@@ -384,6 +536,11 @@ class StateService:
                 metadata=metadata,
                 enabled=True,
             )
+            old = existing.get(definition.code)
+            if old is None or any(getattr(old, key) != value for key, value in payload.items()):
+                updates.append(payload)
+        if updates:
+            await self.repository.upsert_definitions(updates)
 
 
 def _state_status(value: Any) -> StateStatus | None:
@@ -422,7 +579,7 @@ def _state_variant_pairs(
             if len(normalized_periods) == 2:
                 pairs = ((normalized_periods[0], normalized_periods[1]),)
             elif set(DEFAULT_MA_PERIODS).issubset(normalized_periods):
-                # Legacy snapshots may contain one merged MA bundle.  Preserve
+                # Current MA variants may contain multiple periods. Preserve
                 # the built-in MA5/10 state without recreating every possible
                 # cross-product from unrelated numeric MA columns.
                 pairs = ((DEFAULT_MA_PERIODS[0], DEFAULT_MA_PERIODS[1]),)
@@ -477,7 +634,6 @@ def _project_ma_pair(variant: IndicatorVariant, short: int, long: int) -> Indica
         values,
         previous,
         delta,
-        variant.source_format,
     )
 
 

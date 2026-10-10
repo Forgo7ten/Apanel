@@ -87,6 +87,7 @@ class DividendYieldService:
         security_ids: Iterable[int],
         *,
         quotes: Mapping[int, QuoteSnapshot] | None = None,
+        daily_bars: Mapping[int, Any] | None = None,
     ) -> dict[int, DividendYieldResult | ApiError]:
         """Calculate yield for many securities with bounded repository reads.
 
@@ -102,7 +103,8 @@ class DividendYieldService:
         quote_rows = (
             quotes if quotes is not None else await self.repository.latest_quotes_batch(ids)
         )
-        daily_bars = await self.repository.latest_daily_bars_batch(ids)
+        if daily_bars is None:
+            daily_bars = await self.repository.latest_daily_bars_batch(ids)
 
         price_data: dict[int, tuple[Decimal, datetime, str]] = {}
         results: dict[int, DividendYieldResult | ApiError] = {}

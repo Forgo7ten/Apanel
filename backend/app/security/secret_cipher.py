@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
 from collections.abc import Mapping
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.core.config import Settings, get_settings
+from app.security.keyring import parse_secret_keyring
 
 
 class SecretCipher:
@@ -36,36 +36,16 @@ class SecretCipher:
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> SecretCipher:
         selected = settings or get_settings()
-        raw = selected.app_secrets_key
-        if raw:
-            try:
-                key = base64.urlsafe_b64decode(raw.encode("ascii"))
-            except Exception as exc:
-                raise ValueError("APP_SECRETS_KEY must be URL-safe base64") from exc
-        elif selected.app_env.casefold() == "production":
-            raise ValueError("APP_SECRETS_KEY is required in production")
-        else:
-            # Stable local/test fallback only; production never reaches this path.
-            key = hashlib.sha256(selected.jwt_secret_key.encode("utf-8")).digest()
-        previous: dict[str, bytes] = {}
-        if selected.app_secrets_previous_keys:
-            try:
-                payload = json.loads(selected.app_secrets_previous_keys)
-                if not isinstance(payload, dict):
-                    raise TypeError
-                previous = {
-                    str(version): base64.urlsafe_b64decode(str(encoded).encode("ascii"))
-                    for version, encoded in payload.items()
-                }
-            except Exception as exc:
-                raise ValueError(
-                    "APP_SECRETS_PREVIOUS_KEYS must be a JSON object of URL-safe base64 keys"
-                ) from exc
-        return cls(
-            key,
-            key_version=selected.app_secrets_key_version,
-            decryption_keys=previous,
+        fallback = None
+        if selected.app_env.casefold() != "production":
+            fallback = hashlib.sha256(selected.jwt_secret_key.encode("utf-8")).digest()
+        ring = parse_secret_keyring(
+            selected.app_secrets_key,
+            selected.app_secrets_key_version,
+            selected.app_secrets_previous_keys,
+            fallback_key=fallback,
         )
+        return cls(ring.key, key_version=ring.version, decryption_keys=ring.previous)
 
     def encrypt(self, plaintext: str, *, aad: str) -> str:
         nonce = os.urandom(12)

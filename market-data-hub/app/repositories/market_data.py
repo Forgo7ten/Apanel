@@ -9,14 +9,16 @@ surface connection and transaction failures to its caller.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.domain.deduplication import unique_facts
 from app.domain.market_data import (
     Adjustment,
     DailyBar,
@@ -34,6 +36,7 @@ from app.models.market_data import (
     SecurityModel,
     TradingCalendarModel,
 )
+from app.repositories.analysis_stream import combine_changed, invalidate_changed, lock_streams
 
 _ASYNCPG_MAX_BIND_PARAMETERS = 32767
 
@@ -55,7 +58,9 @@ class SecurityRepository(Protocol):
 
     async def upsert_many(self, records: Sequence[Security]) -> None: ...
 
-    async def reconcile_snapshot(self, records: Sequence[Security]) -> None: ...
+    async def reconcile_snapshot(
+        self, records: Sequence[Security], *, authoritative: bool = False
+    ) -> None: ...
 
 
 class DailyBarRepository(Protocol):
@@ -225,6 +230,18 @@ class SqlAlchemyTradingCalendarRepository:
                 }
 
 
+def validate_security_snapshot(previous, records: Sequence[Security]) -> None:
+    """Fail closed on source truncation, including one missing exchange/category."""
+    old = {symbol for symbol, _market, _kind in previous}
+    current = {record.symbol for record in records}
+    if old and len(old - current) / len(old) > 0.05:
+        raise PersistenceRecordError("security snapshot shrinkage exceeds safety threshold")
+    prior_segments = Counter((market, kind) for _symbol, market, kind in previous)
+    new_segments = Counter((record.market.value, record.security_type.value) for record in records)
+    if any(new_segments[segment] < count * 0.95 for segment, count in prior_segments.items()):
+        raise PersistenceRecordError("security snapshot contains an incomplete market segment")
+
+
 class SqlAlchemySecurityRepository:
     """Protocol-compatible repository for security metadata."""
 
@@ -254,7 +271,9 @@ class SqlAlchemySecurityRepository:
             async with session.begin():
                 await self._upsert_in_session(session, records)
 
-    async def reconcile_snapshot(self, records: Sequence[Security]) -> None:
+    async def reconcile_snapshot(
+        self, records: Sequence[Security], *, authoritative: bool = False
+    ) -> None:
         """Persist one authoritative universe and inactivate missing symbols atomically."""
 
         records = self._validated_records(records)
@@ -263,15 +282,29 @@ class SqlAlchemySecurityRepository:
         active_symbols = tuple(record.symbol for record in records)
         async with self._session_factory() as session:
             async with session.begin():
-                await self._upsert_in_session(session, records)
-                await session.execute(
-                    update(SecurityModel)
-                    .where(
-                        SecurityModel.status == "ACTIVE",
-                        SecurityModel.symbol.not_in(active_symbols),
+                bind = getattr(session, "bind", None)
+                if bind is not None and bind.dialect.name == "postgresql":
+                    await session.execute(text("SELECT pg_advisory_xact_lock(7284141301)"))
+                previous = (
+                    await session.execute(
+                        select(
+                            SecurityModel.symbol, SecurityModel.market, SecurityModel.security_type
+                        ).where(SecurityModel.status == "ACTIVE")
                     )
-                    .values(status="INACTIVE")
-                )
+                ).all()
+                validate_security_snapshot(previous, records)
+                await self._upsert_in_session(session, records)
+                # Missing is not delisted. TDX/AKShare lists have no explicit
+                # removal authority; only a verified full snapshot may remove.
+                if authoritative:
+                    await session.execute(
+                        update(SecurityModel)
+                        .where(
+                            SecurityModel.status == "ACTIVE",
+                            SecurityModel.symbol.not_in(active_symbols),
+                        )
+                        .values(status="INACTIVE")
+                    )
 
     def _validated_records(self, records: Sequence[Security]) -> tuple[Security, ...]:
         records = tuple(records)
@@ -279,9 +312,7 @@ class SqlAlchemySecurityRepository:
             raise PersistenceRecordError("security repository received an invalid record")
         return _unique_records(records, key=lambda record: record.symbol)
 
-    async def _upsert_in_session(
-        self, session: AsyncSession, records: Sequence[Security]
-    ) -> None:
+    async def _upsert_in_session(self, session: AsyncSession, records: Sequence[Security]) -> None:
         parameters_per_record = len(_security_values(records[0]))
         batch_size = max(1, _ASYNCPG_MAX_BIND_PARAMETERS // parameters_per_record)
         # asyncpg rejects prepared statements with more than 32,767 bind
@@ -301,7 +332,7 @@ class SqlAlchemySecurityRepository:
 
 
 class SqlAlchemyDailyBarRepository:
-    """Protocol-compatible repository for adjusted daily bars."""
+    """Atomic facts + invalidation, with fencing against stale provider responses."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -310,23 +341,58 @@ class SqlAlchemyDailyBarRepository:
     def build_upsert_statement(records: Sequence[dict[str, Any]]):
         values = [_daily_values(item["security_id"], item["record"]) for item in records]
         statement = postgres_insert(DailyBarModel).values(values)
+        fields = ("open", "high", "low", "close", "volume", "amount")
         return statement.on_conflict_do_update(
-            index_elements=[
-                DailyBarModel.security_id,
-                DailyBarModel.trade_date,
-                DailyBarModel.adjust_type,
-            ],
-            set_={
-                "open": statement.excluded.open,
-                "high": statement.excluded.high,
-                "low": statement.excluded.low,
-                "close": statement.excluded.close,
-                "volume": statement.excluded.volume,
-                "amount": statement.excluded.amount,
-            },
-        )
+            index_elements=["security_id", "trade_date", "adjust_type"],
+            set_={field: statement.excluded[field] for field in fields},
+            where=or_(
+                *(
+                    getattr(DailyBarModel, field).is_distinct_from(statement.excluded[field])
+                    for field in fields
+                )
+            ),
+        ).returning(DailyBarModel.security_id, DailyBarModel.adjust_type, DailyBarModel.trade_date)
+
+    async def reserve_sync(self, symbols, *, adjustment) -> dict[str, int]:
+        selected = normalize_adjustment(adjustment).value
+        normalized = sorted({normalize_symbol(symbol) for symbol in symbols})
+        async with self._session_factory() as session:
+            async with session.begin():
+                rows = (
+                    await session.execute(
+                        select(SecurityModel.id, SecurityModel.symbol).where(
+                            SecurityModel.symbol.in_(normalized)
+                        )
+                    )
+                ).all()
+                streams = await lock_streams(session, [(sid, selected) for sid, _symbol in rows])
+                result = {}
+                for sid, symbol in rows:
+                    stream = streams[(sid, selected)]
+                    stream.sync_generation += 1
+                    result[symbol] = stream.sync_generation
+                return result
+
+    @staticmethod
+    def _check_fences(streams, security_ids, expected, adjustment):
+        if expected is None:
+            return
+        for symbol, security_id in security_ids.items():
+            stream = streams[(security_id, adjustment)]
+            if expected.get(symbol) != stream.sync_generation:
+                raise PersistenceRecordError("market-data sync was superseded")
 
     async def upsert_many(self, records: Sequence[DailyBar]) -> None:
+        await self.upsert_fenced(records)
+
+    async def upsert_fenced(
+        self,
+        records: Sequence[DailyBar],
+        *,
+        generations=None,
+        revisions=None,
+        provider_name="provider",
+    ) -> None:
         records = self._validated_records(records)
         if not records:
             return
@@ -334,72 +400,175 @@ class SqlAlchemyDailyBarRepository:
         async with self._session_factory() as session:
             async with session.begin():
                 security_ids = await _security_ids(session, symbols)
-                await self._upsert_in_session(session, records, security_ids)
+                keys = {(security_ids[bar.symbol], bar.adjustment.value) for bar in records}
+                streams = await lock_streams(session, keys)
+                for adjustment in {bar.adjustment.value for bar in records}:
+                    subset = {
+                        symbol: sid
+                        for symbol, sid in security_ids.items()
+                        if (sid, adjustment) in keys
+                    }
+                    self._check_fences(streams, subset, generations, adjustment)
+                changed, latest = await self._upsert_in_session(session, records, security_ids)
+                if revisions:
+                    for symbol, revision in revisions.items():
+                        if symbol in security_ids and (security_ids[symbol], "qfq") in keys:
+                            first, last, revised = await self._revision_in_session(
+                                session, security_ids[symbol], revision, provider_name
+                            )
+                            if revised and first is not None:
+                                combine_changed(changed, (security_ids[symbol], "qfq"), first)
+                                latest[(security_ids[symbol], "qfq")] = last
+                await invalidate_changed(session, changed, latest)
 
     async def reconcile_revision(
         self,
         symbol: str,
         records: Sequence[DailyBar],
         *,
-        adjustment: Adjustment | str,
+        adjustment,
         coverage_start: date,
         coverage_end: date,
+        generations=None,
+        revision_hash=None,
+        provider_name="provider",
     ) -> None:
-        """Replace the prior qfq revision inside its known coverage atomically."""
-
         canonical = normalize_symbol(symbol)
         selected = normalize_adjustment(adjustment)
         records = self._validated_records(records)
-        if not records:
-            raise PersistenceRecordError("revised daily-bar snapshot must not be empty")
-        if any(
-            record.symbol != canonical or record.adjustment is not selected for record in records
+        if not records or any(
+            bar.symbol != canonical or bar.adjustment is not selected for bar in records
         ):
-            raise PersistenceRecordError("revised daily-bar snapshot does not match target")
-        if coverage_start > coverage_end:
-            raise PersistenceRecordError("daily-bar revision coverage is invalid")
+            raise PersistenceRecordError("revised snapshot does not match its target")
+        if (
+            coverage_start > coverage_end
+            or min(bar.trade_date for bar in records) > coverage_start
+            or max(bar.trade_date for bar in records) < coverage_end
+        ):
+            raise PersistenceRecordError("revised snapshot does not cover replacement range")
         async with self._session_factory() as session:
             async with session.begin():
                 security_ids = await _security_ids(session, (canonical,))
-                await self._upsert_in_session(session, records, security_ids)
-                dates = tuple(record.trade_date for record in records)
-                await session.execute(
-                    delete(DailyBarModel).where(
-                        DailyBarModel.security_id == security_ids[canonical],
-                        DailyBarModel.adjust_type == selected.value,
-                        DailyBarModel.trade_date >= coverage_start,
-                        DailyBarModel.trade_date <= coverage_end,
-                        DailyBarModel.trade_date.not_in(dates),
+                sid = security_ids[canonical]
+                streams = await lock_streams(session, [(sid, selected.value)])
+                self._check_fences(streams, security_ids, generations, selected.value)
+                changed, latest = await self._upsert_in_session(session, records, security_ids)
+                deleted = (
+                    (
+                        await session.execute(
+                            delete(DailyBarModel)
+                            .where(
+                                DailyBarModel.security_id == sid,
+                                DailyBarModel.adjust_type == selected.value,
+                                DailyBarModel.trade_date >= coverage_start,
+                                DailyBarModel.trade_date <= coverage_end,
+                                DailyBarModel.trade_date.not_in(
+                                    [bar.trade_date for bar in records]
+                                ),
+                            )
+                            .returning(DailyBarModel.trade_date)
+                        )
                     )
+                    .scalars()
+                    .all()
                 )
+                if deleted:
+                    combine_changed(changed, (sid, selected.value), min(deleted))
+                if revision_hash is not None:
+                    await self._revision_in_session(
+                        session, sid, revision_hash, provider_name, rebased=True
+                    )
+                combine_changed(changed, (sid, selected.value), coverage_start)
+                latest[(sid, selected.value)] = max(bar.trade_date for bar in records)
+                await invalidate_changed(session, changed, latest)
+
+    async def _revision_in_session(
+        self, session, security_id, revision, provider_name, rebased=False
+    ):
+        previous = (
+            await session.execute(
+                select(MarketDataAdjustmentStateModel.revision_hash).where(
+                    MarketDataAdjustmentStateModel.security_id == security_id
+                )
+            )
+        ).scalar_one_or_none()
+        first, last = (
+            await session.execute(
+                select(
+                    func.min(DailyBarModel.trade_date), func.max(DailyBarModel.trade_date)
+                ).where(
+                    DailyBarModel.security_id == security_id, DailyBarModel.adjust_type == "qfq"
+                )
+            )
+        ).one()
+        values = {
+            "security_id": security_id,
+            "provider_name": provider_name,
+            "revision_hash": revision,
+            "qfq_coverage_start": first,
+            "qfq_coverage_end": last,
+            "updated_at": datetime.now(UTC),
+            "last_rebased_at": datetime.now(UTC) if rebased else None,
+        }
+        stmt = postgres_insert(MarketDataAdjustmentStateModel).values(**values)
+        fields = (
+            "provider_name",
+            "revision_hash",
+            "qfq_coverage_start",
+            "qfq_coverage_end",
+            "updated_at",
+        )
+        updates = {field: stmt.excluded[field] for field in fields}
+        if rebased:
+            updates["last_rebased_at"] = stmt.excluded.last_rebased_at
+        await session.execute(
+            stmt.on_conflict_do_update(index_elements=["security_id"], set_=updates)
+        )
+        return first, last, previous is not None and previous != revision
+
+    async def complete_sync(self, symbols, *, adjustment, generations, history_depth=0):
+        symbols = tuple(symbols)
+        if not symbols:
+            return
+        selected = normalize_adjustment(adjustment).value
+        async with self._session_factory() as session:
+            async with session.begin():
+                security_ids = await _security_ids(session, symbols)
+                streams = await lock_streams(
+                    session, [(sid, selected) for sid in security_ids.values()]
+                )
+                self._check_fences(streams, security_ids, generations, selected)
+                for stream in streams.values():
+                    stream.history_depth = max(stream.history_depth, history_depth or 0)
+                    stream.last_sync_at = datetime.now(UTC)
 
     def _validated_records(self, records: Sequence[DailyBar]) -> tuple[DailyBar, ...]:
         records = tuple(records)
         if any(not isinstance(record, DailyBar) for record in records):
             raise PersistenceRecordError("daily-bar repository received an invalid record")
-        return _unique_records(
-            records,
-            key=lambda record: (record.symbol, record.trade_date, record.adjustment),
+        unique = _unique_records(
+            records, key=lambda bar: (bar.symbol, bar.trade_date, bar.adjustment)
+        )
+        return tuple(
+            sorted(unique, key=lambda bar: (bar.symbol, bar.adjustment.value, bar.trade_date))
         )
 
-    async def _upsert_in_session(
-        self,
-        session: AsyncSession,
-        records: Sequence[DailyBar],
-        security_ids: dict[str, int],
-    ) -> None:
-        parameters_per_record = len(_daily_values(security_ids[records[0].symbol], records[0]))
-        batch_size = max(1, _ASYNCPG_MAX_BIND_PARAMETERS // parameters_per_record)
+    async def _upsert_in_session(self, session, records, security_ids):
+        changed, latest = {}, {}
+        size = len(_daily_values(security_ids[records[0].symbol], records[0]))
+        batch_size = max(1, (_ASYNCPG_MAX_BIND_PARAMETERS - 64) // size)
         for offset in range(0, len(records), batch_size):
-            batch = records[offset : offset + batch_size]
-            await session.execute(
-                self.build_upsert_statement(
-                    [
-                        {"security_id": security_ids[record.symbol], "record": record}
-                        for record in batch
-                    ]
-                )
+            statement = self.build_upsert_statement(
+                [
+                    {"security_id": security_ids[record.symbol], "record": record}
+                    for record in records[offset : offset + batch_size]
+                ]
             )
+            rows = (await session.execute(statement)).all()
+            for sid, adjustment, day in rows:
+                combine_changed(changed, (sid, adjustment), day)
+                latest[(sid, adjustment)] = max(latest.get((sid, adjustment), day), day)
+        return changed, latest
 
     async def list_by_symbol(
         self,
@@ -597,12 +766,11 @@ def _dividend_values(security_id: int, record: Dividend) -> dict[str, Any]:
 
 
 def _unique_records(records: Sequence[Any], *, key) -> tuple[Any, ...]:
-    """Keep the last value for a unique key before a PostgreSQL upsert."""
-
-    unique: dict[Any, Any] = {}
-    for record in records:
-        unique[key(record)] = record
-    return tuple(unique.values())
+    """Deduplicate identical facts, rejecting conflicts even for direct repository callers."""
+    try:
+        return unique_facts(records, key=key)
+    except ValueError as error:
+        raise PersistenceRecordError("conflicting market records for one identity") from error
 
 
 def _security_from_model(model: SecurityModel) -> Security:

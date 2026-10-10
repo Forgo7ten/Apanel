@@ -24,6 +24,8 @@ def test_worker_and_scheduler_share_the_celery_application() -> None:
         "refresh-quotes-close",
         "dispatch-pending-notifications",
         "run-end-of-day-pipeline",
+        "repair-weekly-history",
+        "reconcile-pending-analysis",
     }
     assert celery_app.conf.timezone == "Asia/Shanghai"
     assert celery_app.conf.enable_utc is False

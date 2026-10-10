@@ -76,7 +76,9 @@ class EltdxProvider:
         seen: dict[str, Security] = {}
         for market in ("sh", "sz", "bj"):
             rows = self._client.codes.all(market)
-            for row in rows or ():
+            if not rows:
+                raise ProviderUnavailableError("eltdx security master omitted an exchange")
+            for row in rows:
                 category = str(getattr(row, "category", ""))
                 if category == "a_share":
                     security_type = SecurityType.STOCK
@@ -134,13 +136,16 @@ class EltdxProvider:
             canonical = normalize_symbol(row_code)
             if canonical not in canonical_symbols:
                 raise InvalidMarketDataError("eltdx quote symbol does not match request")
-            result[canonical] = Quote(
+            quote = Quote(
                 symbol=canonical,
                 price=row.last_price,
                 change=getattr(row, "change", None),
                 change_percent=getattr(row, "change_pct", None),
                 timestamp=observed_at,
             )
+            if canonical in result and result[canonical] != quote:
+                raise InvalidMarketDataError("conflicting quotes in provider response")
+            result[canonical] = quote
         return tuple(result[symbol] for symbol in canonical_symbols if symbol in result)
 
     async def get_daily_bars(
@@ -150,44 +155,18 @@ class EltdxProvider:
         end: date,
         adjustment: Adjustment | str = Adjustment.QFQ,
     ) -> Sequence[DailyBar]:
-        canonical = normalize_symbol(symbol)
-        selected = normalize_adjustment(adjustment)
         if start > end:
             raise InvalidMarketDataError("start must not be after end")
-        series = await self._call(
-            "daily bars",
-            self._client.bars.get,
-            _full_code(canonical),
-            period="day",
-            adjust=selected.value,
-            count=max(8, min(self._bar_page_size, (end - start).days * 2 + 8)),
+        rows = await self.get_daily_bars_window(
+            (symbol,),
+            adjustment=adjustment,
+            count=max(8, (end - start).days + 1),
+            end=end,
         )
-        adjust_mode = str(getattr(series, "adjust_mode", "")).strip().lower()
-        if adjust_mode and adjust_mode != selected.value:
-            raise InvalidMarketDataError("eltdx daily-bar adjustment does not match request")
-        rows: list[DailyBar] = []
-        for bar in getattr(series, "bars", ()) or ():
-            timestamp = getattr(bar, "time", None)
-            if not isinstance(timestamp, datetime):
-                raise InvalidMarketDataError("eltdx daily bar is missing a datetime")
-            trade_date = timestamp.date()
-            if trade_date < start or trade_date > end:
-                continue
-            rows.append(
-                DailyBar(
-                    symbol=canonical,
-                    trade_date=trade_date,
-                    open=bar.open,
-                    high=bar.high,
-                    low=bar.low,
-                    close=bar.close,
-                    volume=bar.volume_lots,
-                    amount=getattr(bar, "amount", None),
-                    adjustment=selected,
-                )
-            )
-        rows.sort(key=lambda item: item.trade_date)
-        return tuple(rows)
+        canonical = normalize_symbol(symbol)
+        if canonical not in rows:
+            raise ProviderUnavailableError("eltdx omitted requested daily-bar symbol")
+        return tuple(bar for bar in rows[canonical] if bar.trade_date >= start)
 
     async def get_daily_bars_batch(
         self,
@@ -196,49 +175,78 @@ class EltdxProvider:
         adjustment: Adjustment | str = Adjustment.QFQ,
         count: int,
     ) -> dict[str, Sequence[DailyBar]]:
+        return await self.get_daily_bars_window(symbols, adjustment=adjustment, count=count)
+
+    async def get_daily_bars_window(
+        self,
+        symbols: Sequence[str],
+        *,
+        adjustment: Adjustment | str = Adjustment.QFQ,
+        count: int,
+        end: date | None = None,
+    ) -> dict[str, Sequence[DailyBar]]:
+        """Page from newest using TDX's 800-row limit; cutoff applies before counting.
+
+        Missing symbols remain missing, while an explicitly empty/exhausted
+        series is represented by an empty tuple. Never call a limited page a
+        complete history merely because an old end date filtered it to zero.
+        """
         selected = normalize_adjustment(adjustment)
-        if count <= 0:
-            raise InvalidMarketDataError("count must be positive")
-        canonical_symbols = tuple(dict.fromkeys(normalize_symbol(item) for item in symbols))
-        if not canonical_symbols:
-            return {}
-        full_codes = [_full_code(symbol) for symbol in canonical_symbols]
-        response = await self._call(
-            "daily bars",
-            self._client.bars.get,
-            full_codes,
-            period="day",
-            adjust=selected.value,
-            count=count,
-        )
-        # eltdx returns one series for one code and a mapping/sequence for many
-        # depending on minor version. Normalize all supported public shapes.
-        raw_by_symbol: dict[str, Any] = {}
-        if isinstance(response, dict):
-            for key, value in response.items():
-                raw_by_symbol[normalize_symbol(str(key))] = value
-        elif isinstance(response, Sequence) and not isinstance(response, (str, bytes)):
-            for value in response:
-                code = getattr(value, "code", None) or getattr(value, "symbol", None)
-                if code is not None:
-                    raw_by_symbol[normalize_symbol(str(code))] = value
-        elif len(canonical_symbols) == 1:
-            raw_by_symbol[canonical_symbols[0]] = response
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise InvalidMarketDataError("count must be a positive integer")
+        pending = list(dict.fromkeys(normalize_symbol(item) for item in symbols))
+        collected: dict[str, dict[date, DailyBar]] = {symbol: {} for symbol in pending}
         result: dict[str, Sequence[DailyBar]] = {}
-        for symbol in canonical_symbols:
-            series = raw_by_symbol.get(symbol)
-            if series is None:
-                continue
-            adjust_mode = str(getattr(series, "adjust_mode", "")).strip().lower()
-            if adjust_mode and adjust_mode != selected.value:
-                raise InvalidMarketDataError("eltdx daily-bar adjustment does not match request")
-            bars: list[DailyBar] = []
-            for bar in getattr(series, "bars", ()) or ():
-                timestamp = getattr(bar, "time", None)
-                if not isinstance(timestamp, datetime):
-                    raise InvalidMarketDataError("eltdx daily bar is missing a datetime")
-                bars.append(
-                    DailyBar(
+        page_size = min(count, self._bar_page_size)
+        for page in range(self._bar_max_pages):
+            if not pending:
+                break
+            kwargs = {
+                "period": "day",
+                "adjust": selected.value,
+                "count": page_size,
+                "start": page * page_size,
+            }
+            response = await self._call(
+                "daily bars",
+                self._client.bars.get,
+                [_full_code(symbol) for symbol in pending],
+                **kwargs,
+            )
+            if isinstance(response, dict):
+                raw = {normalize_symbol(str(key)): value for key, value in response.items()}
+            elif isinstance(response, Sequence) and not isinstance(response, (str, bytes)):
+                raw = {}
+                for value in response:
+                    code = getattr(value, "code", None) or getattr(value, "symbol", None)
+                    if code is not None:
+                        raw[normalize_symbol(str(code))] = value
+            elif len(pending) == 1:
+                raw = {pending[0]: response}
+            else:
+                raise ProviderUnavailableError("eltdx returned an invalid batch response")
+            next_pending = []
+            for symbol in pending:
+                series = raw.get(symbol)
+                if series is None:
+                    collected.pop(symbol, None)
+                    continue
+                mode = str(getattr(series, "adjust_mode", "")).strip().lower()
+                if mode and mode != selected.value:
+                    raise InvalidMarketDataError(
+                        "eltdx daily-bar adjustment does not match request"
+                    )
+                source = getattr(series, "bars", None)
+                if source is None:
+                    raise ProviderUnavailableError("eltdx daily-bar series has no bars field")
+                bars = tuple(source)
+                for bar in bars:
+                    timestamp = getattr(bar, "time", None)
+                    if not isinstance(timestamp, datetime):
+                        raise InvalidMarketDataError("eltdx daily bar is missing a datetime")
+                    if end is not None and timestamp.date() > end:
+                        continue
+                    record = DailyBar(
                         symbol=symbol,
                         trade_date=timestamp.date(),
                         open=bar.open,
@@ -249,9 +257,21 @@ class EltdxProvider:
                         amount=getattr(bar, "amount", None),
                         adjustment=selected,
                     )
-                )
-            bars.sort(key=lambda item: item.trade_date)
-            result[symbol] = tuple(bars[-count:])
+                    existing = collected[symbol].get(record.trade_date)
+                    if existing is not None and existing != record:
+                        raise InvalidMarketDataError(
+                            "conflicting daily bars across provider pages"
+                        )
+                    collected[symbol][record.trade_date] = record
+                if len(collected[symbol]) >= count or len(bars) < page_size:
+                    result[symbol] = tuple(
+                        collected[symbol][day] for day in sorted(collected[symbol])[-count:]
+                    )
+                else:
+                    next_pending.append(symbol)
+            pending = next_pending
+        if pending:
+            raise ProviderUnavailableError("eltdx history coverage exceeds bounded paging budget")
         return result
 
     async def is_trading_day(self, trade_date: date) -> bool:

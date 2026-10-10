@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import (
     DailyBar,
     IndicatorSnapshot,
-    IndicatorState,
     Security,
     StateDefinition,
 )
@@ -31,6 +30,58 @@ class IndicatorStateRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def _upsert_many(self, model, payloads, conflict_columns, update_columns):
+        if not payloads:
+            return []
+        unique = {
+            tuple(payload[column] for column in conflict_columns): payload for payload in payloads
+        }
+        ordered = [unique[key] for key in sorted(unique)]
+        bind = self.session.get_bind()
+        factory = postgres_insert if bind.dialect.name == "postgresql" else sqlite_insert
+        result = []
+        size = max(1, min(400, 30000 // max(len(item) for item in ordered)))
+        for offset in range(0, len(ordered), size):
+            values = [
+                {
+                    ("metadata_json" if key == "metadata" else key): value
+                    for key, value in row.items()
+                }
+                for row in ordered[offset : offset + size]
+            ]
+            statement = factory(model).values(values)
+            statement = statement.on_conflict_do_update(
+                index_elements=list(conflict_columns),
+                set_={column: statement.excluded[column] for column in update_columns},
+            ).returning(model)
+            rows = (
+                (
+                    await self.session.execute(
+                        statement, execution_options={"populate_existing": True}
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            result.extend(rows)
+        return result
+
+    async def upsert_snapshots(self, payloads):
+        return await self._upsert_many(
+            IndicatorSnapshot,
+            payloads,
+            ("security_id", "trade_date", "indicator_type", "adjust_type"),
+            ("parameters", "values", "previous_values", "delta"),
+        )
+
+    async def upsert_definitions(self, payloads):
+        return await self._upsert_many(
+            StateDefinition,
+            payloads,
+            ("state_code",),
+            ("indicator_type", "name", "description", "level", "metadata", "enabled"),
+        )
+
     async def get_security(self, symbol: str) -> Security | None:
         return (
             await self.session.execute(select(Security).where(Security.symbol == symbol))
@@ -41,14 +92,24 @@ class IndicatorStateRepository:
         security_id: int,
         *,
         adjustment: str | None = None,
+        end: date | None = None,
+        start: date | None = None,
     ) -> list[DailyBar]:
         statement: Select[tuple[DailyBar]] = select(DailyBar).where(
             DailyBar.security_id == security_id
         )
         if adjustment is not None:
             statement = statement.where(DailyBar.adjust_type == adjustment)
+        if start is not None:
+            statement = statement.where(DailyBar.trade_date >= start)
+        if end is not None:
+            statement = statement.where(DailyBar.trade_date <= end)
         statement = statement.order_by(DailyBar.trade_date.asc(), DailyBar.id.asc())
-        return list((await self.session.execute(statement)).scalars())
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
     async def upsert_snapshot(
         self,
@@ -72,22 +133,7 @@ class IndicatorStateRepository:
             "previous_values": previous_values,
             "delta": delta,
         }
-        await self._upsert(
-            IndicatorSnapshot,
-            payload,
-            conflict_columns=("security_id", "trade_date", "indicator_type", "adjust_type"),
-            update_columns=("parameters", "values", "previous_values", "delta"),
-        )
-        return (
-            await self.session.execute(
-                select(IndicatorSnapshot).where(
-                    IndicatorSnapshot.security_id == security_id,
-                    IndicatorSnapshot.trade_date == trade_date,
-                    IndicatorSnapshot.indicator_type == indicator_type,
-                    IndicatorSnapshot.adjust_type == adjust_type,
-                )
-            )
-        ).scalar_one()
+        return (await self.upsert_snapshots([payload]))[0]
 
     async def list_snapshots(
         self,
@@ -112,7 +158,11 @@ class IndicatorStateRepository:
         statement = statement.order_by(
             IndicatorSnapshot.trade_date.asc(), IndicatorSnapshot.indicator_type.asc()
         )
-        return list((await self.session.execute(statement)).scalars())
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
     async def latest_snapshot_date(
         self, security_id: int, *, adjustment: str | None = None
@@ -121,11 +171,7 @@ class IndicatorStateRepository:
             await self.session.execute(
                 select(func.max(IndicatorSnapshot.trade_date)).where(
                     IndicatorSnapshot.security_id == security_id,
-                    *(
-                        ()
-                        if adjustment is None
-                        else (IndicatorSnapshot.adjust_type == adjustment,)
-                    ),
+                    *(() if adjustment is None else (IndicatorSnapshot.adjust_type == adjustment,)),
                 )
             )
         ).scalar_one_or_none()
@@ -181,164 +227,22 @@ class IndicatorStateRepository:
             "metadata": metadata,
             "enabled": enabled,
         }
-        await self._upsert(
-            StateDefinition,
-            payload,
-            conflict_columns=("state_code",),
-            update_columns=(
-                "indicator_type",
-                "name",
-                "description",
-                "level",
-                "metadata",
-                "enabled",
-            ),
-        )
-        return (
-            await self.session.execute(
-                select(StateDefinition).where(StateDefinition.state_code == state_code)
-            )
-        ).scalar_one()
+        return (await self.upsert_definitions([payload]))[0]
 
     async def list_state_definitions(self, *, enabled_only: bool = True) -> list[StateDefinition]:
         statement: Select[tuple[StateDefinition]] = select(StateDefinition)
         if enabled_only:
             statement = statement.where(StateDefinition.enabled.is_(True))
         statement = statement.order_by(StateDefinition.id.asc())
-        return list((await self.session.execute(statement)).scalars())
-
-    async def upsert_state(
-        self,
-        *,
-        security_id: int,
-        trade_date: date,
-        state_code: str,
-        indicator_type: str,
-        status: str,
-        metadata: dict[str, Any],
-        parameters: dict[str, Any] | None = None,
-        parameter_key: str = "default",
-        adjust_type: str = "qfq",
-    ) -> IndicatorState:
-        payload = {
-            "security_id": security_id,
-            "trade_date": trade_date,
-            "state_code": state_code,
-            "indicator_type": indicator_type,
-            "status": status,
-            "metadata": metadata,
-            "parameters": dict(parameters or {}),
-            "parameter_key": parameter_key,
-            "adjust_type": adjust_type,
-        }
-        await self._upsert(
-            IndicatorState,
-            payload,
-            conflict_columns=(
-                "security_id",
-                "trade_date",
-                "state_code",
-                "parameter_key",
-                "adjust_type",
-            ),
-            update_columns=("indicator_type", "status", "metadata", "parameters"),
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
         )
-        return (
-            await self.session.execute(
-                select(IndicatorState).where(
-                    IndicatorState.security_id == security_id,
-                    IndicatorState.trade_date == trade_date,
-                    IndicatorState.state_code == state_code,
-                    IndicatorState.parameter_key == parameter_key,
-                    IndicatorState.adjust_type == adjust_type,
-                )
-            )
-        ).scalar_one()
-
-    async def list_states(
-        self,
-        security_id: int,
-        *,
-        start: date | None = None,
-        end: date | None = None,
-        active_only: bool = False,
-        adjustment: str | None = None,
-        state_code: str | None = None,
-        parameter_key: str | None = None,
-        indicator_type: str | None = None,
-        limit: int | None = None,
-    ) -> list[IndicatorState]:
-        statement: Select[tuple[IndicatorState]] = select(IndicatorState).where(
-            IndicatorState.security_id == security_id
-        )
-        if start is not None:
-            statement = statement.where(IndicatorState.trade_date >= start)
-        if end is not None:
-            statement = statement.where(IndicatorState.trade_date <= end)
-        if active_only:
-            statement = statement.where(IndicatorState.status == "ACTIVE")
-        if adjustment is not None:
-            statement = statement.where(IndicatorState.adjust_type == adjustment)
-        if state_code is not None:
-            statement = statement.where(IndicatorState.state_code == state_code)
-        if parameter_key is not None:
-            statement = statement.where(IndicatorState.parameter_key == parameter_key)
-        if indicator_type is not None:
-            statement = statement.where(IndicatorState.indicator_type == indicator_type)
-        statement = statement.order_by(IndicatorState.trade_date.asc(), IndicatorState.id.asc())
-        if limit is not None:
-            statement = statement.limit(limit)
-        return list((await self.session.execute(statement)).scalars())
-
-    async def latest_state_date(
-        self,
-        security_id: int,
-        *,
-        adjustment: str | None = None,
-        state_code: str | None = None,
-        parameter_key: str | None = None,
-        indicator_type: str | None = None,
-    ) -> date | None:
-        statement = select(func.max(IndicatorState.trade_date)).where(
-            IndicatorState.security_id == security_id
-        )
-        if adjustment is not None:
-            statement = statement.where(IndicatorState.adjust_type == adjustment)
-        if state_code is not None:
-            statement = statement.where(IndicatorState.state_code == state_code)
-        if parameter_key is not None:
-            statement = statement.where(IndicatorState.parameter_key == parameter_key)
-        if indicator_type is not None:
-            statement = statement.where(IndicatorState.indicator_type == indicator_type)
-        return (await self.session.execute(statement)).scalar_one_or_none()
-
-    async def previous_state(
-        self,
-        security_id: int,
-        state_code: str,
-        trade_date: date,
-        *,
-        parameter_key: str = "default",
-        adjustment: str = "qfq",
-    ) -> IndicatorState | None:
-        return (
-            await self.session.execute(
-                select(IndicatorState)
-                .where(
-                    IndicatorState.security_id == security_id,
-                    IndicatorState.state_code == state_code,
-                    IndicatorState.parameter_key == parameter_key,
-                    IndicatorState.adjust_type == adjustment,
-                    IndicatorState.trade_date < trade_date,
-                )
-                .order_by(IndicatorState.trade_date.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
 
     async def _upsert(
         self,
-        model: type[IndicatorSnapshot] | type[StateDefinition] | type[IndicatorState],
+        model: type[IndicatorSnapshot] | type[StateDefinition],
         payload: dict[str, Any],
         *,
         conflict_columns: tuple[str, ...],
@@ -370,7 +274,7 @@ class IndicatorStateRepository:
 
     async def _fallback_upsert(
         self,
-        model: type[IndicatorSnapshot] | type[StateDefinition] | type[IndicatorState],
+        model: type[IndicatorSnapshot] | type[StateDefinition],
         payload: dict[str, Any],
         *,
         conflict_columns: tuple[str, ...],

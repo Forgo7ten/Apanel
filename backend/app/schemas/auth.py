@@ -56,6 +56,7 @@ class LoginRequest(BaseModel):
 
     username: str = Field(min_length=1, max_length=320)
     password: str = Field(min_length=1, max_length=256)
+    identifier_type: Literal["auto", "username", "email"] = "auto"
 
 
 class UserData(BaseModel):

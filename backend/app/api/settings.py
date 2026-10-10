@@ -29,11 +29,11 @@ async def update_settings(
     user: User = Depends(get_current_user),  # noqa: B008
     session: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> SuccessResponse[UserSettingsData]:
-    raw = payload.model_dump(exclude_unset=True)
-    nested = raw.pop("settings", None)
-    updates = dict(nested) if isinstance(nested, dict) else {}
-    updates.update(raw)
-    return SuccessResponse(data=await UserSettingsService(session).update(user.id, updates))
+    return SuccessResponse(
+        data=await UserSettingsService(session).update(
+            user.id, payload.model_dump(exclude_unset=True)
+        )
+    )
 
 
 __all__ = ["router"]

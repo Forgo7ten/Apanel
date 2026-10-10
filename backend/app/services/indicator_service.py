@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
@@ -51,11 +52,6 @@ class CalculatedIndicator:
         return parameter_key(self.indicator_type, self.parameters)
 
 
-# Backward-compatible name for callers that imported the old default; indicator
-# persistence no longer has an unadjusted default.
-DEFAULT_ADJUSTMENT = DEFAULT_INDICATOR_ADJUSTMENT
-
-
 class IndicatorService:
     """Materialize shared indicator observations for one adjustment series."""
 
@@ -72,7 +68,7 @@ class IndicatorService:
         requests: Iterable[IndicatorRequest | tuple[str, Mapping[str, Any]] | Mapping[str, Any]]
         | None = None,
     ) -> list[IndicatorSnapshotModel]:
-        """Backward-compatible explicit rebuild entry point."""
+        """Compute requested indicator history explicitly."""
         return await self.rebuild_history(symbol, adjustment=adjustment, requests=requests)
 
     async def rebuild_history(
@@ -83,6 +79,10 @@ class IndicatorService:
         requests: Iterable[IndicatorRequest | tuple[str, Mapping[str, Any]] | Mapping[str, Any]]
         | None = None,
         start: date | None = None,
+        end: date | None = None,
+        commit: bool = True,
+        source_revision: int | None = None,
+        restatement_through: date | None = None,
     ) -> list[IndicatorSnapshotModel]:
         return await self._materialize(
             symbol,
@@ -90,6 +90,10 @@ class IndicatorService:
             requests=requests,
             only_latest=False,
             persist_from=start,
+            end=end,
+            commit=commit,
+            source_revision=source_revision,
+            restatement_through=restatement_through,
         )
 
     async def materialize_latest(
@@ -99,6 +103,8 @@ class IndicatorService:
         adjustment: str | None = DEFAULT_INDICATOR_ADJUSTMENT,
         requests: Iterable[IndicatorRequest | tuple[str, Mapping[str, Any]] | Mapping[str, Any]]
         | None = None,
+        end: date | None = None,
+        commit: bool = True,
     ) -> list[IndicatorSnapshotModel]:
         return await self._materialize(
             symbol,
@@ -106,6 +112,8 @@ class IndicatorService:
             requests=requests,
             only_latest=True,
             persist_from=None,
+            end=end,
+            commit=commit,
         )
 
     async def _materialize(
@@ -117,10 +125,16 @@ class IndicatorService:
         | None,
         only_latest: bool,
         persist_from: date | None,
+        end: date | None = None,
+        commit: bool = True,
+        source_revision: int | None = None,
+        restatement_through: date | None = None,
     ) -> list[IndicatorSnapshotModel]:
         adjustment = _validate_indicator_adjustment(adjustment)
         security = await self._get_security(symbol)
-        persisted = await self.repository.list_snapshots(security.id, adjustment=adjustment)
+        persisted = []
+        if requests is None:
+            persisted = await self.repository.latest_snapshots(security.id, adjustment=adjustment)
         effective_requests = merge_indicator_requests(requests)
         if requests is None:
             existing_requests = [
@@ -129,7 +143,7 @@ class IndicatorService:
                 for variant in snapshot_variants(snapshot)
             ]
             effective_requests = merge_indicator_requests(existing_requests)
-        bars = await self.repository.get_daily_bars(security.id, adjustment=adjustment)
+        bars = await self.repository.get_daily_bars(security.id, adjustment=adjustment, end=end)
         if not bars:
             raise ApiError("INDICATOR_DATA_NOT_FOUND", "No daily bars are available.", 404)
 
@@ -153,7 +167,7 @@ class IndicatorService:
                     by_date[bars[index].trade_date][item.indicator_type].append(item)
 
         previous_values: dict[tuple[str, str], dict[str, float]] = {}
-        materialized: list[IndicatorSnapshotModel] = []
+        payloads: list[dict[str, Any]] = []
         target_dates = [bar.trade_date for bar in bars]
         latest_date = target_dates[-1]
         for trade_date in target_dates:
@@ -162,6 +176,13 @@ class IndicatorService:
                     "_format": 2,
                     "variants": {item.key: dict(item.parameters) for item in items},
                 }
+                if source_revision is not None:
+                    parameters["_source"] = {
+                        "revision": source_revision,
+                        "restated_through": restatement_through.isoformat()
+                        if restatement_through
+                        else None,
+                    }
                 values = {item.key: dict(item.values) for item in items}
                 prior_by_variant: dict[str, dict[str, float] | None] = {}
                 delta_by_variant: dict[str, dict[str, float] | None] = {}
@@ -173,7 +194,7 @@ class IndicatorService:
                     not only_latest and (persist_from is None or trade_date >= persist_from)
                 )
                 if should_persist:
-                    snapshot = await self.repository.upsert_snapshot(
+                    snapshot = dict(
                         security_id=security.id,
                         trade_date=trade_date,
                         indicator_type=indicator_type,
@@ -183,10 +204,23 @@ class IndicatorService:
                         previous_values=prior_by_variant,
                         delta=delta_by_variant,
                     )
-                    materialized.append(snapshot)
+                    payloads.append(snapshot)
                 for item in items:
                     previous_values[(indicator_type, item.key)] = item.values
-        await self.session.commit()
+        if not only_latest:
+            statement = delete(IndicatorSnapshotModel).where(
+                IndicatorSnapshotModel.security_id == security.id,
+                IndicatorSnapshotModel.adjust_type == adjustment,
+                IndicatorSnapshotModel.trade_date <= latest_date
+                if end is None
+                else IndicatorSnapshotModel.trade_date <= end,
+            )
+            if persist_from is not None:
+                statement = statement.where(IndicatorSnapshotModel.trade_date >= persist_from)
+            await self.session.execute(statement)
+        materialized = await self.repository.upsert_snapshots(payloads)
+        if commit:
+            await self.session.commit()
         return materialized
 
     def _series_for_request(
@@ -271,9 +305,7 @@ class IndicatorService:
     ) -> list[IndicatorSnapshotModel]:
         adjustment = _validate_history_adjustment(adjustment)
         security = await self._get_security(symbol)
-        latest_date = await self.repository.latest_snapshot_date(
-            security.id, adjustment=adjustment
-        )
+        latest_date = await self.repository.latest_snapshot_date(security.id, adjustment=adjustment)
         if latest_date is None:
             raise ApiError("INDICATOR_DATA_NOT_FOUND", "No indicator data is available.", 404)
         resolved_start, resolved_end = resolve_history_window(
@@ -464,7 +496,6 @@ def _select_one_adjustment_per_day(
 
 
 __all__ = [
-    "DEFAULT_ADJUSTMENT",
     "DEFAULT_INDICATOR_ADJUSTMENT",
     "DEFAULT_HISTORY_ADJUSTMENT",
     "IndicatorService",

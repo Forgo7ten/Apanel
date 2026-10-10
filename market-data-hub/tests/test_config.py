@@ -20,7 +20,7 @@ def test_development_keeps_local_database_password_usable() -> None:
     )
 
     settings.validate_runtime_credentials()
-    assert settings.environment == "development"
+    assert settings.app_env == "development"
 
 
 def test_production_rejects_a_missing_database_password() -> None:

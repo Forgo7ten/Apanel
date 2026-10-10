@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
@@ -107,9 +108,6 @@ class Security(Base):
         back_populates="security", cascade="all, delete-orphan"
     )
     indicator_snapshots: Mapped[list[IndicatorSnapshot]] = relationship(
-        back_populates="security", cascade="all, delete-orphan"
-    )
-    indicator_states: Mapped[list[IndicatorState]] = relationship(
         back_populates="security", cascade="all, delete-orphan"
     )
     watch_table_symbols: Mapped[list[WatchTableSymbol]] = relationship(
@@ -250,62 +248,6 @@ class StateDefinition(Base):
         # SQLAlchemy reserves ``metadata`` on declarative classes.  Keep the
         # database column name/document vocabulary while exposing a friendly
         # constructor alias for callers that build the domain projection.
-        if "metadata" in kwargs:
-            kwargs["metadata_json"] = kwargs.pop("metadata")
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == "metadata":
-            return object.__getattribute__(self, "metadata_json")
-        return super().__getattribute__(name)
-
-
-class IndicatorState(Base):
-    """One durable state observation, including inactive days for history."""
-
-    __tablename__ = "indicator_states"
-    __table_args__ = (
-        UniqueConstraint(
-            "security_id",
-            "trade_date",
-            "state_code",
-            "parameter_key",
-            "adjust_type",
-            name="uq_indicator_states_security_date_code_param_adjust",
-        ),
-        Index(
-            "ix_indicator_states_security_adjust_date",
-            "security_id",
-            "adjust_type",
-            "trade_date",
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    security_id: Mapped[int] = mapped_column(
-        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
-    )
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    state_code: Mapped[str] = mapped_column(String(64), nullable=False)
-    indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    parameter_key: Mapped[str] = mapped_column(
-        String(67), nullable=False, default="default", server_default="default"
-    )
-    adjust_type: Mapped[str] = mapped_column(
-        String(8), nullable=False, default="qfq", server_default="qfq"
-    )
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(
-        "metadata", JSON, nullable=False, default=dict
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    security: Mapped[Security] = relationship(back_populates="indicator_states")
-
-    def __init__(self, **kwargs: Any) -> None:
         if "metadata" in kwargs:
             kwargs["metadata_json"] = kwargs.pop("metadata")
         for key, value in kwargs.items():
@@ -621,6 +563,12 @@ class AlertRule(Base):
     adjust_type: Mapped[str] = mapped_column(
         String(8), nullable=False, default="qfq", server_default="qfq"
     )
+    rule_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    trigger_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -670,6 +618,13 @@ class AlertInstance(Base):
     trigger_sequence: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    rule_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    last_consumed_state_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    last_evaluated_trade_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -693,6 +648,8 @@ class Notification(Base):
         Index("ix_notifications_user_created_at", "user_id", "created_at"),
         Index("ix_notifications_user_status", "user_id", "status"),
         Index("ix_notifications_alert_rule_id", "alert_rule_id"),
+        Index("ix_notifications_pending_scan", "status", "created_at", "id"),
+        Index("ix_notifications_retry_scan", "status", "next_retry_at", "id"),
         UniqueConstraint(
             "alert_rule_id",
             "security_id",
@@ -722,6 +679,13 @@ class Notification(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     observation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    rule_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -734,7 +698,6 @@ __all__ = [
     "DailyBar",
     "QuoteSnapshot",
     "IndicatorSnapshot",
-    "IndicatorState",
     "Invitation",
     "InvitationStatus",
     "AlertConditionType",
@@ -758,3 +721,143 @@ __all__ = [
     "TradingCalendar",
     "UserSecret",
 ]
+
+
+class AnalysisStream(Base):
+    """Shared transactional invalidation and publication boundary per price series."""
+
+    __tablename__ = "analysis_streams"
+
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), primary_key=True
+    )
+    adjust_type: Mapped[str] = mapped_column(String(8), primary_key=True)
+    source_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    sync_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    demand_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    published_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=-1, server_default="-1"
+    )
+    published_demand_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=-1, server_default="-1"
+    )
+    demand_key: Mapped[str | None] = mapped_column(String(67), nullable=True)
+    dirty_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    latest_bar_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    indicator_through: Mapped[date | None] = mapped_column(Date, nullable=True)
+    state_through: Mapped[date | None] = mapped_column(Date, nullable=True)
+    history_depth: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    event_sequence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    state_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CurrentIndicatorState(Base):
+    """One current observation per exact state target; not a daily append log."""
+
+    __tablename__ = "current_indicator_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "security_id",
+            "adjust_type",
+            "state_code",
+            "parameter_key",
+            name="uq_current_state_target",
+        ),
+        Index("ix_current_states_security_adjust", "security_id", "adjust_type"),
+        CheckConstraint(
+            "status IN ('ACTIVE','INACTIVE','UNKNOWN')", name="ck_current_state_status"
+        ),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    adjust_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    state_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameter_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    parameters: Mapped[dict] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    since_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    observed_from: Mapped[date] = mapped_column(Date, nullable=False)
+    since_is_exact: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    source_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class StateEvent(Base):
+    """Changes ordered by a transactional per-stream sequence, never global id."""
+
+    __tablename__ = "state_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "security_id", "adjust_type", "stream_seq", name="uq_state_event_sequence"
+        ),
+        Index(
+            "ix_state_events_target_date",
+            "security_id",
+            "adjust_type",
+            "state_code",
+            "parameter_key",
+            "trade_date",
+        ),
+        Index("ix_state_events_stream_date", "security_id", "adjust_type", "trade_date", "valid"),
+        CheckConstraint("status IN ('ACTIVE','INACTIVE','UNKNOWN')", name="ck_state_event_status"),
+        CheckConstraint(
+            "event_kind IN ('BASELINE','ENTER','EXIT','UNKNOWN','RECOVER')",
+            name="ck_state_event_kind",
+        ),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), nullable=False
+    )
+    adjust_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    stream_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameter_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    indicator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    parameters: Mapped[dict] = mapped_column(JSON, nullable=False)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    since_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    observed_from: Mapped[date] = mapped_column(Date, nullable=False)
+    since_is_exact: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    source_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_restatement: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    valid: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

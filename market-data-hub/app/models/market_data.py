@@ -14,12 +14,14 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     UniqueConstraint,
@@ -196,3 +198,47 @@ __all__ = [
     "MarketDataAdjustmentStateModel",
     "TradingCalendarModel",
 ]
+
+
+class AnalysisStreamModel(Base):
+    """Shared transactional invalidation and publication boundary per price series."""
+
+    __tablename__ = "analysis_streams"
+
+    security_id: Mapped[int] = mapped_column(
+        ForeignKey("securities.id", ondelete="CASCADE"), primary_key=True
+    )
+    adjust_type: Mapped[str] = mapped_column(String(8), primary_key=True)
+    source_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    sync_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    demand_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    published_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=-1, server_default="-1"
+    )
+    published_demand_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=-1, server_default="-1"
+    )
+    demand_key: Mapped[str | None] = mapped_column(String(67), nullable=True)
+    dirty_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    latest_bar_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    indicator_through: Mapped[date | None] = mapped_column(Date, nullable=True)
+    state_through: Mapped[date | None] = mapped_column(Date, nullable=True)
+    history_depth: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    event_sequence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    state_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

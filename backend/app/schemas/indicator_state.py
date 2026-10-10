@@ -41,6 +41,9 @@ class StateData(BaseModel):
     status: str
     active: bool
     transition: bool
+    since_date: date | None = None
+    observed_from: date | None = None
+    since_is_exact: bool = False
     trade_date: date
     parameters: dict[str, Any] = Field(default_factory=dict)
     parameter_key: str = "default"

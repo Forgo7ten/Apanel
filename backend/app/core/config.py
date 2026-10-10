@@ -1,12 +1,12 @@
 """Runtime configuration for the backend service."""
 
-import base64
-import json
 from functools import lru_cache
 from urllib.parse import unquote, urlsplit
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.security.keyring import parse_secret_keyring
 
 KNOWN_DEFAULT_DATABASE_PASSWORDS = frozenset(
     {
@@ -47,12 +47,9 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     app_env: str = Field(
         default="development",
-        validation_alias=AliasChoices("APP_ENV", "ENVIRONMENT"),
+        validation_alias="APP_ENV",
         description="Runtime environment, for example development or production.",
     )
-    # Keep the descriptive name available to callers while app_env is the
-    # canonical setting and APP_ENV is the canonical container variable.
-    environment: str | None = None
     database_url: str = Field(
         default="postgresql+asyncpg://apanel:apanel@localhost:5432/apanel",
         description="SQLAlchemy async database URL.",
@@ -77,15 +74,11 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     market_data_hub_url: str = Field(
         default="http://market-data-hub:8001",
-        validation_alias=AliasChoices("MARKET_DATA_HUB_URL", "MARKET_DATA_URL"),
+        validation_alias="MARKET_DATA_HUB_URL",
     )
     internal_api_token: str | None = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "INTERNAL_API_TOKEN",
-            "INTERNAL_SYNC_TOKEN",
-            "MARKET_DATA_INTERNAL_TOKEN",
-        ),
+        validation_alias="INTERNAL_API_TOKEN",
         description="Shared secret for backend-to-market-data internal writes.",
     )
     market_data_request_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -99,35 +92,23 @@ class Settings(BaseSettings):
     app_secrets_key: str | None = None
     app_secrets_key_version: str = "v1"
     app_secrets_previous_keys: str | None = None
-    legacy_webhook_fallback_enabled: bool = True
     quote_refresh_interval_minutes: int = Field(
         default=5,
         ge=5,
         le=10,
-        validation_alias=AliasChoices(
-            "CELERY_QUOTE_REFRESH_MINUTES",
-            "QUOTE_REFRESH_INTERVAL_MINUTES",
-        ),
+        validation_alias="QUOTE_REFRESH_INTERVAL_MINUTES",
     )
     eod_pipeline_hour: int = Field(
         default=15,
         ge=15,
         le=23,
-        validation_alias=AliasChoices(
-            "EOD_PIPELINE_HOUR",
-            "CELERY_EOD_HOUR",
-            "CELERY_EOD_PIPELINE_HOUR",
-        ),
+        validation_alias="EOD_PIPELINE_HOUR",
     )
     eod_pipeline_minute: int = Field(
         default=20,
         ge=0,
         le=59,
-        validation_alias=AliasChoices(
-            "EOD_PIPELINE_MINUTE",
-            "CELERY_EOD_MINUTE",
-            "CELERY_EOD_PIPELINE_MINUTE",
-        ),
+        validation_alias="EOD_PIPELINE_MINUTE",
     )
     scheduler_lock_ttl_seconds: int = Field(default=3600, gt=0)
     scheduler_retry_max_attempts: int = Field(default=3, ge=0, le=20)
@@ -135,28 +116,19 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     timezone: str = Field(
         default="Asia/Shanghai",
-        validation_alias=AliasChoices("TIMEZONE", "CELERY_TIMEZONE"),
+        validation_alias="TIMEZONE",
     )
     jwt_secret_key: str = Field(
         default="development-only-jwt-secret-change-me-at-least-32-bytes",
-        validation_alias=AliasChoices("JWT_SECRET_KEY", "JWT_SECRET"),
+        validation_alias="JWT_SECRET_KEY",
     )
-    jwt_issuer: str = Field(default="apanel", validation_alias=AliasChoices("JWT_ISSUER"))
-    jwt_audience: str = Field(default="apanel-web", validation_alias=AliasChoices("JWT_AUDIENCE"))
+    jwt_issuer: str = Field(default="apanel", validation_alias="JWT_ISSUER")
+    jwt_audience: str = Field(default="apanel-web", validation_alias="JWT_AUDIENCE")
     access_token_ttl_seconds: int = Field(default=900, gt=0)
     refresh_token_ttl_seconds: int = Field(default=60 * 60 * 24 * 30, gt=0)
     invitation_ttl_seconds: int = Field(default=60 * 60 * 24 * 7, gt=0)
     refresh_cookie_name: str = "refresh_token"
     refresh_cookie_secure: bool | None = None
-
-    @model_validator(mode="after")
-    def normalize_environment(self) -> "Settings":
-        """Make the legacy environment name follow the canonical app_env."""
-
-        if self.environment and self.app_env == "development":
-            self.app_env = self.environment
-        self.environment = self.app_env
-        return self
 
     def validate_database_credentials(self) -> None:
         """Reject known development database credentials in production.
@@ -204,31 +176,9 @@ class Settings(BaseSettings):
 
         if self.app_env.casefold() != "production":
             return
-        if not self.app_secrets_key:
-            raise ValueError("Production requires APP_SECRETS_KEY for encrypted user secrets.")
-        _decode_secret_key(self.app_secrets_key, "APP_SECRETS_KEY")
-        current_version = self.app_secrets_key_version.strip()
-        if not current_version:
-            raise ValueError("APP_SECRETS_KEY_VERSION must not be empty.")
-        if not self.app_secrets_previous_keys:
-            return
-        try:
-            payload = json.loads(self.app_secrets_previous_keys)
-        except Exception as exc:
-            raise ValueError("APP_SECRETS_PREVIOUS_KEYS must be a JSON object.") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("APP_SECRETS_PREVIOUS_KEYS must be a JSON object.")
-        for version, encoded in payload.items():
-            normalized_version = str(version).strip()
-            if not normalized_version:
-                raise ValueError("Previous secret key versions must not be empty.")
-            if normalized_version == current_version:
-                raise ValueError(
-                    "APP_SECRETS_PREVIOUS_KEYS must not redefine the current key version."
-                )
-            if not isinstance(encoded, str):
-                raise ValueError("Previous secret keys must be URL-safe base64 strings.")
-            _decode_secret_key(encoded, f"APP_SECRETS_PREVIOUS_KEYS[{normalized_version}]")
+        parse_secret_keyring(
+            self.app_secrets_key, self.app_secrets_key_version, self.app_secrets_previous_keys
+        )
 
     def validate_market_data_credentials(self) -> None:
         """Require the shared Hub token in production processes that call sync APIs."""
@@ -248,18 +198,6 @@ class Settings(BaseSettings):
 
         self.validate_database_credentials()
         self.validate_auth_credentials()
-
-
-def _decode_secret_key(value: str, name: str) -> bytes:
-    try:
-        raw = value.encode("ascii")
-        raw += b"=" * (-len(raw) % 4)
-        decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
-    except Exception as exc:
-        raise ValueError(f"{name} must be URL-safe base64.") from exc
-    if len(decoded) != 32:
-        raise ValueError(f"{name} must decode to exactly 32 bytes.")
-    return decoded
 
 
 @lru_cache(maxsize=1)

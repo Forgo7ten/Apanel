@@ -186,9 +186,7 @@ async def test_sync_in_chunks_never_reports_failed_items_as_ok() -> None:
                 ),
             )
 
-    context = PipelineContext(
-        date(2026, 9, 24), "qfq", ("600519", "000001", "300750", "601318")
-    )
+    context = PipelineContext(date(2026, 9, 24), "qfq", ("600519", "000001", "300750", "601318"))
     context.resources["market_data_client"] = Client()
     context.resources["settings"] = Settings(market_data_sync_batch_size=50)
 
@@ -235,8 +233,6 @@ async def test_eod_history_sync_repairs_required_provider_windows_without_calend
         (["600519"], 34, date(2026, 9, 24)),
         (["000001"], 60, date(2026, 9, 24)),
     ]
-
-
 
 
 @pytest.mark.asyncio
@@ -321,8 +317,6 @@ async def test_execute_eod_releases_lock_when_a_step_fails() -> None:
     assert lock.released == 1
 
 
-
-
 @pytest.mark.asyncio
 async def test_lock_guard_cancels_pipeline_work_when_lease_is_lost() -> None:
     cancelled = False
@@ -392,9 +386,7 @@ async def test_missing_annual_calendar_backfills_recent_actual_dates() -> None:
 async def test_missing_annual_calendar_remains_fail_closed_when_actual_is_unknown() -> None:
     class Client:
         async def validate_calendar(self, *, trade_date):
-            return {
-                "status": "UNKNOWN" if trade_date == date(2027, 1, 4) else "CLOSED"
-            }
+            return {"status": "UNKNOWN" if trade_date == date(2027, 1, 4) else "CLOSED"}
 
     with pytest.raises(PipelineConfigurationError, match="calendar actual validation"):
         await _validate_missing_calendar_date(
@@ -450,3 +442,28 @@ async def _true_async() -> bool:
 
 async def _noop_async() -> None:
     return None
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_joins_protected_work_before_releasing_lease():
+    import asyncio
+
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class Lock:
+        async def wait_lost(self):
+            await asyncio.Event().wait()
+
+    async def work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runner = asyncio.create_task(_run_with_lock_lease(Lock(), work()))
+    await started.wait()
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert cancelled.is_set()

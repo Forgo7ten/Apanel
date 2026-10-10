@@ -23,6 +23,10 @@ celery_app.conf.update(
     enable_utc=False,
     beat_schedule=build_beat_schedule(settings),
     task_default_queue="default",
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
+    broker_transport_options={"visibility_timeout": 21600},
     task_queues=(
         Queue("default"),
         Queue("market-data"),
@@ -31,6 +35,7 @@ celery_app.conf.update(
     task_routes={
         "apanel.tasks.refresh_quotes": {"queue": "market-data"},
         "apanel.tasks.run_eod_pipeline": {"queue": "pipeline"},
+        "apanel.tasks.reconcile_analysis": {"queue": "pipeline"},
     },
     include=["app.tasks.jobs"],
 )

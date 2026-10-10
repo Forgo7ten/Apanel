@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
+from app.clients.market_data_hub import MarketDataHubClientError
+from app.core.errors import ApiError
 from app.indicators.parameters import IndicatorRequest, required_history_bars
-from app.models import DailyBar, Security
+from app.models import AnalysisStream, DailyBar, Security
 from app.services.data_bootstrap_service import SecurityDataBootstrapService
 
 
@@ -19,6 +21,7 @@ class HistoryReadinessResult:
     checked_symbols: tuple[str, ...]
     bootstrapped_symbols: tuple[str, ...]
     required_bars: dict[str, int]
+    failed_symbols: dict[str, str] = field(default_factory=dict)
 
 
 class DataReadinessService:
@@ -70,41 +73,47 @@ class DataReadinessService:
             normalized_adjustments,
             completed_through=completed_through,
         )
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        Security.symbol, AnalysisStream.adjust_type, AnalysisStream.history_depth
+                    )
+                    .join(Security, Security.id == AnalysisStream.security_id)
+                    .where(
+                        Security.symbol.in_(normalized_symbols),
+                        AnalysisStream.adjust_type.in_(normalized_adjustments),
+                    )
+                )
+            ).all()
+        attempted_depth = {(symbol, adjust): depth for symbol, adjust, depth in rows}
+        failed = {}
         bootstrapped: list[str] = []
         for symbol in normalized_symbols:
             missing = tuple(
                 adjustment
                 for adjustment in normalized_adjustments
                 if counts.get((symbol, adjustment), 0) < required[symbol]
+                and attempted_depth.get((symbol, adjustment), 0) < required[symbol]
             )
             if not missing:
                 continue
-            await self.bootstrap_service.ensure_ready(
-                symbol,
-                adjustments=missing,
-                requests=tuple(requests_by_symbol.get(symbol) or ()),
-                completed_through=completed_through,
-            )
-            bootstrapped.append(symbol)
-        await self._mark_bootstrap_completed(normalized_symbols)
+            try:
+                await self.bootstrap_service.ensure_ready(
+                    symbol,
+                    adjustments=missing,
+                    requests=tuple(requests_by_symbol.get(symbol) or ()),
+                    completed_through=completed_through,
+                )
+                bootstrapped.append(symbol)
+            except (ApiError, MarketDataHubClientError) as error:
+                failed[symbol] = getattr(error, "code", "BOOTSTRAP_SYNC_FAILED")
         return HistoryReadinessResult(
             checked_symbols=normalized_symbols,
             bootstrapped_symbols=tuple(bootstrapped),
             required_bars=required,
+            failed_symbols=failed,
         )
-
-    async def _mark_bootstrap_completed(self, symbols: tuple[str, ...]) -> None:
-        """Mark readiness only after the full required-history check succeeds."""
-
-        if not symbols:
-            return
-        async with self.session_factory() as session:
-            await session.execute(
-                update(Security)
-                .where(Security.symbol.in_(symbols))
-                .values(bootstrap_completed_at=datetime.now(UTC))
-            )
-            await session.commit()
 
     async def _bar_counts(
         self,
@@ -136,5 +145,6 @@ class DataReadinessService:
             (str(symbol).upper(), str(adjustment).lower()): int(count)
             for symbol, adjustment, count in rows
         }
+
 
 __all__ = ["DataReadinessService", "HistoryReadinessResult"]

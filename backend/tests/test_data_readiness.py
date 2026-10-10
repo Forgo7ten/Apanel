@@ -20,9 +20,7 @@ class FakeBootstrapService:
         ] = []
 
     async def ensure_ready(self, symbol, *, adjustments, requests, completed_through=None):
-        self.calls.append(
-            (symbol, tuple(adjustments), tuple(requests), completed_through)
-        )
+        self.calls.append((symbol, tuple(adjustments), tuple(requests), completed_through))
         return None
 
 
@@ -77,7 +75,9 @@ async def test_readiness_bootstraps_only_missing_adjustments(tmp_path) -> None:
     assert bootstrap.calls == [("600519", ("none",), (), None)]
     async with factory() as session:
         security = (await session.execute(select(Security))).scalar_one()
-        assert security.bootstrap_completed_at is not None
+        assert (
+            security.bootstrap_completed_at is None
+        )  # Only successful analysis + dividends mark completion.
     await engine.dispose()
 
 

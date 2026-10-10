@@ -11,8 +11,6 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.models import Security
 from app.services.data_bootstrap_service import BootstrapResult, SecurityDataBootstrapService
-from app.services.indicator_service import IndicatorService
-from app.services.state_service import StateService
 from app.tasks import jobs
 
 
@@ -45,34 +43,41 @@ class _DividendFailingClient:
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_requires_dividend_sync_before_completion(monkeypatch) -> None:
-    async def no_indicators(self, *_args, **_kwargs):
-        return []
+async def test_bootstrap_requires_dividend_sync_before_completion(monkeypatch, tmp_path) -> None:
+    from app.core.errors import ApiError
+    from app.services.analysis_service import AnalysisResult, AnalysisService
 
-    async def no_states(self, *_args, **_kwargs):
-        return []
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'dividend-completion.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        session.add(
+            Security(
+                symbol="600519",
+                name="Test",
+                market="SH",
+                exchange="SH",
+                security_type="STOCK",
+                status="ACTIVE",
+            )
+        )
+        await session.commit()
 
-    monkeypatch.setattr(IndicatorService, "rebuild_history", no_indicators)
-    monkeypatch.setattr(StateService, "rebuild_history", no_states)
+    async def no_analysis(self, *_args, **_kwargs):
+        return AnalysisResult(0, 0, date(2026, 9, 23), 0, True)
 
+    monkeypatch.setattr(AnalysisService, "materialize", no_analysis)
     client = _DividendFailingClient()
     service = SecurityDataBootstrapService(
-        session_factory=_SessionFactory(),
-        market_data_client=client,
-        minimum_bars=1,
+        session_factory=factory, market_data_client=client, minimum_bars=1
     )
-
-    with pytest.raises(RuntimeError, match="dividend bootstrap did not complete"):
+    with pytest.raises(ApiError, match="Dividend bootstrap did not complete"):
         await service.ensure_ready(
-            "600519",
-            adjustments=("qfq",),
-            requests=(),
-            completed_through=date(2026, 9, 23),
+            "600519", adjustments=("qfq",), requests=(), completed_through=date(2026, 9, 23)
         )
-
     assert client.daily_calls[0]["end"] == date(2026, 9, 23)
-
-
+    await engine.dispose()
 
 
 def test_ad_hoc_bootstrap_never_admits_current_day_by_clock_time(monkeypatch) -> None:

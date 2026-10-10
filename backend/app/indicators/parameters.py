@@ -76,7 +76,7 @@ class IndicatorRequest:
 
 @dataclass(frozen=True, slots=True)
 class IndicatorVariant:
-    """One logical parameterized result expanded from a persisted row."""
+    """One logical parameterized result from the current snapshot envelope."""
 
     indicator_type: str
     key: str
@@ -84,7 +84,6 @@ class IndicatorVariant:
     values: dict[str, float]
     previous_values: dict[str, float] | None
     delta: dict[str, float] | None
-    source_format: int = 1
 
 
 def normalize_indicator_type(value: str) -> str:
@@ -199,11 +198,41 @@ def canonicalize_parameters(
     return {key: normalized[key] for key in sorted(normalized)}
 
 
+def canonicalize_state_parameters(
+    indicator_type: str, parameters: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Shared Watch/Alert identity; MA state periods obey normal indicator limits."""
+    indicator = normalize_indicator_type(indicator_type)
+    if indicator != "MA":
+        return canonicalize_parameters(indicator, parameters, fill_defaults=True)
+    raw = dict(parameters or {})
+    if set(raw) - {"short", "long", "short_period", "long_period"}:
+        raise ApiError("INVALID_STATE_PARAMETERS", "Unsupported MA state parameters.", 400)
+    result: dict[str, Any] = {}
+    for name, default in zip(("short", "long"), DEFAULT_MA_PERIODS, strict=True):
+        value = raw.get(name + "_period", raw.get(name, default))
+        if name in raw and name + "_period" in raw and raw[name] != value:
+            raise ApiError("INVALID_STATE_PARAMETERS", "MA state aliases conflict.", 400)
+        result[name + "_period"] = _normalize_parameter_value("period", value)
+    if result["short_period"] >= result["long_period"]:
+        raise ApiError("INVALID_STATE_PARAMETERS", "MA short period must precede long period.", 400)
+    return result
+
+
+def state_indicator_request(indicator_type: str, parameters: Mapping[str, Any]) -> IndicatorRequest:
+    normalized = canonicalize_state_parameters(indicator_type, parameters)
+    if normalize_indicator_type(indicator_type) == "MA":
+        normalized = {"periods": [normalized["short_period"], normalized["long_period"]]}
+    return IndicatorRequest(normalize_indicator_type(indicator_type), normalized)
+
+
 def parameter_key(indicator_type: str, parameters: Mapping[str, Any] | None) -> str:
     """Return a versioned, content-addressed identity for one parameter set."""
 
     normalized_type = normalize_indicator_type(indicator_type)
     canonical = canonicalize_parameters(normalized_type, parameters, fill_defaults=False)
+    if normalized_type == "MA" and "period" in canonical:
+        canonical = {"periods": [canonical["period"]]}
     encoded = json.dumps(
         {"indicator_type": normalized_type, "parameters": canonical},
         ensure_ascii=True,
@@ -282,7 +311,11 @@ def required_history_bars(
 
 
 def snapshot_variants(snapshot: Any) -> tuple[IndicatorVariant, ...]:
-    """Expand v2 rows or adapt one v1 flat row without changing the model."""
+    """Read only the canonical multi-variant snapshot format.
+
+    A flat historic snapshot is not interpreted as a modern observation:
+    accepting it silently could align a value with the wrong parameters.
+    """
 
     indicator_type = normalize_indicator_type(snapshot.indicator_type)
     parameters = snapshot.parameters if isinstance(snapshot.parameters, Mapping) else {}
@@ -291,44 +324,31 @@ def snapshot_variants(snapshot: Any) -> tuple[IndicatorVariant, ...]:
         snapshot.previous_values if isinstance(snapshot.previous_values, Mapping) else None
     )
     delta = snapshot.delta if isinstance(snapshot.delta, Mapping) else None
-    if parameters.get("_format") == 2 and isinstance(parameters.get("variants"), Mapping):
-        variants = parameters["variants"]
-        result: list[IndicatorVariant] = []
-        for raw_key, raw_parameters in variants.items():
-            normalized_parameters = canonicalize_parameters(
-                indicator_type, raw_parameters, fill_defaults=False
+    if parameters.get("_format") != 2 or not isinstance(parameters.get("variants"), Mapping):
+        raise ApiError("UNSUPPORTED_SNAPSHOT_FORMAT", "Indicator snapshot format is invalid.", 409)
+    result: list[IndicatorVariant] = []
+    for raw_key, raw_parameters in parameters["variants"].items():
+        normalized_parameters = canonicalize_parameters(
+            indicator_type, raw_parameters, fill_defaults=False
+        )
+        key = parameter_key(indicator_type, normalized_parameters)
+        if raw_key != key or not isinstance(values.get(key), Mapping):
+            raise ApiError(
+                "INVALID_SNAPSHOT_VARIANT", "Indicator snapshot variant is inconsistent.", 409
             )
-            key = parameter_key(indicator_type, normalized_parameters)
-            value_map = values.get(raw_key, values.get(key, {}))
-            prior_map = (
-                previous_values.get(raw_key, previous_values.get(key)) if previous_values else None
+        prior_map = previous_values.get(key) if previous_values else None
+        delta_map = delta.get(key) if delta else None
+        result.append(
+            IndicatorVariant(
+                indicator_type,
+                key,
+                normalized_parameters,
+                _float_mapping(values[key]),
+                _float_mapping(prior_map) if isinstance(prior_map, Mapping) else None,
+                _float_mapping(delta_map) if isinstance(delta_map, Mapping) else None,
             )
-            delta_map = delta.get(raw_key, delta.get(key)) if delta else None
-            result.append(
-                IndicatorVariant(
-                    indicator_type,
-                    key,
-                    normalized_parameters,
-                    _float_mapping(value_map),
-                    _float_mapping(prior_map) if isinstance(prior_map, Mapping) else None,
-                    _float_mapping(delta_map) if isinstance(delta_map, Mapping) else None,
-                    2,
-                )
-            )
-        return tuple(result)
-
-    normalized_parameters = canonicalize_parameters(indicator_type, parameters, fill_defaults=True)
-    return (
-        IndicatorVariant(
-            indicator_type,
-            parameter_key(indicator_type, normalized_parameters),
-            normalized_parameters,
-            _float_mapping(values),
-            _float_mapping(previous_values),
-            _float_mapping(delta),
-            1,
-        ),
-    )
+        )
+    return tuple(result)
 
 
 def select_snapshot_variant(
@@ -394,7 +414,6 @@ def _project_ma_variant(variant: IndicatorVariant, periods: set[int]) -> Indicat
         values,
         previous,
         delta,
-        variant.source_format,
     )
 
 

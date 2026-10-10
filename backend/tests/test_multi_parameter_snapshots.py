@@ -25,9 +25,9 @@ from app.indicators.parameters import (
     snapshot_variants,
 )
 from app.models import (
+    CurrentIndicatorState,
     DailyBar,
     IndicatorSnapshot,
-    IndicatorState,
     Security,
     TableColumn,
     TradingCalendar,
@@ -42,26 +42,35 @@ from app.tasks.contracts import PipelineContext
 from app.tasks.pipeline import EODPipeline, build_default_eod_steps, collect_indicator_requests
 
 
-def test_parameter_keys_are_canonical_and_legacy_rows_expand_to_one_variant() -> None:
+def test_parameter_keys_are_canonical_and_flat_rows_are_not_supported() -> None:
     first = canonicalize_parameters("boll", {"period": 20, "stddev": 2})
     second = canonicalize_parameters("BOLLINGER", {"multiplier": 2.0, "period": 20})
 
     assert first == second == {"period": 20, "multiplier": 2.0}
     assert parameter_key("BOLL", first) == parameter_key("BOLLINGER", second)
 
-    legacy = SimpleNamespace(
+    obsolete = SimpleNamespace(
         indicator_type="RSI",
         parameters={"period": 14},
         values={"value": 71.0},
         previous_values={"value": 69.0},
         delta={"value": 2.0},
     )
-    variants = snapshot_variants(legacy)
+    with pytest.raises(ApiError, match="format"):
+        snapshot_variants(obsolete)
+    with pytest.raises(ApiError, match="format"):
+        select_snapshot_variant(obsolete, "RSI", {"period": 14})
 
-    assert len(variants) == 1
-    assert variants[0].key == parameter_key("RSI", {"period": 14})
-    assert variants[0].values == {"value": 71.0}
-    assert select_snapshot_variant(legacy, "RSI", {"period": 14}) == variants[0]
+    key = parameter_key("RSI", {"period": 14})
+    current = SimpleNamespace(
+        indicator_type="RSI",
+        parameters={"_format": 2, "variants": {key: {"period": 14}}},
+        values={key: {"value": 71.0}},
+        previous_values={key: {"value": 69.0}},
+        delta={key: {"value": 2.0}},
+    )
+    assert snapshot_variants(current)[0].values == {"value": 71.0}
+    assert select_snapshot_variant(current, "RSI", {"period": 14}) == snapshot_variants(current)[0]
 
 
 def test_indicator_periods_are_bounded_by_market_data_bootstrap_contract() -> None:
@@ -76,20 +85,14 @@ def test_ma_period_count_is_bounded_to_avoid_quadratic_state_explosion() -> None
         canonicalize_parameters("MA", {"periods": list(range(1, MAX_MA_PERIODS + 2))})
 
 
-
-
 def test_distributed_ma_requests_do_not_collapse_into_one_oversized_bundle() -> None:
-    merged = merge_indicator_requests(
-        [("MA", {"period": period}) for period in range(1, 34)]
-    )
+    merged = merge_indicator_requests([("MA", {"period": period}) for period in range(1, 34)])
     ma_requests = [item for item in merged if item.indicator_type == "MA"]
 
     assert max(len(item.parameters["periods"]) for item in ma_requests) <= MAX_MA_PERIODS
-    assert {
-        period
-        for item in ma_requests
-        for period in item.parameters["periods"]
-    } >= set(range(1, 34))
+    assert {period for item in ma_requests for period in item.parameters["periods"]} >= set(
+        range(1, 34)
+    )
     assert required_history_bars(merged) >= 33
 
 
@@ -102,9 +105,7 @@ def test_explicit_ma_pair_survives_when_wider_numeric_bundle_contains_it() -> No
     )
 
     ma_parameters = {
-        tuple(item.parameters["periods"])
-        for item in merged
-        if item.indicator_type == "MA"
+        tuple(item.parameters["periods"]) for item in merged if item.indicator_type == "MA"
     }
     assert (5, 20) in ma_parameters
     assert (5, 10, 20) in ma_parameters
@@ -163,8 +164,6 @@ async def multi_parameter_context(
     await engine.dispose()
 
 
-
-
 async def test_many_independent_ma_columns_do_not_create_cross_product_states(
     multi_parameter_context,
 ) -> None:
@@ -175,15 +174,16 @@ async def test_many_independent_ma_columns_do_not_create_cross_product_states(
         states = list(
             (
                 await session.execute(
-                    select(IndicatorState).where(IndicatorState.indicator_type == "MA")
+                    select(CurrentIndicatorState).where(
+                        CurrentIndicatorState.indicator_type == "MA"
+                    )
                 )
             ).scalars()
         )
 
     assert states
     assert {
-        (item.parameters["short_period"], item.parameters["long_period"])
-        for item in states
+        (item.parameters["short_period"], item.parameters["long_period"]) for item in states
     } == {(5, 10)}
 
 
@@ -218,9 +218,11 @@ async def test_calculation_persists_one_v2_row_per_type_with_all_requested_varia
         boll = next(item for item in latest_rows if item.indicator_type == "BOLL")
         assert ma.parameters["_format"] == 2
         assert len(ma.parameters["variants"]) == 3
-        assert {
-            tuple(value["periods"]) for value in ma.parameters["variants"].values()
-        } == {(5, 10), (5,), (20,)}
+        assert {tuple(value["periods"]) for value in ma.parameters["variants"].values()} == {
+            (5, 10),
+            (5,),
+            (20,),
+        }
         assert len(rsi.parameters["variants"]) == 2
         assert len(boll.parameters["variants"]) == 2
         assert set(rsi.values) == set(rsi.parameters["variants"])

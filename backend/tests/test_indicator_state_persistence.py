@@ -17,13 +17,15 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.main import create_app
 from app.models import (
+    CurrentIndicatorState,
     DailyBar,
     IndicatorSnapshot,
-    IndicatorState,
     Security,
     StateDefinition,
+    StateEvent,
     TradingCalendar,
 )
+from app.repositories.state_event import StateEventRepository
 from app.services.history_window import resolve_history_window
 from app.services.indicator_service import IndicatorService
 from app.services.state_service import StateService
@@ -89,9 +91,7 @@ async def indicator_context(tmp_path) -> AsyncIterator[async_sessionmaker[AsyncS
 def test_history_window_defaults_to_90_days_and_rejects_large_ranges() -> None:
     from app.core.errors import ApiError
 
-    start, end = resolve_history_window(
-        start=None, end=None, latest_date=date(2026, 9, 24)
-    )
+    start, end = resolve_history_window(start=None, end=None, latest_date=date(2026, 9, 24))
     assert start == date(2026, 6, 27)
     assert end == date(2026, 9, 24)
 
@@ -141,13 +141,17 @@ async def test_state_history_survives_a_new_service_instance(indicator_context) 
             await session.execute(select(func.count()).select_from(StateDefinition))
         ).scalar_one()
         first_count = (
-            await session.execute(select(func.count()).select_from(IndicatorState))
+            await session.execute(select(func.count()).select_from(StateEvent))
         ).scalar_one()
         second = await StateService(session).calculate("600519")
         second_count = (
-            await session.execute(select(func.count()).select_from(IndicatorState))
+            await session.execute(select(func.count()).select_from(StateEvent))
         ).scalar_one()
 
+        assert "indicator_states" not in Base.metadata.tables
+        assert (
+            await session.execute(select(func.count()).select_from(CurrentIndicatorState))
+        ).scalar_one() == 18
         assert definition_count == 18
         assert first_count == second_count
         assert len(first) == len(second)
@@ -158,14 +162,8 @@ async def test_state_persistence_keeps_notification_value_context(indicator_cont
     async with indicator_context() as session:
         await IndicatorService(session).calculate("600519")
         await StateService(session).calculate("600519")
-        state = (
-            await session.execute(
-                select(IndicatorState)
-                .where(IndicatorState.state_code == "MA_CROSS_UP")
-                .order_by(IndicatorState.trade_date.desc())
-                .limit(1)
-            )
-        ).scalar_one()
+        states = (await StateEventRepository(session).current_many([1]))[1]
+        state = next(row for row in states if row.state_code == "MA_CROSS_UP")
 
         context = state.metadata["value_context"]
         assert set(context) == {"MA5", "MA10"}
@@ -176,14 +174,7 @@ async def test_state_persistence_keeps_notification_value_context(indicator_cont
                 values["current_value"] - values["previous_value"]
             )
 
-        boll_break = (
-            await session.execute(
-                select(IndicatorState)
-                .where(IndicatorState.state_code == "BOLL_BREAK_UPPER")
-                .order_by(IndicatorState.trade_date.desc())
-                .limit(1)
-            )
-        ).scalar_one()
+        boll_break = next(row for row in states if row.state_code == "BOLL_BREAK_UPPER")
         assert set(boll_break.metadata["value_context"]) == {"upper", "price"}
         assert boll_break.metadata["value_context"]["price"]["current_value"] is not None
 
@@ -201,19 +192,13 @@ async def test_state_calculation_marks_missing_previous_trading_day_unknown(
         await session.commit()
 
         await StateService(session).calculate("600519")
-        affected = list(
-            (
-                await session.execute(
-                    select(IndicatorState).where(IndicatorState.trade_date == affected_date)
-                )
-            ).scalars()
+        affected = await StateService(session).history(
+            "600519", start=affected_date, end=affected_date
         )
 
         assert affected
         assert {row.status for row in affected} == {"UNKNOWN"}
-        assert {row.metadata["reason"] for row in affected} == {
-            "missing_previous_trading_day"
-        }
+        assert {row.metadata["reason"] for row in affected} == {"missing_previous_trading_day"}
         assert {row.metadata["expected_previous_trade_date"] for row in affected} == {
             missing_date.isoformat()
         }
@@ -287,7 +272,7 @@ async def test_indicator_and_state_routes_return_current_and_history(indicator_c
     )
 
 
-async def test_history_services_only_read_persisted_rows(indicator_context) -> None:
+async def test_history_reconstruction_is_read_only(indicator_context, monkeypatch) -> None:
     async with indicator_context() as session:
         indicator_service = IndicatorService(session)
         await indicator_service.calculate("600519")
@@ -298,10 +283,10 @@ async def test_history_services_only_read_persisted_rows(indicator_context) -> N
             raise AssertionError("history must not calculate indicators")
 
         async def unexpected_state_calculation(*_args, **_kwargs):
-            raise AssertionError("history must not calculate states")
+            raise AssertionError("history must never publish/rewrite states")
 
         indicator_service.calculate = unexpected_indicator_calculation
-        state_service.calculate = unexpected_state_calculation
+        monkeypatch.setattr(StateEventRepository, "publish", unexpected_state_calculation)
 
         indicator_rows = await indicator_service.history(
             "600519", start=date(2026, 1, 10), end=date(2026, 1, 12)
@@ -353,6 +338,7 @@ async def test_indicator_and_state_persistence_keep_adjustments_separate(indicat
         ).scalar_one()
         assert qfq_snapshot_count > 0
         assert none_snapshot_count > 0
+
 
 async def test_alert_state_observation_ignores_unknown_state() -> None:
     from types import SimpleNamespace

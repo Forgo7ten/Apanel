@@ -103,7 +103,6 @@ class RedisTaskLock:
         except asyncio.CancelledError:
             raise
 
-
     def _mark_lost(self) -> None:
         self._acquired = False
         self._lost_event.set()
