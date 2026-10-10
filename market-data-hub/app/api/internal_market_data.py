@@ -296,10 +296,6 @@ async def sync_daily(
     "/sync/quotes",
     dependencies=[Depends(require_internal_token)],  # noqa: B008
 )
-@router.post(
-    "/sync/quote",
-    dependencies=[Depends(require_internal_token)],  # noqa: B008
-)
 async def sync_quotes(
     request: QuoteSyncRequest,
     service: QuoteSyncService = Depends(get_quote_sync_service),  # noqa: B008
@@ -325,10 +321,6 @@ async def sync_quotes(
 
 @router.post(
     "/sync/dividends",
-    dependencies=[Depends(require_internal_token)],  # noqa: B008
-)
-@router.post(
-    "/sync/dividend",
     dependencies=[Depends(require_internal_token)],  # noqa: B008
 )
 async def sync_dividends(

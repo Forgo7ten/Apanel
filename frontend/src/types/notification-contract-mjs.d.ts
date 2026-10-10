@@ -16,7 +16,7 @@ declare module "@/lib/notification-contract.mjs" {
     indicator?: string;
     operator?: string;
     threshold?: number | string;
-    parameters?: Record<string, number>;
+    parameters?: import("@/api/types").IndicatorParameters;
     field?: string;
     adjust_type?: "qfq" | "none";
   }): Record<string, unknown>;

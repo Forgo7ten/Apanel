@@ -112,7 +112,7 @@ BOLL 突破状态还需要当前和上一交易日价格；缺少价格时返回
 
 `STATUS` 列和 STATE Alert 都不会只按“指标类型”模糊匹配。两者都持久化明确的 `state_code` 与参数集合，服务端再生成/使用稳定的 `parameter_key`。例如 `MA5/10` 与 `MA20/60` 的 `MA_CROSS_UP` 是两个独立 state instance，可以同时展示、查询和监听。
 
-Frontend 从指标/状态详情创建 Alert 时会把当前状态的参数与 `adjust_type` 一并带入；已有规则不会因为用户后来修改全局 indicator defaults 或 adjustment 设置而漂移。
+Frontend 从指标/状态详情创建 Alert 时携带精确字段、参数与 `adjust_type`。VALUE 不将 `none` 静默变成 `qfq`；多周期 MA 保留整个 `periods` 数组、不混入默认 `period=5`，必须选择源周期中的字段（例如 `MA20`）。服务端校验字段与参数精确对应。已有规则不会因为之后修改用户默认设置而漂移。
 
 ## 与产品层的关系
 

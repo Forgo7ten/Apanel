@@ -43,7 +43,7 @@ declare module "@/lib/watch-contract.mjs" {
     description: string;
     retryLabel: string;
   };
-  export function isCurrentWatchDetail(detail: unknown, activeTableId: number | string | null): boolean;
+  export function isCurrentWatchDetail(detail: unknown, activeTableId: number | string | null, adjustment?: "qfq" | "none"): boolean;
   export function calculateVirtualRange(input?: {
     itemCount?: number;
     scrollTop?: number;

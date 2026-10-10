@@ -298,16 +298,26 @@ async def test_history_expands_parameter_variants_without_mixing_values(
 
 async def test_pipeline_collects_column_parameters_and_keeps_default_requests() -> None:
     class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
         def all(self):
-            return [
-                ("600519", "RSI", {"period": 6}),
-                ("600519", "BOLL", {"period": 20, "multiplier": 3}),
-                ("600000", "MA", {"period": 20}),
-            ]
+            return self.rows
 
     class Session:
-        async def execute(self, _statement):
-            return Result()
+        async def execute(self, statement):
+            # Only model the current exact 4-column query contracts.
+            if statement.selected_columns.keys()[1] == "indicator_type" and (
+                statement.selected_columns.keys()[2] == "parameters"
+            ):
+                return Result(
+                    [
+                        ("600519", "RSI", {"period": 6}, "NUMBER"),
+                        ("600519", "BOLL", {"period": 20, "multiplier": 3}, "NUMBER"),
+                        ("600000", "MA", {"period": 20}, "NUMBER"),
+                    ]
+                )
+            return Result([])
 
     collected = await collect_indicator_requests(Session(), ("600519", "600000"))
 

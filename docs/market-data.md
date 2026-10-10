@@ -113,6 +113,8 @@ eltdx 的 TDX 7709 使用原生 TCP；本项目不通过运行时代理环境变
 
 Quote 通过 eltdx `get_snapshots([...])` 原生批量获取；Daily Bar 通过批量 codes + `count` 获取；Dividend 等无原生批量能力的路径使用有界并发。Backend 在调用 Hub 前再按 `MARKET_DATA_SYNC_BATCH_SIZE` chunk，因此不会把用户监控 universe 直接塞进一个无限大请求。
 
+TDX `0x054c` Quote 只提供语义未验证的 `time_raw` 整数，不能据此计算真实交易所成交时间。`quote_snapshots.timestamp`、Hub Quote API 的 `timestamp` 是收到上游响应的 UTC **采集观测时间**，`timestamp_kind=OBSERVED_AT`。Watch 在采集观测超过20分钟时将 `observation_stale=true` 提示，日线回退使用 `DAILY_BAR_DATE`。刚采集也不能证明上游没有缓存，禁止将未经验证的 raw 值伪装成交易所行情时间。
+
 同步结果保留逐证券 `SyncItemResult`。单只证券停牌、无目标 bar 或业务校验失败不会抹掉同批其他证券的成功结果；transport/provider 不可用等 retryable failure 才会驱动 Celery 重试策略。Daily Bar PostgreSQL 写入还会按 asyncpg 32,767 bind 参数上限继续拆 SQL 批次，但保持在同一事务内。
 
 ## 同步与持久化
@@ -144,7 +146,11 @@ Hub 负责写入共享公共行情事实：
 
 Future schedule 不能靠 eltdx 历史 K 线猜测。数据库中的 annual seed 负责官方未来休市安排；当前迁移内置 2025/2026 seed。对已经发生的日期，Hub 可调用 eltdx workday capability 写入 `actual_open`。官方预期与实际校验冲突时记录 `UNKNOWN`，Worker 不会退化成 Mon-Fri 猜测。
 
-每个新年度应根据上交所、深交所、北交所官方休市通知更新 seed/导入数据。若三所安排出现差异，应按 market 拆分，而不是强行归并。
+新年度日历必须基于三所官方休市公告核实后维护。已有库不重新运行 Alembic：由 Backend 的 `import-trading-calendar` CLI 在现有 `trading_calendar` 导入全年预期。仅当上交所、深交所、北交所安排一致时允许生成 `market=CN` 清单；有差异时不可强行归并，须先扩展按市场读取的业务边界。
+
+年度 JSON 清单包含 `year`、`market="CN"`、`sources`（`SH`、`SZ`、`BJ` 官方 HTTPS 公告 URL）、`closed_ranges`（全年已核对的非周末闭市日期段，格式 `[["YYYY-MM-DD","YYYY-MM-DD"]]`）及 `operator_confirmed=true`。日期为格式占位符，绝非实际未来休市安排。CLI 默认只预览，需要 `--apply` 才会更新数据库；与已有官方预期冲突需先人工核实，明确提供 `--replace-existing` 才能订正；已写入的 `actual_open` 不被覆盖，预期不一致的记录状态为 `UNKNOWN`。
+
+运行步骤：先执行 `python -m app.cli import-trading-calendar --file /secure/path/official.json` 预览；确认无误后执行同命令附加 `--apply`。公告尚未发布时不得猜测2027或以后年度日期。当前仅对已到日期通过 Hub 回补实际开市校验，是应急方案，不代替官方年度数据。
 
 ## 可用性与授权
 
@@ -167,6 +173,8 @@ TDX 历史读取使用带 start offset 的有界分页，每页不超过配置�
 
 同一批次中，相同业务键的完全相同记录按幂等数据去重；内容不一致的记录没有来源版本或其他权威依据时拒绝写入，不再以“最后返回的一条”为正确值。日线、分红汇总和直接 repository 调用都遵循此规则。TDX 分页之间同一天出现不一致 OHLC 也会失败，不能拼成一个未确认的历史序列。
 
-日线先完成类型、股票、复权口径、重复冲突检查并按交易日排序，再进行 end/lookback 截取；否则短窗口可能先删掉冲突证据。报价若携带不同的可信 source timestamp，可选择最新时间点；同一时间点内容冲突则只将对应 symbol 标记为失败，其他有效报价继续处理。TDX 同次观测时间内的冲突在适配器边界拒绝。
+日线先完成类型、股票、复权口径、重复冲突检查并按交易日排序，再进行 end/lookback 截取；否则短窗口可能先删掉冲突证据。报价有可信且完整的来源时间时才能按此排序；TDX `time_raw` 尚不满足该条件，存储明确采集观测时间。
+
+遇到单证券非法值或跨页冲突触发的 `InvalidMarketDataError`，Hub 会二分拆批重试，将错误归到对应证券并保留其他成功股票的写入。上游超时、连接断开等共享基础设施故障**不拆分**成单证券请求风暴，按批次失败等待后续重试。
 
 分红 Provider 交付的是每股、每日期的汇总值。原始公司行动存在多笔现金事件时，应先由适配器聚合成日汇总，不能在通用去重层把两个冲突汇总再次相加。合法的历史修正应通过下一次来源响应和正常变更检测更新数据库；本规则不禁止跨批次、经过版本控制的修正。

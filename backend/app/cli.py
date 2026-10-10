@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import getpass
 import inspect
+import json
 import math
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -20,6 +22,7 @@ from app.core.config import get_settings
 from app.core.errors import ApiError
 from app.db.session import create_engine, dispose_engine
 from app.services.auth_service import bootstrap_admin
+from app.services.trading_calendar_import import import_annual_calendar, parse_annual_calendar
 
 
 def _positive_float(value: str) -> float:
@@ -45,6 +48,19 @@ def build_parser() -> argparse.ArgumentParser:
     securities.add_argument("--retry-until-success", action="store_true")
     securities.add_argument("--retry-interval-seconds", type=_positive_float, default=30.0)
     securities.add_argument("--timeout-seconds", type=_positive_float, default=10.0)
+    calendar = commands.add_parser(
+        "import-trading-calendar",
+        help="Preview or import operator-confirmed official annual exchange dates",
+    )
+    calendar.add_argument("--file", required=True, help="Path to reviewed JSON manifest")
+    calendar.add_argument(
+        "--apply", action="store_true", help="Commit the calendar to the database"
+    )
+    calendar.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="Permit corrections to previously announced expected dates",
+    )
     return parser
 
 
@@ -263,6 +279,35 @@ async def run_security_bootstrap(
     return exit_code
 
 
+async def _import_trading_calendar(args: argparse.Namespace, settings: Any) -> int:
+    try:
+        manifest = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("annual calendar manifest could not be read as JSON") from exc
+    calendar = parse_annual_calendar(manifest)
+    expected = calendar.expected_days()
+    print(
+        f"Official CN calendar {calendar.year}: "
+        f"{sum(expected.values())} open / "
+        f"{sum(not value for value in expected.values())} closed; "
+        f"three source URLs confirmed."
+    )
+    if not args.apply:
+        print("Preview only: no database was changed. Pass --apply to import.")
+        return 0
+    settings.validate_database_credentials()
+    engine = create_engine(settings.database_url)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            counts = await import_annual_calendar(
+                session, calendar, replace_existing=args.replace_existing
+            )
+    finally:
+        await dispose_engine(engine)
+    print("Calendar imported: " + ", ".join(f"{name}={count}" for name, count in counts.items()))
+    return 0
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -274,6 +319,8 @@ def main(
     try:
         if args.command == "bootstrap-admin":
             return asyncio.run(_bootstrap_admin(args))
+        if args.command == "import-trading-calendar":
+            return asyncio.run(_import_trading_calendar(args, settings or get_settings()))
         if args.command == "bootstrap-securities":
             return asyncio.run(
                 run_security_bootstrap(

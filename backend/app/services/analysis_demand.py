@@ -52,8 +52,7 @@ async def collect_indicator_requests(
     result = await session.execute(statement)
     raw_by_symbol: dict[str, list[IndicatorRequest]] = {symbol: [] for symbol in normalized_symbols}
     for row in result.all():
-        symbol, indicator_type, parameters = row[:3]
-        view_mode = row[3] if len(row) > 3 else None
+        symbol, indicator_type, parameters, view_mode = row
         if not indicator_type or str(indicator_type).upper() == "DIVIDEND_YIELD":
             continue
         raw_parameters = dict(parameters or {})
@@ -92,10 +91,6 @@ async def collect_indicator_requests(
         .where(Security.symbol.in_(normalized_symbols), AlertRule.enabled.is_(True))
     )
     for row in alert_rows.all():
-        if len(row) != 4:
-            # Compatibility with lightweight test/session adapters that only
-            # implement the historical table-column projection.
-            continue
         symbol, condition_type, indicator_type, parameters = row
         if not indicator_type or str(indicator_type).upper() == "DIVIDEND_YIELD":
             continue

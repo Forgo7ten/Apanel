@@ -266,11 +266,13 @@ export function watchRowLayoutContract(fieldCount = 0, density = "compact") {
  * Do not reuse a previous query's placeholder when it belongs to another
  * selected watch table.
  */
-export function isCurrentWatchDetail(detail, activeTableId) {
+export function isCurrentWatchDetail(detail, activeTableId, adjustment) {
   if (activeTableId === null || activeTableId === undefined) return false;
   if (!detail || typeof detail !== "object" || Array.isArray(detail)) return false;
   const detailId = detail.id;
-  return detailId !== null && detailId !== undefined && String(detailId) === String(activeTableId);
+  return detailId !== null && detailId !== undefined
+    && String(detailId) === String(activeTableId)
+    && (adjustment === undefined || detail.adjust_type === adjustment);
 }
 
 /**

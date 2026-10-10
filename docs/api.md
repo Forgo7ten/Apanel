@@ -151,7 +151,7 @@ http://localhost:8080/api/v1
 }
 ```
 
-Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、只通过 column id 键控的 `column_values`、当前可见 states，以及每只证券的 `bootstrap_ready`。`bootstrap_ready` 只有在该证券自加入当前监控表后完成一轮完整 bootstrap（日线、指标、状态、股息同步）时才为 `true`，前端据此决定何时结束“数据准备中”，而不根据股息率是否为 0 或状态是否为空来猜测。当前交易日存在更新的 Quote 时价格使用 Quote；未开盘或 Quote 仍停留在上一交易日时，价格回退到最近未复权日线收盘价。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列；指标字段统一由列 ID 键控的 `column_values` 返回。
+Watch Table detail 顶层 `adjust_type` 是**本次实际读取并物化指标的口径**，前端按 table id + adjustment 同时核对缓存、创建 Alert。Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、只通过 column id 键控的 `column_values`、当前可见 states，以及每只证券的 `bootstrap_ready`。`bootstrap_ready` 只有在该证券自加入当前监控表后完成一轮完整 bootstrap（日线、指标、状态、股息同步）时才为 `true`，前端据此决定何时结束“数据准备中”，而不根据股息率是否为 0 或状态是否为空来猜测。当前交易日存在更新的 Quote 时价格使用 Quote；未开盘或 Quote 仍停留在上一交易日时，价格回退到最近未复权日线收盘价。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列；指标字段统一由列 ID 键控的 `column_values` 返回。`price.timestamp_kind=OBSERVED_AT` 表示采集观测时间（非交易所成交时间）；采集超过20分钟设 `price.observation_stale=true`；`DAILY_BAR_DATE` 表示最近日线收盘日。
 
 ## Settings API
 
@@ -337,7 +337,7 @@ Authorization: Bearer <INTERNAL_API_TOKEN>
 
 ### `POST /internal/sync/quotes` / `POST /internal/sync/dividends`
 
-两者都使用内部 token，接收 `{"symbols":[...]}`。Quote 使用 provider 原生批量快照；Dividend 使用有界并发并逐证券返回同步结果。Backend 统一调用复数形式的规范接口。
+两者都使用内部 token，接收 `{"symbols":[...]}`。Quote 使用 provider 原生批量快照；Dividend 使用有界并发并逐证券返回同步结果。Backend 统一调用复数形式的规范接口。`GET /internal/quotes/{symbol}` 的 `timestamp_kind=OBSERVED_AT` 表示采集时间，不是可信成交时间。报价/日线的单证券非法上游批次会隔离坏股票，合法股票正常落库；基础设施错误按批次失败。
 
 ### `POST /internal/calendar/validate`
 

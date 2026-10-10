@@ -109,6 +109,8 @@ export type PriceSnapshot = {
   delta?: number | string | null;
   direction?: "UP" | "DOWN" | "FLAT" | string | null;
   timestamp?: string | null;
+  timestamp_kind?: "OBSERVED_AT" | "DAILY_BAR_DATE" | null;
+  observation_stale?: boolean | null;
 };
 
 export type IndicatorState = {
@@ -144,6 +146,7 @@ export type WatchTableStock = {
 };
 
 export type WatchTableDetails = Omit<WatchTableSummary, "stock_count"> & {
+  adjust_type: AdjustmentType;
   stock_count?: number;
   columns: WatchTableColumn[];
   stocks: WatchTableStock[];

@@ -10,6 +10,7 @@ import { AddStockDialog } from "@/components/table/AddStockDialog";
 import { WatchTable } from "@/components/table/WatchTable";
 import { AlertWizard, type AlertWizardDraft } from "@/components/alerts/AlertWizard";
 import type { DetailSelection } from "@/components/indicators/detail-types";
+import { buildDetailAlertDraft } from "@/lib/watch-alert-contract.mjs";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { LoadingState, QueryErrorState } from "@/components/ui/QueryState";
 import { isApiError } from "@/lib/api-errors";
@@ -22,6 +23,7 @@ import {
   watchDetailViewState,
 } from "@/lib/watch-contract.mjs";
 import { useWatchStore } from "@/stores/watch-store";
+import { useWorkspaceSettings } from "@/lib/use-workspace-settings";
 
 function sameId(left: Identifier | null, right: Identifier | null): boolean {
   return left !== null && right !== null && String(left) === String(right);
@@ -31,6 +33,7 @@ const EMPTY_BOOTSTRAP_DEADLINES: Readonly<Record<string, number>> = Object.freez
 
 export default function WatchPage() {
   const queryClient = useQueryClient();
+  const { settings: workspaceSettings } = useWorkspaceSettings();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [createName, setCreateName] = useState("");
   const [alertDraft, setAlertDraft] = useState<AlertWizardDraft | null>(null);
@@ -46,7 +49,7 @@ export default function WatchPage() {
     ? EMPTY_BOOTSTRAP_DEADLINES
     : bootstrapDeadlinesByTable[String(activeTableId)] ?? EMPTY_BOOTSTRAP_DEADLINES;
   const detailsQuery = useQuery({
-    queryKey: ["watch-table", activeTableId],
+    queryKey: ["watch-table", activeTableId, workspaceSettings.adjustType],
     queryFn: () => getWatchTable(activeTableId as Identifier),
     enabled: activeTableId !== null,
     placeholderData: (previous) => previous,
@@ -55,7 +58,7 @@ export default function WatchPage() {
         .filter(([, deadline]) => deadline > Date.now());
       if (pendingEntries.length === 0) return WATCH_DETAIL_REFRESH_INTERVAL_MS;
       const data = query.state.data;
-      const detail = data && isCurrentWatchDetail(data, activeTableId) ? data : undefined;
+      const detail = data && isCurrentWatchDetail(data, activeTableId, workspaceSettings.adjustType) ? data : undefined;
       const stillPreparing = pendingEntries.some(([securityId]) => {
         const stock = detail?.stocks.find((item) => String(item.security_id) === securityId);
         return !detail || (stock ? !isWatchStockDataReady(stock, detail.columns) : false);
@@ -64,7 +67,7 @@ export default function WatchPage() {
     },
     refetchIntervalInBackground: false,
   });
-  const currentDetail = detailsQuery.data && isCurrentWatchDetail(detailsQuery.data, activeTableId)
+  const currentDetail = detailsQuery.data && isCurrentWatchDetail(detailsQuery.data, activeTableId, workspaceSettings.adjustType)
     ? detailsQuery.data
     : undefined;
   const bootstrappingStockIds = useMemo(() => {
@@ -128,31 +131,7 @@ export default function WatchPage() {
   });
 
   const openAlertFromDetail = useCallback((selection: DetailSelection) => {
-    const stock = selection.stock;
-    const securityId = stock.security_id ?? stock.security?.security_id ?? stock.security?.id;
-    if (securityId === undefined) return;
-    if (selection.kind === "state") {
-      const stateParameters = Object.fromEntries(
-        Object.entries(selection.state.parameters ?? {}).filter(([, value]) => typeof value === "number"),
-      ) as Record<string, number>;
-      setAlertDraft({
-        security: { id: securityId, security_id: securityId, symbol: stock.symbol, name: stock.name ?? stock.symbol, market: stock.market ?? "" },
-        condition_type: "STATE",
-        state_id: selection.state.state_code ?? selection.state.state_id,
-        parameters: stateParameters,
-        adjust_type: selection.state.adjust_type === "none" ? "none" : "qfq",
-      });
-      return;
-    }
-    const raw = selection.column.parameters ?? {};
-    const numericParameters = Object.fromEntries(Object.entries(raw).filter(([key, value]) => key !== "field" && typeof value === "number")) as Record<string, number>;
-    setAlertDraft({
-      security: { id: securityId, security_id: securityId, symbol: stock.symbol, name: stock.name ?? stock.symbol, market: stock.market ?? "" },
-      condition_type: "VALUE",
-      indicator: selection.column.indicator_type ?? selection.column.type,
-      parameters: numericParameters,
-      field: typeof raw.field === "string" ? raw.field : undefined,
-    });
+    setAlertDraft(buildDetailAlertDraft(selection));
   }, []);
 
   useEffect(() => {

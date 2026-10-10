@@ -15,9 +15,7 @@ from app.services.sync import SyncItemResult, SyncSummary
 
 class FakeDividendRepository:
     async def list_by_symbol(self, symbol, *, start=None, end=None):
-        return (
-            Dividend(symbol=symbol, date=date(2026, 6, 30), cash_amount="2.00"),
-        )
+        return (Dividend(symbol=symbol, date=date(2026, 6, 30), cash_amount="2.00"),)
 
 
 class FakeQuoteSyncService:
@@ -58,9 +56,7 @@ def test_dividend_query_serializes_persisted_events_and_date_filters() -> None:
     app, _, _ = make_app()
     try:
         with TestClient(app) as client:
-            response = client.get(
-                "/internal/dividends/SZ.600519?start=2026-01-01&end=2026-12-31"
-            )
+            response = client.get("/internal/dividends/SZ.600519?start=2026-01-01&end=2026-12-31")
     finally:
         app.dependency_overrides.clear()
 
@@ -100,11 +96,26 @@ def test_dividend_query_rejects_reversed_date_range() -> None:
     app, _, _ = make_app()
     try:
         with TestClient(app) as client:
-            response = client.get(
-                "/internal/dividends/600519?start=2026-12-31&end=2026-01-01"
-            )
+            response = client.get("/internal/dividends/600519?start=2026-12-31&end=2026-01-01")
     finally:
         app.dependency_overrides.clear()
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "INVALID_DATE_RANGE"
+
+
+def test_obsolete_singular_internal_sync_paths_are_not_exposed() -> None:
+    app, quote_service, dividend_service = make_app()
+    try:
+        with TestClient(app) as client:
+            for path in ("/internal/sync/quote", "/internal/sync/dividend"):
+                response = client.post(
+                    path,
+                    json={"symbols": ["600519"]},
+                    headers={"X-Internal-Token": "test-token"},
+                )
+                assert response.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+    assert quote_service.calls == []
+    assert dividend_service.calls == []

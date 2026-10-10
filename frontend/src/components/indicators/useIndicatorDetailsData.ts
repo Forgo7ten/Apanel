@@ -30,7 +30,10 @@ function persistedParameterKey(selection: DetailSelection | null): string | unde
 export function useIndicatorDetailsData(selection: DetailSelection | null) {
   const range = useMemo(() => historyWindow(), []);
   const { settings } = useWorkspaceSettings();
-  const adjustment = settings.adjustType;
+  const adjustment = selection?.kind === "indicator"
+    ? selection.adjust_type
+    : selection?.kind === "state" && selection.state.adjust_type
+      ? selection.state.adjust_type : settings.adjustType;
   const open = selection !== null;
   const symbol = selection?.stock.symbol ?? "";
   const parameterKey = persistedParameterKey(selection);

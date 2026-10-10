@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -53,6 +53,7 @@ _COLUMN_TYPES = {"PRICE", "INDICATOR", "STATE"}
 _VIEW_MODES = {"NUMBER", "DELTA", "STATUS", "COMPOSITE"}
 _DEFAULT_WATCH_INDICATORS = ("MA", "RSI", "KDJ", "BOLL", "MACD")
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+_QUOTE_OBSERVATION_STALE_AFTER = timedelta(minutes=20)
 
 
 class WatchTableService:
@@ -262,6 +263,7 @@ class WatchTableService:
             )
         columns = [_column_data(column) for column in table.columns]
         return WatchTableDetailsData(
+            adjust_type=adjustment,
             id=table.id,
             name=table.name,
             description=table.description,
@@ -1030,7 +1032,7 @@ def _security_data(security) -> Any:
     )
 
 
-def _price_data(quote, daily_bar=None) -> PriceData | None:
+def _price_data(quote, daily_bar=None, *, now: datetime | None = None) -> PriceData | None:
     if daily_bar is not None and (
         quote is None or _quote_trade_date(quote.timestamp) <= daily_bar.trade_date
     ):
@@ -1042,10 +1044,18 @@ def _price_data(quote, daily_bar=None) -> PriceData | None:
             change_percent=None,
             direction="FLAT",
             timestamp=datetime.combine(daily_bar.trade_date, time.min, tzinfo=_SHANGHAI_TZ),
+            timestamp_kind="DAILY_BAR_DATE",
+            observation_stale=None,
         )
     if quote is None:
         return None
     change = _number(quote.change)
+    sampled_at = (
+        quote.timestamp
+        if quote.timestamp.tzinfo is not None
+        else quote.timestamp.replace(tzinfo=UTC)
+    ).astimezone(UTC)
+    compared_at = (now or datetime.now(UTC)).astimezone(UTC)
     return PriceData(
         value=_number(quote.price),
         price=_number(quote.price),
@@ -1060,6 +1070,8 @@ def _price_data(quote, daily_bar=None) -> PriceData | None:
             else "FLAT"
         ),
         timestamp=quote.timestamp,
+        timestamp_kind="OBSERVED_AT",
+        observation_stale=compared_at - sampled_at > _QUOTE_OBSERVATION_STALE_AFTER,
     )
 
 

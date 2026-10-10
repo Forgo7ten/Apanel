@@ -68,6 +68,10 @@ npm run build
 
 浏览器 API 基路径由 `NEXT_PUBLIC_API_BASE_URL` 读取，默认是 `/api/v1`。在 Compose 中通过 Nginx 使用默认同源路径；直接运行前端时必须提供一个浏览器可访问的后端基路径，并自行处理跨域和凭据策略。
 
+## 官方年度交易日历维护
+
+每年在三所官方休市公告发布并逐项核对后，使用 Backend CLI 为已有库导入完整 `CN` 年度日历。JSON 清单字段和冲突处理规则见 [行情数据](market-data.md)。先运行 `python -m app.cli import-trading-calendar --file /secure/path/official.json` 预览，再附加 `--apply` 写入；正式订正已有年度预期须在核实后加 `--replace-existing`。文件必须是 Backend 进程可读取的绝对路径。此命令只操作现有日历表，不新增数据库模型或迁移；不能把未经确认的新年工作日当成未来交易所开市日，也不要将临时清单或操作日志加入 `docs/`。
+
 ## 数据库初始化与结构检查
 
 仅在**全新空 PostgreSQL 数据库**首次启动时，Compose 的 `migrate` 服务执行唯一 `0001_fresh_schema` 初始化：

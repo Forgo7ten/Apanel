@@ -212,9 +212,25 @@ function buildColumnDefs(
       accessorFn: (stock) => isBootstrapping(stock) ? undefined : stock.price,
       header: "当前价",
       sortingFn: (rowA, rowB) => compareRows(rowA.original, rowB.original, "price"),
-      cell: ({ row }) => isBootstrapping(row.original)
-        ? <span className="text-xs text-muted">—</span>
-        : <IndicatorCell mode={showDeltas ? "DELTA" : "NUMBER"} value={row.original.price} />,
+      cell: ({ row }) => {
+        if (isBootstrapping(row.original)) return <span className="text-xs text-muted">—</span>;
+        const quote = row.original.price;
+        const kind = typeof quote === "object" && quote !== null ? quote.timestamp_kind : undefined;
+        const stale = typeof quote === "object" && quote !== null && quote.observation_stale === true;
+        const observed = typeof quote === "object" && quote !== null ? quote.timestamp : undefined;
+        return (
+          <div title={kind === "OBSERVED_AT" ? "数据采集时间：" + (observed ?? "未知") + "；不等于交易所原始更新时间" : "最近未复权日线收盘价"}>
+            <IndicatorCell mode={showDeltas ? "DELTA" : "NUMBER"} value={quote} />
+            {kind === "OBSERVED_AT" ? (
+              <span className={"text-[10px] " + (stale ? "text-warning" : "text-muted")}>
+                {stale ? "采集已超20分钟" : "行情采集值"}
+              </span>
+            ) : kind === "DAILY_BAR_DATE" ? (
+              <span className="text-[10px] text-muted">日线收盘</span>
+            ) : null}
+          </div>
+        );
+      },
       meta: { label: "当前价", movable: false, toggleable: false },
     },
     ...dynamicColumns,
@@ -334,8 +350,8 @@ export function WatchTable({
 
   const openIndicatorDetail = useCallback((stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => {
     detailTriggerRef.current = trigger;
-    setDetailSelection({ kind: "indicator", stock, column });
-  }, []);
+    setDetailSelection({ kind: "indicator", stock, column, adjust_type: table.adjust_type });
+  }, [table.adjust_type]);
   const openStateDetail = useCallback((stock: WatchTableStock, state: IndicatorState, trigger: HTMLButtonElement) => {
     detailTriggerRef.current = trigger;
     setDetailSelection({ kind: "state", stock, state });

@@ -240,6 +240,7 @@ async def test_watch_table_endpoints_aggregate_data_and_enforce_ownership(watch_
     assert stock["security_id"] == 1
     assert stock["bootstrap_ready"] is True
     assert stock["price"]["value"] == 1680.0
+    assert details.json()["data"]["adjust_type"] == "qfq"
     assert stock["column_values"][str(column_id)]["value"] == 71.0
     assert "indicators" not in stock and "indicator_values" not in stock and "values" not in stock
     assert stock["states"][0]["state_id"] == "RSI_OVERBOUGHT"

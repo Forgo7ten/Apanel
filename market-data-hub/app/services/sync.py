@@ -345,40 +345,49 @@ class DailyBarSyncService:
         if callable(batch_method):
             for offset in range(0, len(normal_symbols), self._batch_size):
                 chunk = normal_symbols[offset : offset + self._batch_size]
+
+                async def fetch_requested(requested):
+                    return await fetch_batch(requested, count)
+
                 try:
-                    by_symbol = await fetch_batch(chunk, count)
+                    batches, individual_errors = await _fetch_with_invalid_symbol_isolation(
+                        chunk, fetch_requested
+                    )
                 except Exception as exc:
                     for symbol in chunk:
                         results[symbol] = SyncItemResult(
                             symbol=symbol, status="failed", error=_sync_error(exc)
                         )
                     continue
-                for symbol in chunk:
-                    try:
-                        if symbol not in by_symbol:
-                            raise ProviderUnavailableError(
-                                "provider omitted requested daily-bar symbol"
+                for symbol, exc in individual_errors.items():
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="failed", error=_sync_error(exc)
+                    )
+                for batch_symbols, by_symbol in batches:
+                    for symbol in batch_symbols:
+                        try:
+                            if symbol not in by_symbol:
+                                raise ProviderUnavailableError(
+                                    "provider omitted requested daily-bar symbol"
+                                )
+                            # Validate/deduplicate/sort BEFORE clipping.
+                            raw = _validated_bars(
+                                symbol, tuple(by_symbol[symbol]), selected_adjustment
                             )
-                        # Validate/deduplicate/sort BEFORE clipping; otherwise a
-                        # trailing duplicate can hide a conflicting earlier row.
-                        raw = _validated_bars(
-                            symbol, tuple(by_symbol[symbol]), selected_adjustment
-                        )
-                        if lookback_bars is not None:
-                            if end is not None:
-                                raw = tuple(item for item in raw if item.trade_date <= end)
-                            raw = raw[-int(lookback_bars) :]
-                        elif start is not None and end is not None:
-                            raw = tuple(item for item in raw if start <= item.trade_date <= end)
-                        bars = raw
-                        pending[symbol] = bars
-                        results[symbol] = SyncItemResult(
-                            symbol=symbol, status="success", fetched=len(bars)
-                        )
-                    except Exception as exc:
-                        results[symbol] = SyncItemResult(
-                            symbol=symbol, status="failed", error=_sync_error(exc)
-                        )
+                            if lookback_bars is not None:
+                                if end is not None:
+                                    raw = tuple(item for item in raw if item.trade_date <= end)
+                                raw = raw[-lookback_bars:]
+                            elif start is not None and end is not None:
+                                raw = tuple(item for item in raw if start <= item.trade_date <= end)
+                            pending[symbol] = raw
+                            results[symbol] = SyncItemResult(
+                                symbol=symbol, status="success", fetched=len(raw)
+                            )
+                        except Exception as exc:
+                            results[symbol] = SyncItemResult(
+                                symbol=symbol, status="failed", error=_sync_error(exc)
+                            )
         else:
             if start is None or end is None:
                 raise InvalidMarketDataError(
@@ -519,6 +528,25 @@ class DailyBarSyncService:
         return SyncSummary(operation="daily_bar", items=tuple(results.values()))
 
 
+async def _fetch_with_invalid_symbol_isolation(symbols, fetch):
+    """Split only *data-invalid* provider batches; never fan out infrastructure outages.
+
+    A provider adapter may validate an entire native response before returning.
+    When one source record is malformed, split the batch until the offending
+    securities can be reported independently. Every child request still runs
+    through the provider's full validation and paging logic.
+    """
+    try:
+        return [(tuple(symbols), await fetch(tuple(symbols)))], {}
+    except InvalidMarketDataError as exc:
+        if len(symbols) == 1:
+            return [], {symbols[0]: exc}
+        middle = len(symbols) // 2
+        left, left_errors = await _fetch_with_invalid_symbol_isolation(symbols[:middle], fetch)
+        right, right_errors = await _fetch_with_invalid_symbol_isolation(symbols[middle:], fetch)
+        return left + right, {**left_errors, **right_errors}
+
+
 class QuoteSyncService:
     """Fetch and persist latest quote snapshots with provider-native batching."""
 
@@ -536,42 +564,61 @@ class QuoteSyncService:
         if callable(batch_method):
             for offset in range(0, len(canonical_symbols), self._batch_size):
                 chunk = canonical_symbols[offset : offset + self._batch_size]
+
+                async def fetch_quotes(requested):
+                    return tuple(await batch_method(requested))
+
                 try:
-                    records = tuple(await batch_method(chunk))
-                    by_symbol: dict[str, list[Quote]] = {}
-                    for record in records:
-                        if not isinstance(record, Quote) or record.symbol not in chunk:
-                            raise InvalidMarketDataError("provider returned an unexpected quote")
-                        by_symbol.setdefault(record.symbol, []).append(record)
+                    batches, individual_errors = await _fetch_with_invalid_symbol_isolation(
+                        chunk, fetch_quotes
+                    )
                 except Exception as exc:
                     for symbol in chunk:
                         results[symbol] = SyncItemResult(
                             symbol=symbol, status="failed", error=_sync_error(exc)
                         )
                     continue
-                for symbol in chunk:
-                    if symbol not in by_symbol:
-                        results[symbol] = SyncItemResult(
-                            symbol=symbol,
-                            status="failed",
-                            error=SyncError(
-                                "PROVIDER_UNAVAILABLE", "provider omitted requested quote"
-                            ),
-                        )
-                        continue
+                for symbol, exc in individual_errors.items():
+                    results[symbol] = SyncItemResult(
+                        symbol=symbol, status="failed", error=_sync_error(exc)
+                    )
+                for batch_symbols, records in batches:
                     try:
-                        candidates = unique_facts(
-                            by_symbol[symbol], key=lambda record: record.timestamp
-                        )
-                    except InvalidMarketDataError as exc:
-                        results[symbol] = SyncItemResult(
-                            symbol=symbol, status="failed", error=_sync_error(exc)
-                        )
+                        by_symbol: dict[str, list[Quote]] = {}
+                        for record in records:
+                            if not isinstance(record, Quote) or record.symbol not in batch_symbols:
+                                raise InvalidMarketDataError(
+                                    "provider returned an unexpected quote"
+                                )
+                            by_symbol.setdefault(record.symbol, []).append(record)
+                    except Exception as exc:
+                        for symbol in batch_symbols:
+                            results[symbol] = SyncItemResult(
+                                symbol=symbol, status="failed", error=_sync_error(exc)
+                            )
                         continue
-                    # An explicit source timestamp can order quotes; response
-                    # position cannot. Equal-time conflicts remain failures.
-                    pending[symbol] = candidates[-1]
-                    results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
+                    for symbol in batch_symbols:
+                        if symbol not in by_symbol:
+                            results[symbol] = SyncItemResult(
+                                symbol=symbol,
+                                status="failed",
+                                error=SyncError(
+                                    "PROVIDER_UNAVAILABLE", "provider omitted requested quote"
+                                ),
+                            )
+                            continue
+                        try:
+                            candidates = unique_facts(
+                                by_symbol[symbol], key=lambda record: record.timestamp
+                            )
+                        except InvalidMarketDataError as exc:
+                            results[symbol] = SyncItemResult(
+                                symbol=symbol, status="failed", error=_sync_error(exc)
+                            )
+                            continue
+                        # Latest explicit timestamp wins; equal-time conflicts fail.
+                        pending[symbol] = candidates[-1]
+                        results[symbol] = SyncItemResult(symbol=symbol, status="success", fetched=1)
         else:
             for symbol in canonical_symbols:
                 try:

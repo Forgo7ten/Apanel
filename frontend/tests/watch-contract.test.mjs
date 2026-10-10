@@ -304,6 +304,9 @@ test("detail data is reusable only for the active watch table", () => {
   assert.equal(isCurrentWatchDetail({ id: 8 }, 7), false);
   assert.equal(isCurrentWatchDetail(null, 7), false);
   assert.equal(isCurrentWatchDetail({ id: 7 }, null), false);
+  assert.equal(isCurrentWatchDetail({ id: 7, adjust_type: "none" }, 7, "none"), true);
+  assert.equal(isCurrentWatchDetail({ id: 7, adjust_type: "qfq" }, 7, "none"), false);
+  assert.equal(isCurrentWatchDetail({ id: 7 }, 7, "none"), false);
 });
 
 test("virtual range handles empty, small, scrolling, and boundary rows", () => {

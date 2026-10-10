@@ -4,7 +4,8 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { searchSecurities } from "@/api/securities";
-import type { AlertRule, CreateAlertInput, Security } from "@/api/types";
+import type { AlertRule, CreateAlertInput, IndicatorParameters, Security } from "@/api/types";
+import { initialValueParameters, availableMaPeriods } from "@/lib/watch-alert-contract.mjs";
 import { getDefaultIndicatorParameters, getIndicatorFieldOptions, indicatorUsesAdjustment } from "@/lib/indicator-metadata.mjs";
 import { StateTag, stateToneFromLevel } from "@/components/ui/StateTag";
 import { isApiError } from "@/lib/api-errors";
@@ -22,7 +23,7 @@ export type AlertWizardDraft = {
   condition_type?: "STATE" | "VALUE";
   state_id?: string;
   indicator?: string;
-  parameters?: Record<string, number>;
+  parameters?: IndicatorParameters;
   field?: string;
   adjust_type?: "qfq" | "none";
 };
@@ -79,11 +80,13 @@ export function AlertWizard({
   const [operator, setOperator] = useState(initialRule?.operator ?? ALERT_OPERATOR_OPTIONS[0]?.id ?? ">=");
   const [threshold, setThreshold] = useState(initialRule?.threshold === null || initialRule?.threshold === undefined ? "70" : String(initialRule.threshold));
   const initialIndicator = initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator ?? "RSI";
-  const [parameters, setParameters] = useState<Record<string, number>>(() => ({
-    ...getDefaultIndicatorParameters(initialIndicator),
-    ...((initialRule?.condition_type?.toUpperCase() === "VALUE" ? initialRule.parameters : initialDraft?.condition_type === "VALUE" ? initialDraft.parameters : {}) as Record<string, number>),
-  }));
-  const [stateParameters, setStateParameters] = useState<Record<string, number>>(() => ({
+  const [parameters, setParameters] = useState<IndicatorParameters>(() => initialValueParameters(
+    initialIndicator,
+    initialRule?.condition_type?.toUpperCase() === "VALUE"
+      ? initialRule.parameters
+      : initialDraft?.condition_type === "VALUE" ? initialDraft.parameters : undefined,
+  ));
+  const [stateParameters, setStateParameters] = useState<IndicatorParameters>(() => ({
     ...((initialRule?.condition_type?.toUpperCase() === "STATE" ? initialRule.parameters : initialDraft?.condition_type === "STATE" ? initialDraft.parameters : {}) as Record<string, number>),
   }));
   const [field, setField] = useState(initialRule?.field ?? initialDraft?.field ?? "");
@@ -277,9 +280,15 @@ export function AlertWizard({
                   <div className="grid gap-3 sm:grid-cols-3">
                     {Object.entries(parameters).map(([key, value]) => (
                       <label key={key} className="text-xs font-medium text-secondary">{key}
-                        <input type="number" min="1" step={key === "multiplier" ? "0.1" : "1"} value={value}
-                          onChange={(event) => setParameters((current) => ({ ...current, [key]: Number(event.target.value) }))}
-                          className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary" />
+                        {Array.isArray(value) ? (
+                          <span className="mt-2 block rounded border border-line bg-card px-3 py-2.5 text-xs text-primary" title="多周期请在监控列设置中修改">
+                            {value.join("、")}（源列周期）
+                          </span>
+                        ) : (
+                          <input type="number" min="1" step={key === "multiplier" ? "0.1" : "1"} value={String(value ?? "")}
+                            onChange={(event) => setParameters((current) => ({ ...current, [key]: Number(event.target.value) }))}
+                            className="mt-2 h-10 w-full rounded border border-line bg-card px-3 text-sm text-primary" />
+                        )}
                       </label>
                     ))}
                   </div>
@@ -289,7 +298,7 @@ export function AlertWizard({
                     <select value={field} onChange={(event) => setField(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm text-primary">
                       <option value="">请选择</option>
                       {indicator === "MA"
-                        ? <option value={`MA${parameters.period ?? 5}`}>{`MA${parameters.period ?? 5}`}</option>
+                        ? availableMaPeriods(parameters).map((period) => <option key={period} value={"MA" + period}>{"MA" + period}</option>)
                         : getIndicatorFieldOptions(indicator).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                     </select>
                   </label>

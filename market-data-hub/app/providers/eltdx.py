@@ -122,7 +122,6 @@ class EltdxProvider:
         if not canonical_symbols:
             return ()
         requested = {_full_code(symbol): symbol for symbol in canonical_symbols}
-        observed_at = datetime.now(UTC)
         rows = await self._call(
             "quotes",
             self._client.quotes.get_snapshots,
@@ -130,6 +129,9 @@ class EltdxProvider:
         )
         if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
             raise ProviderUnavailableError("eltdx quotes returned an invalid response")
+        # Observation receipt time, not TDX's opaque server time_raw value.
+        # Capture after the network call so latency cannot predate receipt.
+        observed_at = datetime.now(UTC)
         result: dict[str, Quote] = {}
         for row in rows:
             row_code = str(getattr(row, "code", "")).strip()
@@ -259,9 +261,7 @@ class EltdxProvider:
                     )
                     existing = collected[symbol].get(record.trade_date)
                     if existing is not None and existing != record:
-                        raise InvalidMarketDataError(
-                            "conflicting daily bars across provider pages"
-                        )
+                        raise InvalidMarketDataError("conflicting daily bars across provider pages")
                     collected[symbol][record.trade_date] = record
                 if len(collected[symbol]) >= count or len(bars) < page_size:
                     result[symbol] = tuple(

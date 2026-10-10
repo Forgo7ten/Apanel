@@ -119,6 +119,10 @@ class PriceData(BaseModel):
     change_percent: float | None = None
     direction: str | None = None
     timestamp: datetime | None = None
+    # TDX 0x054c only exposes an opaque time_raw: this is an observation time,
+    # never a verified exchange execution/update time.
+    timestamp_kind: str | None = None
+    observation_stale: bool | None = None
 
 
 class CurrentStateData(BaseModel):
@@ -163,6 +167,7 @@ class WatchTableStockData(BaseModel):
 class WatchTableDetailsData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    adjust_type: str
     id: int
     name: str
     description: str | None = None

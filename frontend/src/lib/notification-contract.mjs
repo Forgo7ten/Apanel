@@ -1,4 +1,5 @@
 import { INDICATOR_OPTIONS, getDefaultIndicatorParameters, getIndicatorFieldOptions, indicatorUsesAdjustment } from "./indicator-metadata.mjs";
+import { maPeriods } from "./watch-alert-contract.mjs";
 
 /**
  * Shared alert vocabulary. These labels mirror the state IDs exposed by the
@@ -80,6 +81,9 @@ export function buildAlertPayload(form) {
   const fields = getIndicatorFieldOptions(indicator);
   if (fields.length > 1 || indicator === "MA") {
     if (!form.field?.trim()) throw new Error("请选择具体指标字段。");
+    if (indicator === "MA" && !maPeriods(payload.parameters).some((period) => ("MA" + period) === form.field.trim().toUpperCase())) {
+      throw new Error("所选 MA 字段不属于当前周期参数。");
+    }
     payload.field = form.field.trim();
   } else if (fields.length === 1) {
     payload.field = fields[0].value;
