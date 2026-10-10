@@ -8,7 +8,14 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from app.models import AlertInstance, AlertRule, IndicatorSnapshot, IndicatorState, Notification
+from app.models import (
+    AlertInstance,
+    AlertRule,
+    CurrentIndicatorState,
+    IndicatorSnapshot,
+    Notification,
+)
+from app.schemas.state_row import StateRow
 
 
 class AlertRepository:
@@ -24,17 +31,24 @@ class AlertRepository:
             .options(joinedload(AlertRule.security))
             .order_by(AlertRule.created_at.desc(), AlertRule.id.desc())
         )
-        return list((await self.session.execute(statement)).scalars())
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
     async def get_owned(self, rule_id: int, user_id: int) -> AlertRule | None:
         statement = (
             select(AlertRule)
             .where(AlertRule.id == rule_id, AlertRule.user_id == user_id)
             .options(joinedload(AlertRule.security))
+            .execution_options(populate_existing=True)
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
 
-    async def get_for_evaluation(self, rule_id: int) -> AlertRule | None:
+    async def get_for_evaluation(
+        self, rule_id: int, *, user_id: int | None = None
+    ) -> AlertRule | None:
         """Lock one rule while calculating and claiming its next edge.
 
         The rule row is the parent isolation boundary for ``AlertInstance``.
@@ -47,7 +61,10 @@ class AlertRepository:
             .where(AlertRule.id == rule_id)
             .options(joinedload(AlertRule.security))
             .with_for_update(of=AlertRule)
+            .execution_options(populate_existing=True)
         )
+        if user_id is not None:
+            statement = statement.where(AlertRule.user_id == user_id)
         return (await self.session.execute(statement)).scalar_one_or_none()
 
     async def list_enabled_for_evaluation(self) -> list[AlertRule]:
@@ -57,15 +74,21 @@ class AlertRepository:
             .options(joinedload(AlertRule.security))
             .order_by(AlertRule.user_id.asc(), AlertRule.id.asc())
         )
-        return list((await self.session.execute(statement)).scalars())
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
     async def get_instance(self, alert_rule_id: int, security_id: int) -> AlertInstance | None:
         return (
             await self.session.execute(
-                select(AlertInstance).where(
+                select(AlertInstance)
+                .where(
                     AlertInstance.alert_rule_id == alert_rule_id,
                     AlertInstance.security_id == security_id,
                 )
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
 
@@ -80,6 +103,7 @@ class AlertRepository:
                     IndicatorSnapshot.indicator_type == indicator_type,
                     IndicatorSnapshot.adjust_type == adjustment,
                 )
+                .execution_options(populate_existing=True)
                 .order_by(IndicatorSnapshot.trade_date.desc(), IndicatorSnapshot.id.desc())
                 .limit(1)
             )
@@ -107,7 +131,11 @@ class AlertRepository:
             )
             .order_by(IndicatorSnapshot.indicator_type.asc())
         )
-        return list((await self.session.execute(statement)).scalars())
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
     async def latest_states(
         self,
@@ -116,31 +144,16 @@ class AlertRepository:
         adjustment: str | None = None,
         state_code: str | None = None,
         parameter_key: str | None = None,
-    ) -> list[IndicatorState]:
-        latest_date = (
-            await self.session.execute(
-                select(func.max(IndicatorState.trade_date)).where(
-                    IndicatorState.security_id == security_id,
-                    *(() if adjustment is None else (IndicatorState.adjust_type == adjustment,)),
-                    *(() if state_code is None else (IndicatorState.state_code == state_code,)),
-                    *(
-                        ()
-                        if parameter_key is None
-                        else (IndicatorState.parameter_key == parameter_key,)
-                    ),
-                )
-            )
-        ).scalar_one_or_none()
-        if latest_date is None:
-            return []
-        statement: Select[tuple[IndicatorState]] = select(IndicatorState).where(
-            IndicatorState.security_id == security_id,
-            IndicatorState.trade_date == latest_date,
-            *(() if adjustment is None else (IndicatorState.adjust_type == adjustment,)),
-            *(() if state_code is None else (IndicatorState.state_code == state_code,)),
-            *(() if parameter_key is None else (IndicatorState.parameter_key == parameter_key,)),
+    ) -> list[StateRow]:
+        from app.repositories.state_event import StateEventRepository
+
+        rows = await StateEventRepository(self.session).current_many(
+            [security_id],
+            adjustment=adjustment or "qfq",
+            state_code=state_code,
+            parameter_key=parameter_key,
         )
-        return list((await self.session.execute(statement)).scalars())
+        return rows[security_id]
 
     async def latest_observation_date(self, security_id: int) -> date | None:
         snapshot_date = (
@@ -152,8 +165,8 @@ class AlertRepository:
         ).scalar_one_or_none()
         state_date = (
             await self.session.execute(
-                select(func.max(IndicatorState.trade_date)).where(
-                    IndicatorState.security_id == security_id
+                select(func.max(CurrentIndicatorState.trade_date)).where(
+                    CurrentIndicatorState.security_id == security_id
                 )
             )
         ).scalar_one_or_none()
@@ -174,7 +187,11 @@ class AlertRepository:
             .order_by(Notification.created_at.desc(), Notification.id.desc())
             .limit(limit)
         )
-        return list((await self.session.execute(statement)).scalars())
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
 
 __all__ = ["AlertRepository"]

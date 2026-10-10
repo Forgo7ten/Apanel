@@ -22,7 +22,6 @@ from app.models import (
     AlertInstance,
     AlertRule,
     IndicatorSnapshot,
-    IndicatorState,
     Notification,
     Security,
     User,
@@ -36,6 +35,7 @@ from app.providers.notification import (
     NotificationProviderRegistry,
 )
 from app.schemas.alerts import AlertRuleCreateRequest
+from app.schemas.state_row import StateRow
 from app.services.alert_service import AlertService
 from app.services.notification_service import (
     NOTIFICATION_PENDING_RECOVERY_MARGIN,
@@ -46,6 +46,9 @@ from app.services.notification_service import (
     validate_pending_recovery_window,
 )
 from app.services.settings_service import UserSettingsService
+from app.services.state_service import state_parameter_key
+from tests.snapshot_fixture import current_snapshot
+from tests.state_fixture import seed_current_state
 
 
 class FakeProvider:
@@ -111,7 +114,7 @@ async def alert_context(tmp_path) -> AsyncIterator[dict[str, object]]:
         session.add_all([user_one, user_two, security])
         await session.flush()
         session.add(
-            IndicatorSnapshot(
+            current_snapshot(
                 security_id=security.id,
                 trade_date=date(2026, 9, 24),
                 indicator_type="RSI",
@@ -121,13 +124,18 @@ async def alert_context(tmp_path) -> AsyncIterator[dict[str, object]]:
                 delta={"value": 2.0},
             )
         )
-        session.add(
-            IndicatorState(
+        await seed_current_state(
+            session,
+            StateRow(
                 security_id=security.id,
                 trade_date=date(2026, 9, 24),
                 state_code="BOLL_WIDTH_NARROWING",
                 indicator_type="BOLL",
                 status="ACTIVE",
+                parameters={"period": 20, "multiplier": 2.0},
+                parameter_key=state_parameter_key(
+                    "BOLL_WIDTH_NARROWING", {"period": 20, "multiplier": 2.0}
+                ),
                 metadata={
                     "name": "带口收窄",
                     "active": True,
@@ -139,7 +147,7 @@ async def alert_context(tmp_path) -> AsyncIterator[dict[str, object]]:
                         }
                     },
                 },
-            )
+            ),
         )
         await session.commit()
         await session.refresh(user_one)
@@ -276,13 +284,13 @@ async def test_value_edge_trigger_survives_service_restart_and_reset(alert_conte
         held = await AlertService(session, notification_provider=provider).evaluate_user(user.id)
         assert held[0].triggered is False
         snapshot = (await session.execute(select(IndicatorSnapshot))).scalar_one()
-        snapshot.values = {"value": 60.0}
+        snapshot.values = {key: {"value": 60.0} for key in snapshot.values}
         snapshot.previous_values = {"value": 71.0}
         snapshot.delta = {"value": -11.0}
         await session.commit()
         reset = await AlertService(session, notification_provider=provider).evaluate_user(user.id)
         assert reset[0].status == "RESET"
-        snapshot.values = {"value": 72.0}
+        snapshot.values = {key: {"value": 72.0} for key in snapshot.values}
         snapshot.previous_values = {"value": 60.0}
         snapshot.delta = {"value": 12.0}
         await session.commit()
@@ -328,16 +336,13 @@ async def test_state_trigger_and_provider_failure_are_persisted(alert_context) -
         }
         assert notification.content["value_details"] == expected_details
         assert provider.messages[0].value_details == expected_details
-        assert (
-            "width · 当前 0.08 · 前值 0.1 · 变化 -0.02"
-            in provider.messages[0].render_text()
-        )
+        assert "width · 当前 0.08 · 前值 0.1 · 变化 -0.02" in provider.messages[0].render_text()
         assert "webhook" not in (notification.error_message or "").lower()
 
         replacement = FakeProvider()
-        retried = await AlertService(
-            session, notification_provider=replacement
-        ).retry_notification(user.id, notification.id)
+        retried = await AlertService(session, notification_provider=replacement).retry_notification(
+            user.id, notification.id
+        )
         assert retried.status == "SENT"
         assert replacement.messages[0].value_details == expected_details
 
@@ -702,6 +707,26 @@ async def test_pending_recovery_skips_recent_inflight_rows(alert_context) -> Non
     assert summary == {"total": 1, "sent": 1, "failed": 0, "pending": 0}
 
 
+async def enqueue_and_dispatch_for_test(
+    session, provider, user_id, security_id, *, created_at=None
+):
+    """Exercise the real two-stage outbox path without a removed helper."""
+    service = NotificationService(session, provider=provider)
+    message = retry_message()
+    queued = await service.enqueue(
+        user_id=user_id,
+        alert_rule_id=None,
+        security_id=security_id,
+        title="RSI >= 70",
+        message=message,
+        trigger_sequence=None,
+        observation_date=message.date,
+        created_at=created_at,
+    )
+    await session.commit()
+    return await service.dispatch(queued.id)
+
+
 @pytest.mark.asyncio
 async def test_initial_delivery_serializes_stale_retry_before_provider_call(alert_context) -> None:
     session_factory = alert_context["session_factory"]
@@ -712,13 +737,8 @@ async def test_initial_delivery_serializes_stale_retry_before_provider_call(aler
 
     async with session_factory() as delivery_session, session_factory() as retry_session:
         delivery = asyncio.create_task(
-            NotificationService(delivery_session, provider=provider).deliver(
-                user_id=user.id,
-                alert_rule_id=None,
-                security_id=security.id,
-                title="RSI >= 70",
-                message=retry_message(),
-                created_at=created_at,
+            enqueue_and_dispatch_for_test(
+                delivery_session, provider, user.id, security.id, created_at=created_at
             )
         )
         await provider.started.wait()
@@ -884,13 +904,7 @@ async def test_terminal_commit_recovery_returns_safe_error_when_persistence_stay
 
         monkeypatch.setattr(session, "commit", fail_terminal_commits)
         with pytest.raises(ApiError) as raised:
-            await NotificationService(session, provider=provider).deliver(
-                user_id=user.id,
-                alert_rule_id=None,
-                security_id=security.id,
-                title="RSI >= 70",
-                message=retry_message(),
-            )
+            await enqueue_and_dispatch_for_test(session, provider, user.id, security.id)
 
     assert raised.value.code == "NOTIFICATION_PERSISTENCE_FAILED"
     assert raised.value.status_code == 503

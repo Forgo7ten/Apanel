@@ -2,6 +2,8 @@
 
 import { create } from "zustand";
 
+import { sessionScope } from "@/lib/session-scope.mjs";
+
 export type WatchSort = {
   id: string;
   desc: boolean;
@@ -19,14 +21,30 @@ type WatchStore = {
   resetTableView: () => void;
 };
 
-export const useWatchStore = create<WatchStore>((set) => ({
-  selectedTableId: null,
-  columnVisibility: {},
-  columnOrder: [],
-  sorting: [],
-  setSelectedTableId: (selectedTableId) => set({ selectedTableId }),
-  setColumnVisibility: (columnVisibility) => set({ columnVisibility }),
-  setColumnOrder: (columnOrder) => set({ columnOrder }),
-  setSorting: (sorting) => set({ sorting }),
-  resetTableView: () => set({ columnVisibility: {}, columnOrder: [], sorting: [] }),
-}));
+function accountState(set: (patch: Partial<WatchStore>) => void): WatchStore {
+  const version = sessionScope.version();
+  const update = (patch: Partial<WatchStore>) => {
+    // A mutation callback may have awaited before the account changed. Its
+    // captured actions must not touch the new account, even after a reset.
+    if (sessionScope.version() === version) set(patch);
+  };
+  return {
+    selectedTableId: null,
+    columnVisibility: {},
+    columnOrder: [],
+    sorting: [],
+    setSelectedTableId: (selectedTableId) => update({ selectedTableId }),
+    setColumnVisibility: (columnVisibility) => update({ columnVisibility }),
+    setColumnOrder: (columnOrder) => update({ columnOrder }),
+    setSorting: (sorting) => update({ sorting }),
+    resetTableView: () => update({ columnVisibility: {}, columnOrder: [], sorting: [] }),
+  };
+}
+
+export const useWatchStore = create<WatchStore>((set) => accountState(set));
+
+// Renew both values and actions synchronously. A -> B -> A is a new lifetime,
+// while an access-token refresh for the same account preserves current actions.
+sessionScope.subscribe(() => {
+  useWatchStore.setState(accountState(useWatchStore.setState), true);
+});

@@ -28,6 +28,7 @@
 - 邀请 token 使用高熵 URL-safe 随机值；数据库只保存 SHA-256 哈希，原始 token 只在创建邀请的响应中返回一次。
 - 注册在事务中锁定并消费邀请，邀请状态可为 `PENDING`、`ACCEPTED`、`REVOKED` 或 `EXPIRED`。
 - 用户名和邮箱使用大小写不敏感的唯一索引；注册时邀请邮箱和提交邮箱必须匹配。
+- 用户名与邮箱共用登录标识命名空间；创建账户时锁定冲突标识，避免不同账户的用户名/邮箱交叉歧义。
 
 ## 会话与授权
 
@@ -38,6 +39,7 @@
 - 前端把 access token 保存在进程内会话状态，不把 refresh token 放入 JavaScript 可读存储；多标签页通过协调器避免正常刷新竞争。
 - `/auth/me` 每次从数据库读取当前激活用户；管理员权限由数据库中的 `role` 检查，不信任 JWT 中的角色字段。
 - 创建邀请需要激活的管理员；注册、登录和刷新不接受客户端提供的 `user_id` 作为权限依据。
+- 登录支持 `identifier_type=auto|username|email`；`auto` 遇到歧义时拒绝登录，显式类型只查询对应字段。
 
 ## 飞书 Webhook 与用户密钥
 
@@ -45,15 +47,19 @@
 - 空输入表示“保持”；只有显式 `null`/清除动作才删除已保存 Webhook。
 - 新 Webhook 只接受 HTTPS，并默认 allowlist `open.feishu.cn` / `open.larksuite.com` 的 `/open-apis/bot/v2/hook/<token>` 路径；拒绝 userinfo、query、fragment 和非 443 显式端口，避免把通知出口变成任意 SSRF。
 - Webhook 使用 AES-GCM 存入 `user_secrets`，AAD 绑定 user/secret type，数据库不再把新 token 明文写进 `user_settings.settings`。
-- `python -m app.cli migrate-user-secrets` 可把遗留 JSON 明文迁移到加密表；迁移前 NotificationService 保留只读 legacy fallback，迁移完成后应审计并清除所有旧值。
-- 迁移后运行 `python -m app.cli audit-user-secrets`；只有输出 `legacy_plaintext=0` 且 `release_b_ready=yes` 时，才把 `LEGACY_WEBHOOK_FALLBACK_ENABLED=false` 部署到 Backend/Worker，进入 Release B。审计只输出计数，不输出 URL/token。
 - `APP_SECRETS_KEY_VERSION` 用于记录密钥版本；轮换时把旧版本 key 通过 `APP_SECRETS_PREVIOUS_KEYS` JSON 映射提供给 Backend/Worker，再切换当前 key。历史 ciphertext 会按 `user_secrets.key_version` 选择解密 key；完成重加密后再移除旧 key。生产 Backend/Worker 会在启动期校验 current/previous key 的 URL-safe base64、32-byte 长度、JSON 结构和版本唯一性；previous key 不允许重复当前版本，错误配置直接 fail-fast。
+- 更新 Webhook 仅通过 `notification_settings.feishu_webhook`：省略表示保留、显式 `null` 清除；URL 只写入加密表，用户设置 JSON 不保存明文。
+- 启动配置与解密过程共用 `parse_secret_keyring`；接受合法的无 padding URL-safe base64，拒绝重复或冲突版本，保留 key version 的精确身份，避免轮换时错误读取密文。
 
 ## 通知投递语义
 
 飞书 Webhook 当前采用 **at-least-once（至少一次）** 投递语义，而不是 exactly-once。`PENDING` outbox 会等待超过 provider timeout 与恢复窗口后才允许恢复发送，数据库 row lock 可以避免多个恢复 worker 同时重复 POST；但如果外部 Webhook 已返回成功、worker 却在 terminal DB commit 前崩溃，数据库无法证明外部是否已经收到该消息，后续恢复可能再次发送。
 
 Apanel 不会通过“发送前先标记 SENT”来伪造 exactly-once，因为那会把重复风险换成永久漏通知。Notification 内容保留稳定 `event_id`，供诊断以及未来接入支持幂等键的通知网关时使用。
+
+提醒规则自创建就保存 `rule_version` 和规则级单调 `trigger_sequence`；规则变更、并发评估和通知 outbox 使用数据库行锁，不重用已消费的事件身份。临时传输错误及 HTTP 429/5xx 按 60 秒起始指数退避自动恢复，最多五次发送尝试；永久失败仅允许显式手动重试。无效内容被标记为 `INVALID_NOTIFICATION_CONTENT`，不阻塞后续任务。
+
+Provider 消息与飞书文本携带同一稳定 `event_id`，重试沿用该标识。编号仅允许有限长度的安全字符；Provider 清理连接的延迟不应影响已确认的投递结果入库。
 
 ## 内部行情接口
 
@@ -81,3 +87,11 @@ Nginx 当前添加 `X-Content-Type-Options: nosniff` 和 `X-Frame-Options: SAMEO
 - 仓库没有独立的速率限制、审计日志、密码找回或管理员撤销邀请 HTTP API。
 - Cookie 使用 SameSite 策略，但当前没有单独的 CSRF token 机制；应保持前后端同源并在 HTTPS 入口后部署。
 - 行情读取接口依赖内部网络隔离；不要在未增加认证和网关策略的情况下直接发布 `8001`。
+
+## 浏览器账户作用域
+
+QueryClient 的生命周期绑定账户作用域；切换账户/退出后重建缓存容器并清空旧缓存和监控表局部状态，同用户 access token 刷新不重建容器。API 请求在 fetch、刷新认证、读取 JSON 后都校验发起时的作用域；旧请求不得使用新用户凭证重试，也不得用晚到的 401 清空新会话。跨标签协调只广播公开用户 ID 提示，不广播 token。旧登录结果在 logout 后失效。
+
+Zustand 的字段与操作方法同时绑定账户 lifetime。切换账户时同步更新字段并创建新方法；旧异步回调即使在 `await` 后持有上一个账户的方法，也只能成为无操作，不能覆盖新账户状态。同一用户刷新 access token 不使当前方法失效，A→B→A 则属于新的 lifetime。
+
+部署前应在真实浏览器中验证多标签切换、注销与离线恢复行为。

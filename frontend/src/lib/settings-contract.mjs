@@ -26,18 +26,14 @@ function cloneParameters(parameters) {
 }
 
 /**
- * Convert the versioned settings response to the small shape consumed by the
- * form. A configured webhook is deliberately not copied when the server only
- * returns a masked value or a boolean configuration marker.
+ * Convert the current settings response to form state; never copy secrets.
  */
 export function normalizeSettings(input) {
   const source = isRecord(input?.settings) ? input.settings : isRecord(input) ? input : {};
-  const indicatorSettings = isRecord(source.indicator_settings) ? source.indicator_settings : isRecord(source.indicators) ? source.indicators : {};
-  const displaySettings = isRecord(source.display_settings) ? source.display_settings : isRecord(source.display) ? source.display : {};
-  const notificationSettings = isRecord(source.notification_settings) ? source.notification_settings : isRecord(source.notification) ? source.notification : {};
-  const rawWebhook = typeof notificationSettings.feishu_webhook === "string" ? notificationSettings.feishu_webhook.trim() : "";
-  const maskedWebhook = rawWebhook.length > 0 && /^[*•…]+$/.test(rawWebhook);
-  const configured = notificationSettings.feishu_webhook_configured === true || (rawWebhook.length > 0 && !maskedWebhook);
+  const indicatorSettings = isRecord(source.indicator_settings) ? source.indicator_settings : {};
+  const displaySettings = isRecord(source.display_settings) ? source.display_settings : {};
+  const notificationSettings = isRecord(source.notification_settings) ? source.notification_settings : {};
+  const configured = notificationSettings.feishu_webhook_configured === true;
   const defaults = Array.isArray(indicatorSettings.defaults)
     ? indicatorSettings.defaults.filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim().toUpperCase())
     : DEFAULT_INDICATORS.slice();

@@ -18,14 +18,16 @@ from app.db.session import get_db
 from app.main import create_app
 from app.models import (
     DailyBar,
-    IndicatorSnapshot,
-    IndicatorState,
     QuoteSnapshot,
     Security,
     User,
     UserStatus,
 )
 from app.repositories.security import DIVIDEND_EVENTS_TABLE
+from app.schemas.state_row import StateRow
+from app.services.state_service import state_parameter_key
+from tests.snapshot_fixture import current_snapshot
+from tests.state_fixture import seed_current_state
 
 
 @pytest_asyncio.fixture
@@ -91,7 +93,7 @@ async def tab1_context(
         )
         session.add_all(
             [
-                IndicatorSnapshot(
+                current_snapshot(
                     security_id=security.id,
                     trade_date=date(2026, 9, 23),
                     indicator_type="MA",
@@ -100,7 +102,7 @@ async def tab1_context(
                     previous_values={"MA5": 98.0, "MA20": 117.0},
                     delta={"MA5": 2.0, "MA20": 3.0},
                 ),
-                IndicatorSnapshot(
+                current_snapshot(
                     security_id=security.id,
                     trade_date=date(2026, 9, 23),
                     indicator_type="BOLL",
@@ -114,7 +116,7 @@ async def tab1_context(
                     },
                     delta={"upper": 1.0, "middle": 1.0, "lower": 1.0, "width": -0.01},
                 ),
-                IndicatorSnapshot(
+                current_snapshot(
                     security_id=security.id,
                     trade_date=date(2026, 9, 23),
                     indicator_type="RSI",
@@ -125,15 +127,20 @@ async def tab1_context(
                 ),
             ]
         )
-        session.add(
-            IndicatorState(
+        await seed_current_state(
+            session,
+            StateRow(
                 security_id=security.id,
                 trade_date=date(2026, 9, 23),
                 state_code="BOLL_WIDTH_NARROWING",
                 indicator_type="BOLL",
                 status="ACTIVE",
+                parameters={"period": 20, "multiplier": 2.0},
+                parameter_key=state_parameter_key(
+                    "BOLL_WIDTH_NARROWING", {"period": 20, "multiplier": 2.0}
+                ),
                 metadata={"name": "带口收窄", "level": "WARNING", "active": True},
-            )
+            ),
         )
         await session.flush()
         await session.execute(
@@ -220,12 +227,6 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
     assert details.status_code == 200
     stock = details.json()["data"]["stocks"][0]
 
-    assert stock["indicators"]["MA"]["value"] == 120.0
-    assert stock["indicators"]["MA"]["current_value"] == 120.0
-    assert stock["indicators"]["MA"]["delta"] == 3.0
-    assert stock["indicators"]["BOLL"]["upper"] == 110.0
-    assert stock["indicators"]["BOLL"]["current_value"]["upper"] == 110.0
-    assert stock["indicators"]["BOLL"]["delta"]["width"] == -0.01
     ma_column_value = stock["column_values"][str(ma_column.json()["data"]["id"])]
     assert ma_column_value["parameter_key"].startswith("v1_")
     assert {key: value for key, value in ma_column_value.items() if key != "parameter_key"} == {
@@ -250,7 +251,7 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
         "direction": "DOWN",
     }
     assert stock["states"][0]["state_id"] == "BOLL_WIDTH_NARROWING"
-    assert "RSI" not in stock["indicators"]
+    assert stock["column_values"][str(bad_column.json()["data"]["id"])]["available"] is False
 
 
 async def test_composite_number_and_delta_columns_require_a_field_selector(tab1_context) -> None:

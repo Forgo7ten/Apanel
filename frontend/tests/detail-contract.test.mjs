@@ -55,13 +55,14 @@ test("mini chart handles empty, single-point, and multi-point calculated values"
   assert.equal(miniChartGeometry(toMiniChartPoints(items, column)).length, 2);
 });
 
-test("persisted parameter key is primary and legacy matching is exact", () => {
+test("persisted parameter key is mandatory for historical matching", () => {
   const column = { indicator_type: "RSI", parameters: { period: 6 }, parameter_key: "rsi6" };
   const matching = { indicator_type: "RSI", parameter_key: "rsi6", parameters: { period: 14 }, values: { value: 80 } };
   const wrongKey = { ...matching, parameter_key: "rsi14", parameters: { period: 6 } };
   assert.equal(matchesHistoryParameters(matching, column, "rsi6"), true);
   assert.equal(matchesHistoryParameters(wrongKey, column, "rsi6"), false);
-  assert.equal(matchesHistoryParameters({ indicator_type: "RSI", parameters: { period: 6 } }, column), true);
+  assert.equal(matchesHistoryParameters(matching, { indicator_type: "RSI" }), false);
+  assert.equal(matchesHistoryParameters({ indicator_type: "RSI", parameters: { period: 6 } }, column), false);
   assert.equal(matchesHistoryParameters({ indicator_type: "RSI", parameters: { period: 14 } }, column), false);
 });
 

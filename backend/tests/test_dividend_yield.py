@@ -307,9 +307,9 @@ async def test_watch_detail_projects_dividend_yield_column(dividend_context) -> 
     details = await client.get(f"/api/v1/watch-tables/{table_id}")
 
     assert details.status_code == 200
-    data = details.json()["data"]["stocks"][0]["indicators"]["DIVIDEND_YIELD"]
+    stock = details.json()["data"]["stocks"][0]
+    data = stock["column_values"][str(column.json()["data"]["id"])]
+    assert data["available"] is True
     assert data["value"] == 0.04
-    assert data["yield"] == 0.04
-    assert data["dividend_total"] == 2.0
-    assert data["price"] == 50.0
-    assert data["price_source"] == "QUOTE"
+    assert data["indicator_type"] == "DIVIDEND_YIELD"
+    assert "indicators" not in stock and "values" not in stock

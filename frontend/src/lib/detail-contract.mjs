@@ -4,19 +4,6 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function stableValue(value) {
-  if (Array.isArray(value)) return value.map(stableValue);
-  if (isRecord(value)) {
-    return Object.fromEntries(
-      Object.entries(value)
-        .filter(([key]) => key !== "field")
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, item]) => [key, stableValue(item)]),
-    );
-  }
-  return value;
-}
-
 export function buildHistoryPath(path, query = {}) {
   const params = new URLSearchParams();
   if (query.start) params.set("start", query.start);
@@ -43,12 +30,8 @@ export function matchesHistoryParameters(point, column, parameterKey) {
   if (!isRecord(point) || !isRecord(column)) return false;
   if (String(point.indicator_type ?? "").toUpperCase() !== String(column.indicator_type ?? "").toUpperCase()) return false;
   const expectedKey = parameterKey ?? column.parameter_key;
-  if (point.parameter_key && expectedKey) return point.parameter_key === expectedKey;
-  const requested = stableValue(column.parameters ?? {});
-  const stored = stableValue(point.parameters ?? {});
-  // Legacy v1 rows have no selector.  Keep this fallback exact so a missing
-  // key never turns a same-type column into an arbitrary parameter match.
-  return JSON.stringify(requested) === JSON.stringify(stored);
+  return typeof expectedKey === "string" && expectedKey.length > 0
+    && point.parameter_key === expectedKey;
 }
 
 export function selectHistoryPoints(items, column, parameterKey) {
@@ -101,7 +84,7 @@ export function miniChartPointLabel(point) {
 
 export function selectStateHistory(items, stateCode) {
   return (Array.isArray(items) ? items : []).filter((item) => (
-    item?.state_code === stateCode || (!item?.state_code && item?.state_id === stateCode)
+    item?.state_code === stateCode
   ));
 }
 

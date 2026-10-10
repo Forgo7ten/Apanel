@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
+from app.core.config import get_settings
 from app.security.webhook_url import validate_feishu_webhook_url
 
 from .base import NotificationProvider
@@ -37,10 +39,12 @@ class FeishuWebhookError(NotificationProviderError):
         *,
         status_code: int | None = None,
         business_code: str | int | None = None,
+        retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.business_code = business_code
+        self.retryable = retryable
 
 
 def _redacted_endpoint(url: str) -> str:
@@ -58,7 +62,9 @@ def _redacted_endpoint(url: str) -> str:
 
 def _validate_webhook_url(url: Any) -> str:
     try:
-        return validate_feishu_webhook_url(url)
+        return validate_feishu_webhook_url(
+            url, allowed_hosts=get_settings().feishu_webhook_allowed_hosts.split(",")
+        )
     except ValueError as exc:
         raise FeishuWebhookError("Feishu webhook URL is invalid") from exc
 
@@ -112,7 +118,7 @@ class FeishuWebhookProvider(NotificationProvider):
         resolved_timeout = timeout_seconds if timeout is None else timeout
         if isinstance(resolved_timeout, bool) or not isinstance(resolved_timeout, (int, float)):
             raise ValueError("timeout_seconds must be a positive number")
-        if resolved_timeout <= 0:
+        if not math.isfinite(resolved_timeout) or resolved_timeout <= 0:
             raise ValueError("timeout_seconds must be a positive number")
         self.webhook_url = None if webhook_url is None else _validate_webhook_url(webhook_url)
         self.timeout_seconds = float(resolved_timeout)
@@ -177,10 +183,10 @@ class FeishuWebhookProvider(NotificationProvider):
             )
         except (TimeoutError, httpx.TimeoutException):
             self._logger.warning("Feishu webhook timed out endpoint=%s", endpoint_label)
-            raise FeishuWebhookError("Feishu webhook request timed out") from None
+            raise FeishuWebhookError("Feishu webhook request timed out", retryable=True) from None
         except httpx.RequestError:
             self._logger.warning("Feishu webhook request failed endpoint=%s", endpoint_label)
-            raise FeishuWebhookError("Feishu webhook request failed") from None
+            raise FeishuWebhookError("Feishu webhook request failed", retryable=True) from None
         except Exception:
             # Fake clients and alternative transports may expose a different
             # exception hierarchy; do not leak their URL-bearing messages.
@@ -195,7 +201,10 @@ class FeishuWebhookProvider(NotificationProvider):
                 endpoint_label,
             )
             raise FeishuWebhookError(
-                f"Feishu webhook returned HTTP {status_code}", status_code=status_code
+                f"Feishu webhook returned HTTP {status_code}",
+                status_code=status_code,
+                retryable=status_code == 429
+                or (isinstance(status_code, int) and status_code >= 500),
             )
 
         try:

@@ -140,3 +140,4 @@ compose.yaml             本地服务编排
 - [安全说明](docs/security.md)：凭据、认证会话和内部接口安全边界。
 - [行情数据](docs/market-data.md)：provider、同步、存储和复权口径。
 - [指标与状态](docs/indicators-and-states.md)：指标输入输出和状态识别语义。
+- [状态事件架构](docs/state-events.md)：当前状态、事件存储及历史查询规则。

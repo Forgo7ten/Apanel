@@ -391,3 +391,8 @@ test("watch page remounts the table only when its persisted table id changes", (
   assert.match(source, /<WatchTable\s+key=\{String\(currentDetail\.id \?\? activeTableId\)\}/);
   assert.doesNotMatch(source, /<WatchTable\s+key=\{currentDetail\}/);
 });
+
+test("completed short-history analysis is not a permanently spinning bootstrap", () => {
+  assert.equal(isWatchStockDataReady({ bootstrap_ready: true, analysis_status: "READY", column_values: { "1": { available: false } } }, [{ id: 1, visible: true }]), true);
+  assert.equal(isWatchStockDataReady({ bootstrap_ready: true, analysis_status: "REBUILD_PENDING", price: { value: 10 } }), false);
+});

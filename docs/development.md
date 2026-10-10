@@ -68,22 +68,22 @@ npm run build
 
 浏览器 API 基路径由 `NEXT_PUBLIC_API_BASE_URL` 读取，默认是 `/api/v1`。在 Compose 中通过 Nginx 使用默认同源路径；直接运行前端时必须提供一个浏览器可访问的后端基路径，并自行处理跨域和凭据策略。
 
-## 数据库迁移
+## 数据库初始化与结构检查
 
-Compose 启动时由 `migrate` 服务自动执行：
+仅在**全新空 PostgreSQL 数据库**首次启动时，Compose 的 `migrate` 服务执行唯一 `0001_fresh_schema` 初始化：
 
 ```bash
 docker compose up migrate
 ```
 
-在完整栈运行后，也可以在后端容器中查看或执行迁移：
+在完整栈运行后，可以在后端容器中查询版本并检查是否位于唯一 head：
 
 ```bash
 docker compose exec backend alembic current
 docker compose exec backend alembic upgrade head
 ```
 
-迁移使用容器内的 `DATABASE_URL`，不要把 `alembic.ini` 中的占位 URL 当作真实连接地址。新增迁移时在 `backend` 目录执行 Alembic 命令，并确保模型元数据和迁移脚本同步。
+初始化使用容器内的 `DATABASE_URL`，不要把 `alembic.ini` 中的占位 URL 当作真实连接地址。当前只维护全新建库基线；调整表结构时必须同步更新模型和基线 DDL，并在独立空库验证 `alembic upgrade head`、`alembic check`。
 
 ## CI
 
@@ -109,9 +109,11 @@ cd backend && alembic heads
 
 涉及 schema 的变更还应在 PostgreSQL 上执行 `alembic upgrade head`；涉及 Hub shared ORM 的变更必须同时更新/验证 Backend migration owner 与 Hub persistence contract。
 
+**重要：只支持新建空 PostgreSQL 数据库**，唯一 Alembic revision 为 `0001_fresh_schema`；旧库升级、旧明文迁移和数据库 downgrade 均不支持。不要通过手工删除旧表绕过版本失败。
+
 ## 文档维护
 
-`README.md` 与 `docs/` 描述当前可运行实现，应随代码一起更新并进入版本控制。`plan_docs/` 是需求/设计来源与历史规划材料，不应把其中旧的 `market-data-service`、Provider 或 Sprint 状态直接当作当前运行事实；实现状态以当前代码、migration、Compose 和 `docs/` 为准。若产品约束发生变化，应先更新正式 PRD/设计来源，再同步运行文档。
+`README.md` 和 `docs/` 只记录当前可运行的能力、架构、接口、安全与运维流程，应随对应实现同步更新。测试日志、基准输出、临时 Review 和阶段性结论保存在仓库外，不进入 `docs/` 或 Git 提交。产品约束变化时同步更新正式设计来源及对应运行文档。
 
 ## 修改边界
 
@@ -129,3 +131,22 @@ backend/tests/                 认证、Watch、指标/状态、Alert/Notificati
 market-data-hub/tests/         Provider、domain、批量同步、持久化、日历和内部 API
 frontend/tests/                认证协调、Watch/详情、Alert、Settings、Notification 与浏览器契约
 ```
+
+### PostgreSQL 数据库回归
+
+`backend/tests/test_alert_postgres_concurrency.py` 与 `market-data-hub/tests/test_analysis_stream_postgres.py` 需要 `APANEL_TEST_POSTGRES_URL` 指向可丢弃数据库；测试会创建/删除表，严禁传入业务数据库。分别验证跨进程替代的行锁语义、设置首写竞争、同步 fencing、行情/dirty 标记原子回滚及相同输入不重复写入。
+
+批量 Indicator/State Repository 使用有界 UPSERT RETURNING，返回 ORM 对象时刷新 identity map。Ruff、全量 Python/Node 测试、空库 `upgrade head` / `alembic check` 与禁止 downgrade 的测试均属于发布检查，不把 SQLite 通过当作 PostgreSQL 并发验证。
+
+`test_analysis_recovery_postgres.py`、`test_fresh_baseline_postgres.py` 分别覆盖事务/恢复和新库建表、旧 revision 拒绝、禁止 downgrade。CI 使用独立 PostgreSQL 服务运行测试与 `alembic check`。
+
+### 可复现分析性能基线
+
+`backend/scripts/benchmark_analysis.py` 使用独立空数据库生成合成数据，拒绝已有表的数据库，不执行 DROP。数据库名称必须以 `apanel_bench_` 或 `apanel_remaining_bench` 开头。示例（从 backend 执行）：
+
+```bash
+APP_ENV=test APANEL_BENCHMARK_POSTGRES_URL="$DEDICATED_EMPTY_BENCHMARK_URL" \
+  python scripts/benchmark_analysis.py --symbols 100 --bars 400 --output /tmp/apanel-analysis-benchmark.json
+```
+
+脚本覆盖 qfq/none 的冷物化、次日增量和同日幂等重放；结果写到仓库外的临时目录，**不得提交测试 JSON 或跑分报告**。它统计耗时、SQL 数、实际存储行数和 Python 进程峰值 RSS。它不调用真实行情源、Alert 或飞书，因此不是完整 EOD 端到端耗时；生成数据与初始建表不计入阶段耗时。`per_stream_p95_ms` 表示这一轮股票/复权序列之间的分位数，不是多轮负载压测的服务 SLA。

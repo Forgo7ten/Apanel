@@ -1,6 +1,6 @@
 # 指标与状态
 
-指标和状态的纯计算代码位于 `backend/app/indicators` 与 `backend/app/states`；持久化和 API 编排位于 `IndicatorService`、`StateService`。计算内核不依赖 ORM，但服务层会把结果写入 `indicator_snapshots` / `indicator_states`，并通过证券指标/状态 API 与 Watch 工作台读取。
+指标、状态的计算代码位于 `backend/app/indicators` 与 `backend/app/states`；`AnalysisService` 在同一事务发布 `indicator_snapshots`、`current_indicator_states` 和 `state_events`。只接受 `0001_fresh_schema` 空库初始化，不支持旧日度 State 数据。详见 [状态事件存储](state-events.md)。
 
 ## 指标输入
 
@@ -57,7 +57,7 @@
 }
 ```
 
-`IndicatorRegistry` 通过名称解析实现，不需要在 dispatch 代码中添加分支。内置指标同时实现 `calculate_series()`，历史重建时按单次线性扫描计算整段序列，避免逐日重复计算前缀。自定义指标仍可只实现 `calculate(series, **parameters)`；注册表会保留兼容 fallback 并执行结果合同校验。
+`IndicatorRegistry` 通过名称解析实现，不需要在 dispatch 代码中添加分支。内置指标同时实现 `calculate_series()`，历史重建时按单次线性扫描计算整段序列，避免逐日重复计算前缀。自定义指标可以只实现 `calculate(series, **parameters)`；注册表会按当前插件接口调用并校验结果合同。
 
 持久化按 `qfq` / `none` 分开保存，同一指标类型的多个参数 variant 共用一条交易日 snapshot，通过稳定 `parameter_key` 区分。读取 API 不再隐式重算；数据生成由 bootstrap/EOD/rebase 流程负责。
 
@@ -104,7 +104,7 @@ BOLL 突破状态还需要当前和上一交易日价格；缺少价格时返回
 
 ## 计算需求与持久化边界
 
-实际计算需求不是一套全局固定参数，而是 Watch Table 列、enabled VALUE Alert 和 enabled STATE Alert 的并集。新增自定义 RSI/BOLL/MACD 参数或 MA state 周期组合后，bootstrap/EOD 会把对应 variant 纳入计算；`parameter_key` 用于稳定区分同一 indicator type 的多个参数组合。MA 不再把所有用户、所有表格的独立周期合成一个全局大 bundle：单周期数值列、明确的两周期状态组合和多周期数值列都按精确参数保持独立 variant，避免状态请求因为被更大数值 bundle 覆盖而丢失。StateService 只对明确的两周期 MA variant（以及遗留大 bundle 中的默认 MA5/10）物化 MA pair 状态，避免无关 MA 数值列产生 O(n²) 状态组合。
+实际计算需求不是一套全局固定参数，而是 Watch Table 列、enabled VALUE Alert 和 enabled STATE Alert 的并集。新增自定义 RSI/BOLL/MACD 参数或 MA state 周期组合后，bootstrap/EOD 会把对应 variant 纳入计算；`parameter_key` 用于稳定区分同一 indicator type 的多个参数组合。MA 不再把所有用户、所有表格的独立周期合成一个全局大 bundle：单周期数值列、明确的两周期状态组合和多周期数值列都按精确参数保持独立 variant，避免状态请求因为被更大数值 bundle 覆盖而丢失。StateService 只对明确的两周期 MA variant（以及含默认 MA5/10 的多周期 variant）物化 MA pair 状态，避免无关 MA 数值列产生 O(n²) 状态组合。
 
 内置指标使用 `calculate_series()` 线性遍历历史序列；StateService 直接消费已物化 snapshot，不再重复触发 IndicatorService 全历史重算。GET `/indicators*` 与 `/states*` 都是只读读取，缺数据应由后台 bootstrap/EOD 修复，而不是由 HTTP GET 隐式写库。
 
@@ -117,3 +117,9 @@ Frontend 从指标/状态详情创建 Alert 时会把当前状态的参数与 `a
 ## 与产品层的关系
 
 Watch 表格、指标详情和提醒共用同一套持久化快照/状态。用户选择的 qfq/none 只决定当前工作台读取哪条分析序列；已有提醒规则把 adjustment、参数和具体 scalar field 固化在规则上，不会随着用户后续修改默认设置而漂移。
+
+## 监听目标精确身份
+
+MA `period=N` 和 `periods=[N]` 是现行合法的单周期参数形式，使用同一个规范参数键；新建规则保存精确目标标识，未知旧键不被自动修复，也不跨参数/复权寻找默认状态。
+
+`mode=edge` 的监听要求该 observation 的 `transition=true`；“持续位于上方”不是新上穿。连续条件和 VALUE 规则保留首次满足通知的行为。调度重跑同一交易日只修正已评估基线，不再次发送该日通知；更早交易日不倒退已评估水位。完整缺口追赶另由分析恢复链路负责。

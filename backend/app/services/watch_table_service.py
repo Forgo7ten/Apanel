@@ -16,8 +16,8 @@ from app.core.errors import ApiError
 from app.indicators.parameters import (
     IndicatorVariant,
     canonicalize_parameters,
+    canonicalize_state_parameters,
     normalize_indicator_type,
-    normalize_json_parameters,
     parameter_key,
     select_snapshot_variant,
 )
@@ -33,6 +33,13 @@ from app.schemas.watch import (
     WatchTableDetailsData,
     WatchTableStockData,
     WatchTableSummaryData,
+)
+from app.services.analysis_control import (
+    ensure_monitor_capacity,
+    lock_account,
+    lock_analysis_reads,
+    mark_demand_changed,
+    publication_is_current,
 )
 from app.services.bootstrap_scheduler import (
     NoopSecurityBootstrapScheduler,
@@ -70,6 +77,7 @@ class WatchTableService:
     async def create(
         self, user_id: int, *, name: str, description: str | None = None
     ) -> WatchTableSummaryData:
+        await lock_account(self.session, user_id)
         normalized_name = _normalize_name(name)
         if not normalized_name:
             raise ApiError("INVALID_REQUEST", "Watch table name is required.", 400)
@@ -133,7 +141,10 @@ class WatchTableService:
         return self._summary(table, 0)
 
     async def delete(self, user_id: int, table_id: int) -> None:
+        await lock_account(self.session, user_id)
         table = await self._owned(table_id, user_id)
+        members = await self.repository.list_symbols(table.id)
+        await mark_demand_changed(self.session, [member.security_id for member in members])
         await self.session.delete(table)
         try:
             await self.session.commit()
@@ -147,13 +158,14 @@ class WatchTableService:
         table = await self._owned(table_id, user_id, with_details=True)
         security_ids = [membership.security_id for membership in table.symbols]
         adjustment = await self._user_adjustment(user_id)
+        streams = await lock_analysis_reads(self.session, security_ids, adjustment)
         quotes = await self.security_repository.latest_quotes_batch(security_ids)
         daily_bars = await self.security_repository.latest_daily_bars_batch(security_ids)
         snapshots_by_security = await self.security_repository.latest_indicators_batch(
             security_ids, adjustment=adjustment
         )
         states_by_security = await self.security_repository.current_states_batch(
-            security_ids, adjustment=adjustment
+            security_ids, adjustment=adjustment, active_only=False
         )
         dividend_results: Mapping[int, DividendYieldResult | ApiError] | None = None
         if any(
@@ -164,11 +176,12 @@ class WatchTableService:
             dividend_results = await self.dividend_yield_service.calculate_for_securities(
                 security_ids,
                 quotes=quotes,
+                daily_bars=daily_bars,
             )
         stocks: list[WatchTableStockData] = []
         for membership in table.symbols:
             security = membership.security
-            indicators, column_values = await self._indicator_projections(
+            column_values = await self._indicator_projections(
                 table.columns,
                 snapshots_by_security.get(security.id, ()),
                 security.id,
@@ -204,9 +217,16 @@ class WatchTableService:
                         "view_mode": "STATUS",
                         "indicator_type": matched.indicator_type,
                         "parameters": _json_numbers(dict(matched.parameters or {})),
-                        "available": True,
+                        "available": matched.status != "UNKNOWN",
                         "parameter_key": matched.parameter_key,
-                        "status": metadata.get("name", matched.state_code),
+                        "state_status": matched.status,
+                        "active": matched.status == "ACTIVE",
+                        "reason": metadata.get("reason"),
+                        "status": metadata.get("name", matched.state_code)
+                        if matched.status == "ACTIVE"
+                        else "未触发"
+                        if matched.status == "INACTIVE"
+                        else "数据不足",
                         "state": matched.state_code,
                         "title": metadata.get("name", matched.state_code),
                     }
@@ -219,11 +239,23 @@ class WatchTableService:
                     name=security.name,
                     market=security.market,
                     security=_security_data(security),
-                    bootstrap_ready=_bootstrap_ready(membership, security),
+                    bootstrap_ready=_bootstrap_ready(membership, security)
+                    and publication_is_current(streams.get(security.id)),
+                    analysis_status=(
+                        "READY"
+                        if publication_is_current(streams[security.id])
+                        and streams[security.id].published_revision >= 0
+                        else "REBUILD_PENDING"
+                    )
+                    if security.id in streams
+                    else None,
+                    analysis_trade_date=streams[security.id].state_through
+                    if security.id in streams
+                    else None,
+                    analysis_revision=streams[security.id].published_revision
+                    if security.id in streams
+                    else None,
                     price=price,
-                    indicators=indicators,
-                    indicator_values=indicators,
-                    values=indicators,
                     column_values=column_values,
                     states=state_data,
                 )
@@ -256,7 +288,7 @@ class WatchTableService:
         security_id: int,
         *,
         dividend_results: Mapping[int, DividendYieldResult | ApiError] | None = None,
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    ) -> dict[str, dict[str, Any]]:
         """Build values only for configured columns with matching snapshots.
 
         A security may have more than one persisted snapshot for a logical
@@ -271,12 +303,6 @@ class WatchTableService:
             for column in columns
             if column.column_type.upper() == "INDICATOR" and column.indicator_type
         ]
-        counts: dict[str, int] = {}
-        for column in indicator_columns:
-            indicator_type = _normalize_indicator_type(column.indicator_type)
-            counts[indicator_type] = counts.get(indicator_type, 0) + 1
-
-        projected: dict[str, dict[str, Any]] = {}
         column_values: dict[str, dict[str, Any]] = {}
         for column in indicator_columns:
             indicator_type = _normalize_indicator_type(column.indicator_type)
@@ -305,25 +331,8 @@ class WatchTableService:
                     parameters,
                     variant,
                 )
-                value = (
-                    _snapshot_projection(variant, indicator_type, calculation_parameters)
-                    if variant is not None
-                    else None
-                )
             column_values[str(column.id)] = column_value
-            if value is None:
-                continue
-
-            # Keep the historical indicator-type key for one column of a type.
-            # When a table contains MA5 and MA20, stable column-id keys prevent
-            # one projection from overwriting the other; the first projection
-            # remains available under the legacy type alias for compatibility.
-            if counts[indicator_type] == 1:
-                projected[indicator_type] = value
-            else:
-                projected.setdefault(indicator_type, value)
-                projected[str(column.id)] = value
-        return projected, column_values
+        return column_values
 
     async def _dividend_yield_projection(
         self,
@@ -353,6 +362,7 @@ class WatchTableService:
         return _dividend_yield_data(result)
 
     async def add_stock(self, user_id: int, table_id: int, security_id: int) -> WatchTableStockData:
+        await lock_account(self.session, user_id)
         table = await self._owned(table_id, user_id)
         security = await self.security_repository.get_by_id(security_id)
         if security is None:
@@ -361,6 +371,7 @@ class WatchTableService:
             raise ApiError("SECURITY_INACTIVE", "Security is not active.", 409)
         if await self.repository.find_symbol(table.id, security.id) is not None:
             raise ApiError("WATCH_STOCK_EXISTS", "Security is already in this watch table.", 409)
+        await ensure_monitor_capacity(self.session, user_id, security_id)
         membership = WatchTableSymbol(
             watch_table_id=table.id,
             security_id=security.id,
@@ -368,6 +379,7 @@ class WatchTableService:
         )
         self.session.add(membership)
         try:
+            await mark_demand_changed(self.session, [security.id])
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
@@ -379,16 +391,19 @@ class WatchTableService:
         return await self._stock_projection(membership, security)
 
     async def remove_stock(self, user_id: int, table_id: int, security_id: int) -> None:
+        await lock_account(self.session, user_id)
         table = await self._owned(table_id, user_id)
         membership = await self.repository.find_symbol(table.id, security_id)
         if membership is None:
             raise ApiError("WATCH_STOCK_NOT_FOUND", "Security is not in this watch table.", 404)
         await self.session.delete(membership)
+        await mark_demand_changed(self.session, [security_id])
         await self.session.commit()
 
     async def reorder_stocks(
         self, user_id: int, table_id: int, items: Sequence[tuple[int, int]]
     ) -> list[WatchTableStockData]:
+        await lock_account(self.session, user_id)
         table = await self._owned(table_id, user_id)
         rows = await self.repository.list_symbols(table.id)
         expected = {row.security_id for row in rows}
@@ -419,6 +434,7 @@ class WatchTableService:
     async def add_column(
         self, user_id: int, table_id: int, request: ColumnCreateRequest
     ) -> TableColumnData:
+        await lock_account(self.session, user_id)
         table = await self._owned(table_id, user_id)
         column_type, indicator_type, parameters, view_mode = _validate_column_request(request)
         duplicate = await self.repository.find_duplicate_column(
@@ -450,6 +466,8 @@ class WatchTableService:
         )
         self.session.add(column)
         try:
+            members = await self.repository.list_symbols(table.id)
+            await mark_demand_changed(self.session, [member.security_id for member in members])
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
@@ -463,46 +481,33 @@ class WatchTableService:
     async def update_column(
         self, user_id: int, column_id: int, request: ColumnUpdateRequest
     ) -> TableColumnData:
+        await lock_account(self.session, user_id)
         column = await self.repository.get_column_owned(column_id, user_id)
         if column is None:
             raise ApiError("WATCH_COLUMN_NOT_FOUND", "Column was not found.", 404)
-        requires_materialization = any(
-            value is not None
-            for value in (request.state_code, request.parameters, request.view_mode)
+        old_target = (
+            column.indicator_type,
+            dict(column.parameters or {}),
+            column.state_code,
+            column.view_mode,
         )
-        next_parameters = column.parameters
-        if request.state_code is not None:
-            column.state_code = request.state_code.strip().upper()
-        if request.parameters is not None:
-            if (
-                column.view_mode.upper() == "STATUS"
-                or (request.view_mode or "").upper() == "STATUS"
-            ):
-                if not column.state_code:
-                    raise ApiError(
-                        "STATE_TARGET_REQUIRED", "STATUS columns require state_code.", 400
-                    )
-                try:
-                    definition = DEFAULT_REGISTRY.get(column.state_code)
-                except UnknownStateError as exc:
-                    raise ApiError("INVALID_STATE_CODE", "State code is invalid.", 400) from exc
-                column.indicator_type = definition.indicator_type
-                next_parameters = _normalize_state_parameters(
-                    definition.indicator_type, request.parameters
-                )
-            elif column.indicator_type is None:
-                next_parameters = normalize_json_parameters(request.parameters)
-            else:
-                next_parameters = _normalize_indicator_parameters(
-                    _normalize_indicator_type(column.indicator_type),
-                    request.parameters,
-                    fill_defaults=True,
-                )
-        if request.view_mode is not None:
-            _validate_view_mode(request.view_mode)
-            column.view_mode = request.view_mode
-        if request.parameters is not None:
-            column.parameters = next_parameters
+        candidate = ColumnCreateRequest(
+            column_type=column.column_type,
+            indicator_type=column.indicator_type,
+            state_code=request.state_code if request.state_code is not None else column.state_code,
+            parameters=request.parameters if request.parameters is not None else column.parameters,
+            view_mode=request.view_mode or column.view_mode,
+        )
+        column_type, indicator_type, parameters, view_mode = _validate_column_request(candidate)
+        column.column_type, column.indicator_type = column_type, indicator_type
+        column.parameters, column.view_mode = parameters, view_mode
+        column.state_code = candidate.state_code
+        requires_materialization = old_target != (
+            indicator_type,
+            parameters,
+            column.state_code,
+            view_mode,
+        )
         if request.visible is not None:
             column.visible = request.visible
         if request.hidden is not None:
@@ -529,6 +534,9 @@ class WatchTableService:
         if duplicate is not None:
             await self.session.rollback()
             raise ApiError("WATCH_COLUMN_EXISTS", "This column already exists.", 409)
+        if requires_materialization:
+            members = await self.repository.list_symbols(column.watch_table_id)
+            await mark_demand_changed(self.session, [member.security_id for member in members])
         await self.session.commit()
         await self.session.refresh(column)
         if requires_materialization:
@@ -538,15 +546,19 @@ class WatchTableService:
         return _column_data(column)
 
     async def delete_column(self, user_id: int, column_id: int) -> None:
+        await lock_account(self.session, user_id)
         column = await self.repository.get_column_owned(column_id, user_id)
         if column is None:
             raise ApiError("WATCH_COLUMN_NOT_FOUND", "Column was not found.", 404)
+        members = await self.repository.list_symbols(column.watch_table_id)
+        await mark_demand_changed(self.session, [member.security_id for member in members])
         await self.session.delete(column)
         await self.session.commit()
 
     async def reorder_columns(
         self, user_id: int, table_id: int, column_ids: Sequence[int]
     ) -> list[TableColumnData]:
+        await lock_account(self.session, user_id)
         table = await self._owned(table_id, user_id)
         columns = await self.repository.get_columns_owned(table.id, user_id) or []
         expected = {column.id for column in columns}
@@ -679,19 +691,7 @@ def _validate_view_mode(view_mode: str) -> None:
 def _normalize_state_parameters(
     indicator_type: str, parameters: Mapping[str, Any]
 ) -> dict[str, Any]:
-    if indicator_type == "MA":
-        raw = dict(parameters or {})
-        try:
-            short = int(raw.get("short_period", raw.get("short", 5)))
-            long = int(raw.get("long_period", raw.get("long", 10)))
-        except (TypeError, ValueError) as exc:
-            raise ApiError(
-                "INVALID_STATE_PARAMETERS", "MA state periods are invalid.", 400
-            ) from exc
-        if short <= 0 or long <= 0 or short >= long:
-            raise ApiError("INVALID_STATE_PARAMETERS", "MA state periods are invalid.", 400)
-        return {"short_period": short, "long_period": long}
-    return canonicalize_parameters(indicator_type, parameters, fill_defaults=True)
+    return canonicalize_state_parameters(indicator_type, parameters)
 
 
 def _normalize_indicator_type(value: str | None) -> str:
@@ -810,79 +810,12 @@ def _matching_snapshot(
         try:
             variant = select_snapshot_variant(snapshot, indicator_type, parameters)
         except ApiError:
-            # Persisted snapshots are shared data.  A malformed legacy row
-            # must be treated as a miss, not as a reason to fail every table.
+            # Persisted snapshots are shared data. A malformed input must
+            # not make one broken indicator block every Watch Table.
             continue
         if variant is not None:
             return variant
     return None
-
-
-def _snapshot_parameters_match(
-    indicator_type: str,
-    column_parameters: dict[str, Any],
-    snapshot_parameters: dict[str, Any],
-) -> bool:
-    if indicator_type != "MA":
-        return column_parameters == snapshot_parameters
-    requested_period = column_parameters.get("period")
-    if requested_period is not None:
-        periods = snapshot_parameters.get("periods")
-        if periods is not None:
-            return requested_period in periods
-        return snapshot_parameters.get("period") == requested_period
-    requested_periods = column_parameters.get("periods")
-    if requested_periods is not None:
-        snapshot_periods = snapshot_parameters.get("periods")
-        if snapshot_periods is not None:
-            return requested_periods == snapshot_periods
-        return (
-            len(requested_periods) == 1
-            and snapshot_parameters.get("period") == requested_periods[0]
-        )
-    return not snapshot_parameters
-
-
-def _snapshot_projection(
-    variant: IndicatorVariant,
-    indicator_type: str,
-    parameters: dict[str, Any],
-) -> dict[str, Any] | None:
-    values = _json_numbers(variant.values)
-    delta = _json_numbers(variant.delta) if variant.delta is not None else None
-    if not isinstance(values, dict):
-        return None
-    current_values = dict(values)
-
-    if indicator_type == "MA" and parameters.get("period") is not None:
-        period = parameters["period"]
-        value_key = _mapping_key(values, f"MA{period}")
-        delta_key = value_key or f"MA{period}"
-        if value_key is None and len(values) == 1 and "value" in values:
-            value_key = "value"
-            delta_key = "value"
-        if value_key is None:
-            return None
-        current_value = values[value_key]
-        current_delta = delta.get(delta_key) if isinstance(delta, dict) else delta
-        projection = dict(values)
-        projection["value"] = current_value
-        projection["current_value"] = current_value
-        projection["delta"] = current_delta
-        return projection
-
-    if indicator_type in {"RSI", "PROJECTED_MA"} and "value" in values:
-        current_value = values["value"]
-        current_delta = delta.get("value") if isinstance(delta, dict) else delta
-        projection = dict(values)
-        projection["current_value"] = current_value
-        projection["delta"] = current_delta
-        return projection
-
-    values["current_value"] = current_values
-    if delta is not None:
-        values["delta"] = delta
-    return values
 
 
 def _column_value_from_variant(
@@ -1050,18 +983,6 @@ def _column_parameter_key(indicator_type: str, parameters: Mapping[str, Any]) ->
     return parameter_key(indicator_type, _calculation_parameters(parameters))
 
 
-def _mapping_key(values: dict[str, Any], expected: str) -> str | None:
-    """Find a persisted value key without changing its public spelling."""
-
-    if expected in values:
-        return expected
-    folded = expected.casefold()
-    return next(
-        (key for key in values if isinstance(key, str) and key.casefold() == folded),
-        None,
-    )
-
-
 def _visible_states(states: Sequence[Any], columns: Sequence[TableColumn]) -> list[Any]:
     explicit: set[tuple[str, str]] = set()
     for column in columns:
@@ -1075,8 +996,7 @@ def _visible_states(states: Sequence[Any], columns: Sequence[TableColumn]) -> li
         )
     visible = []
     for state in states:
-        if getattr(state, "parameter_key", None) == "default":
-            visible.append(state)
+        if state.status != "ACTIVE":
             continue
         parameters = dict(getattr(state, "parameters", {}) or {})
         is_default_ma = parameters == {"short_period": 5, "long_period": 10}
@@ -1112,8 +1032,7 @@ def _security_data(security) -> Any:
 
 def _price_data(quote, daily_bar=None) -> PriceData | None:
     if daily_bar is not None and (
-        quote is None
-        or _quote_trade_date(quote.timestamp) <= daily_bar.trade_date
+        quote is None or _quote_trade_date(quote.timestamp) <= daily_bar.trade_date
     ):
         return PriceData(
             value=_number(daily_bar.close),
@@ -1160,6 +1079,9 @@ def _state_data(state) -> CurrentStateData:
         status=state.status,
         active=bool(metadata.get("active", state.status == "ACTIVE")),
         transition=bool(metadata.get("transition", False)),
+        since_date=getattr(state, "since_date", None),
+        observed_from=getattr(state, "observed_from", None),
+        since_is_exact=bool(getattr(state, "since_is_exact", False)),
         trade_date=state.trade_date,
         parameters=dict(state.parameters or {}),
         parameter_key=state.parameter_key,

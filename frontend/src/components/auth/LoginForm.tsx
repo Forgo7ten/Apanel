@@ -5,12 +5,14 @@ import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { useAuth } from "./AuthProvider";
+import type { LoginIdentifierType } from "@/lib/auth-session";
 
 export function LoginForm() {
   const router = useRouter();
   const { login, getErrorMessage } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [identifierType, setIdentifierType] = useState<LoginIdentifierType>("auto");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -20,7 +22,7 @@ export function LoginForm() {
     setSubmitting(true);
 
     try {
-      await login(username.trim(), password);
+      await login(username.trim(), password, identifierType);
       router.replace("/watch");
     } catch (requestError) {
       setError(getErrorMessage(requestError));
@@ -31,6 +33,15 @@ export function LoginForm() {
 
   return (
     <form className="space-y-5" onSubmit={handleSubmit}>
+      <label className="block text-xs text-secondary">
+        登录方式
+        <select value={identifierType} onChange={(event) => setIdentifierType(event.target.value as LoginIdentifierType)}
+          className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-primary">
+          <option value="auto">用户名或邮箱</option>
+          <option value="username">仅用户名</option>
+          <option value="email">仅邮箱</option>
+        </select>
+      </label>
       <div>
         <label htmlFor="login-username" className="mb-2 block text-xs font-medium text-secondary">用户名</label>
         <input

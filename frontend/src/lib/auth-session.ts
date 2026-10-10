@@ -1,3 +1,4 @@
+import { sessionScope, SessionChangedError } from "@/lib/session-scope.mjs";
 import { safeAuthErrorMessage } from "@/lib/auth-logic.mjs";
 import {
   AUTH_REFRESH_LEASE_KEY,
@@ -49,6 +50,7 @@ type RefreshOutcome = {
 };
 
 let currentSession: AuthSession | null = null;
+let authOperation = 0;
 const sessionListeners = new Set<(session: AuthSession | null) => void>();
 let sessionGeneration = 0;
 let sessionEpoch = Date.now();
@@ -112,8 +114,21 @@ function createAuthChannel(): BroadcastChannel | null {
       // advances the local generation so every older refresh is discarded.
       abortActiveRefresh();
       currentSession = null;
+      authOperation += 1;
+      sessionScope.transition(null, true);
       sessionGeneration = Math.max(sessionGeneration, message.epoch) + 1;
       notifySessionListeners();
+      return;
+    }
+
+    if (message.userId !== undefined && currentSession && String(currentSession.user.id) !== message.userId) {
+      abortActiveRefresh();
+      authOperation += 1;
+      currentSession = null;
+      sessionScope.transition(null, true);
+      sessionGeneration = Math.max(sessionGeneration, message.epoch) + 1;
+      notifySessionListeners();
+      void refreshSession().catch(() => undefined);
       return;
     }
 
@@ -139,13 +154,14 @@ export function getAccessToken(): string | null {
 
 export function setSession(session: AuthSession): AuthSession {
   abortActiveRefresh();
-  applySession(session, true);
+  applySession(session, true, true);
   return session;
 }
 
 export function clearSession(): void {
+  authOperation += 1;
   abortActiveRefresh();
-  applySession(null, true);
+  applySession(null, true, true);
 }
 
 export function subscribeToSession(listener: (session: AuthSession | null) => void): () => void {
@@ -162,8 +178,9 @@ function notifySessionListeners(): void {
   }
 }
 
-function applySession(session: AuthSession | null, broadcast: boolean): void {
+function applySession(session: AuthSession | null, broadcast: boolean, forceScope = false): void {
   currentSession = session;
+  sessionScope.transition(session?.user.id, forceScope);
   sessionGeneration += 1;
   sessionEpoch = Math.max(sessionEpoch + 1, Date.now());
   notifySessionListeners();
@@ -184,6 +201,7 @@ function broadcastAuthState(status: AuthBroadcastMessage["status"], epoch = sess
       epoch,
       status,
       timestamp: Date.now(),
+      ...(currentSession ? { userId: String(currentSession.user.id) } : {}),
     });
     authChannel.postMessage(message);
   } catch {
@@ -549,20 +567,25 @@ export function refreshSession(
   return trackedOperation.then(applyRefreshOutcome);
 }
 
-export async function login(username: string, password: string, fetchImpl?: FetchLike): Promise<AuthSession> {
+export type LoginIdentifierType = "auto" | "username" | "email";
+
+export async function login(username: string, password: string, fetchImpl?: FetchLike, identifierType: LoginIdentifierType = "auto"): Promise<AuthSession> {
+  const operation = ++authOperation;
+  abortActiveRefresh();
   const request = getFetch(fetchImpl);
   const data = await requestAuth<AuthPayload>(
     "/auth/login",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, identifier_type: identifierType }),
     },
     request,
   );
 
   const session = await createSessionFromPayload(data, request);
 
+  if (operation !== authOperation) throw new SessionChangedError();
   if (session) {
     setSession(session);
     return session;
@@ -577,6 +600,7 @@ export async function register(
   inviteToken: string | null,
   fetchImpl?: FetchLike,
 ): Promise<AuthSession> {
+  const operation = ++authOperation;
   const request = getFetch(fetchImpl);
   const data = await requestAuth<AuthPayload>(
     "/auth/register",
@@ -590,6 +614,7 @@ export async function register(
 
   const session = await createSessionFromPayload(data, request);
 
+  if (operation !== authOperation) throw new SessionChangedError();
   if (session) {
     setSession(session);
     return session;
@@ -621,6 +646,7 @@ export async function logout(fetchImpl?: FetchLike): Promise<void> {
 }
 
 export function authErrorMessage(error: unknown): string {
+  if (error instanceof SessionChangedError) return error.message;
   if (error instanceof ApiError) {
     return error.message;
   }

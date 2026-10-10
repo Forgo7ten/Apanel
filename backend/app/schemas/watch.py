@@ -132,6 +132,9 @@ class CurrentStateData(BaseModel):
     status: str
     active: bool
     transition: bool = False
+    since_date: date | None = None
+    observed_from: date | None = None
+    since_is_exact: bool = False
     trade_date: date
     parameters: dict[str, Any] = Field(default_factory=dict)
     parameter_key: str = "default"
@@ -148,12 +151,11 @@ class WatchTableStockData(BaseModel):
     market: str
     security: SecurityData
     bootstrap_ready: bool = True
+    analysis_status: str | None = None
+    analysis_trade_date: date | None = None
+    analysis_revision: int | None = None
     price: PriceData | None = None
-    indicators: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    indicator_values: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    values: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    # New deterministic seam: dynamic columns are addressed by their own
-    # database id, so two columns of the same indicator type cannot collide.
+    # Dynamic columns have a unique identity, even for repeated indicator types.
     column_values: dict[str, dict[str, Any]] = Field(default_factory=dict)
     states: list[CurrentStateData] = Field(default_factory=list)
 

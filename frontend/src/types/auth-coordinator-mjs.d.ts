@@ -6,6 +6,7 @@ declare module "@/lib/auth-coordinator.mjs" {
     epoch: number;
     status: AuthStateStatus;
     timestamp: number;
+    userId?: string;
   };
 
   export const AUTH_REFRESH_LEASE_KEY: string;
@@ -51,6 +52,7 @@ declare module "@/lib/auth-coordinator.mjs" {
     epoch: number;
     status: AuthStateStatus;
     timestamp?: number;
+    userId?: string;
   }): AuthStateMessage;
 
   export function isAuthStateMessage(value: unknown): value is AuthStateMessage;

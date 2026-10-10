@@ -1,6 +1,6 @@
 # 开始使用
 
-本指南描述从空目录配置本地环境、启动 Compose、创建管理员到完成邀请注册的流程。
+本指南仅面向**全新空 PostgreSQL 数据库**安装，不接受旧 Apanel 数据库原地升级。
 
 ## 前置条件
 
@@ -36,7 +36,7 @@ docker compose up --build -d
 docker compose ps
 ```
 
-`migrate` 成功结束后，行情数据中枢和后端才会继续启动。可以分别跟踪 API、任务与行情中枢日志：
+`migrate` 在空库中创建唯一的 `0001_fresh_schema` 基线；成功结束后，行情数据中枢和后端才会继续启动。已有其他 Apanel revision 的数据库不会被自动改造，请使用单独新建的空库。可以分别跟踪 API、任务与行情中枢日志：
 
 ```bash
 docker compose logs -f backend
@@ -127,13 +127,7 @@ curl -sS -X POST http://localhost:8080/api/v1/auth/register \
 5. 配置飞书 Webhook 后，设置接口只显示“已配置”，不会再次返回 URL 明文。
 6. 可以从指标/状态详情直接创建监听，也可以在通知页手工创建 VALUE/STATE 规则。
 
-如果数据库来自旧版本且 `user_settings` 中已经保存过 Webhook 明文，在配置 `APP_SECRETS_KEY` 后执行：
-
-```bash
-docker compose exec backend python -m app.cli migrate-user-secrets
-```
-
-迁移命令把 legacy Webhook 搬入加密 `user_secrets` 表；执行后应确认旧 JSON 中已无明文。
+飞书 Webhook 只保存在使用 AES-GCM 加密的 `user_secrets` 中，设置 API 不回传密文或原始 URL。
 
 ## 停止与数据
 

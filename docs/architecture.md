@@ -117,7 +117,7 @@ target-date readiness
         ↓
 最新 IndicatorSnapshot / corporate-action rebase
         ↓
-IndicatorState
+CurrentIndicatorState + StateEvent（同 stream 原子发布）
         ↓
 Alert Edge evaluation + PENDING Notification（同事务）
         ↓
@@ -140,20 +140,32 @@ HTTP 读取路径与后台物化路径明确分离：
 
 ## 数据库边界
 
-迁移由 `backend/alembic` 统一管理。当前数据库表包括：
+数据库结构仅由 Backend 的 Alembic `0001_fresh_schema` 初始化空 PostgreSQL 数据库；Hub 共享行情表但不维护独立迁移链。当前数据库表包括：
 
 - 认证：`users`、`invitations`、`refresh_sessions`。
 - 行情：`securities`、`daily_bars`、`quote_snapshots`、`dividend_events`、`market_data_adjustment_state`、`trading_calendar`。
-- 分析：`indicator_snapshots`、`state_definitions`、`indicator_states`。
+- 分析：`indicator_snapshots`、`state_definitions`、`analysis_streams`、`current_indicator_states`、`state_events`；由唯一 `0001_fresh_schema` 空库基线建立，没有旧日度 `indicator_states` 表。
 - 工作台：`watch_tables`、`watch_table_symbols`、`table_columns`、`user_settings`、`user_secrets`。
 - 提醒：`alert_rules`、`alert_instances`、`notifications`。
 
 行情表通过 `security_id` 关联 `securities`。日线唯一键是证券、交易日和复权类型；报价唯一键是证券和 UTC 时间戳；分红事件唯一键是证券和事件日期。repository 使用 PostgreSQL `ON CONFLICT` upsert，重复同步不会重复创建相同业务记录。
 
-指标和状态由 Backend 统一物化到共享表，并按 `adjust_type`、参数 identity 和交易日隔离。EOD 正常路径只物化最新交易日；历史 bootstrap 或 qfq corporate-action revision 变化时才回建受影响历史。`bootstrap_completed_at` 只在真实 readiness/bootstrap 成功后写入；`0003_reset_bootstrap_readiness` 会清除早期迁移中未经数据验证的乐观标记，随后由正常 EOD/bootstrap 恢复可信状态。提醒规则读取精确的 indicator parameter/field 或 state parameter identity。Edge 状态和 PENDING notification outbox 在同一事务中提交，之后由通知阶段/恢复任务投递；外部 Webhook 边界采用 at-least-once 语义，provider 已成功但 terminal commit 前进程崩溃时仍可能产生重复发送。
+指标和状态由 Backend 按复权、参数和交易日隔离并原子发布。`bootstrap_completed_at` 初始 NULL，只能由真实数据准备过程设置。规则与通知保留精确状态身份、统一 outbox 及至少一次外部投递语义。
 
 ## 错误与配置边界
 
 后端公共 API 使用 `success/data` 成功包和 `success/error` 错误包；行情数据中枢使用相同字段，一般请求错误时返回 `data: null`，但健康检查降级和部分同步失败会保留诊断数据。provider、数据库和参数错误在 API 层映射为稳定的错误码，不把底层连接细节直接返回给客户端。
 
 `APP_ENV=production` 时，Backend API 会校验 PostgreSQL 密码、JWT、Secure Cookie 与完整的用户密钥 keyring；Worker 会校验数据库、内部行情 token 与完整的用户密钥 keyring。current/previous secret key 的编码、长度、JSON 结构或版本冲突都会在启动期 fail-fast。Market Data Hub 生产环境要求 `INTERNAL_API_TOKEN`。不同进程使用最小化配置校验，避免把 JWT 或用户密钥错误地要求给 migration/scheduler 等不消费它们的进程。
+
+## 事务化分析流与恢复
+
+`analysis_streams` 以 `security_id + adjust_type` 为边界，保存原始数据 revision、同步 generation、需求 generation、最早 dirty date 和已发布的 Indicator/State 水位。Hub 在写入实际变化的 OHLCVA 行时，在同一事务推进 revision 和 dirty date；相同值 UPSERT 不更新行。同步请求先在短事务领取 generation，provider 请求期间不持锁，落库时拒绝被更新请求取代的旧结果。qfq 描述符和行情也在同一事务提交。
+
+Backend 的 `AnalysisService` 在同一 stream 行锁内读取需求与输入、写入 Indicator/State 并发布水位；不在锁内调用外部服务。这是 v1 的保守串行发布边界，避免旧 Bootstrap、EOD 或数据修订互相覆盖。历史任务不能倒退已发布日期。历史重算替换受影响区间，保留区间前驱作为 State seed，不能读旧受影响状态作为新的前驱。
+
+配置变更在原事务内推进 demand generation，队列只是唤醒；相同需求签名仅确认新 generation，不反复重建。已确认请求过完整历史的新股可保留不足预热的数据，不能为了达到 400 根每天重做完整 bootstrap。
+
+正常 EOD 走最近数据日期加 7 个日历日重叠的增量请求；独立周五 23:40 历史修复任务才使用完整窗口。Beat 每 10 分钟对账未完成的 stream 和 Alert 水位，覆盖 enqueue 丢失及分析发布后 worker 崩溃。大范围永久数据故障仍需根据 pipeline issues 处理；对账不是无限重试的成功保证。
+
+读监控表时对已有 stream 取得共享锁，避免在多条批量查询之间拼接两个发布版本。当前价/股息率回退只允许不复权收盘价。数据库迁移须先于同时升级 Backend 和 Hub，旧版本写入程序不得与新版本混跑。

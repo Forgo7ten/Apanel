@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -11,11 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
 from app.indicators.parameters import select_snapshot_variant
-from app.models import AlertRule, IndicatorSnapshot, IndicatorState
+from app.models import AlertRule, IndicatorSnapshot
 from app.repositories.alert import AlertRepository
 from app.repositories.security import SecurityRepository
+from app.schemas.state_row import StateRow
+from app.services.analysis_control import publication_is_current, published_stream_for_read
 from app.services.dividend_service import DividendYieldService
-from app.states import StateStatus
+from app.states import DEFAULT_REGISTRY, StateRegistry, StateStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,20 +28,23 @@ class ScalarObservation:
     delta: float | None
     observation_date: date
     snapshot: IndicatorSnapshot | None = None
-    state: IndicatorState | None = None
+    state: StateRow | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class StateObservation:
     active: bool
     observation_date: date
-    state: IndicatorState
+    state: StateRow
     value_context: dict[str, dict[str, float | None]]
 
 
 class AlertObservationService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self, session: AsyncSession, *, state_registry: StateRegistry | None = None
+    ) -> None:
         self.session = session
+        self.state_registry = state_registry or DEFAULT_REGISTRY
         self.alert_repository = AlertRepository(session)
         self.security_repository = SecurityRepository(session)
         self.dividend_service = DividendYieldService(self.security_repository)
@@ -60,6 +66,9 @@ class AlertObservationService:
             )
 
         if not rule.parameter_key or not rule.field:
+            return None
+        stream = await published_stream_for_read(self.session, rule.security_id, rule.adjust_type)
+        if not publication_is_current(stream):
             return None
         snapshot = await self.alert_repository.latest_snapshot(
             rule.security_id,
@@ -87,6 +96,13 @@ class AlertObservationService:
     async def resolve_state(self, rule: AlertRule) -> StateObservation | None:
         if not rule.state_code or not rule.parameter_key:
             return None
+        # Lightweight read adapters used by extensions need not own a session.
+        if hasattr(getattr(self, "session", None), "execute"):
+            stream = await published_stream_for_read(
+                self.session, rule.security_id, rule.adjust_type
+            )
+            if not publication_is_current(stream):
+                return None
         rows = await self.alert_repository.latest_states(
             rule.security_id,
             adjustment=rule.adjust_type,
@@ -94,22 +110,15 @@ class AlertObservationService:
             parameter_key=rule.parameter_key,
         )
         if not rows:
-            legacy = await self.alert_repository.latest_states(
-                rule.security_id,
-                state_code=rule.state_code,
-            )
-            rows = (
-                legacy
-                if len(legacy) == 1
-                else [item for item in legacy if item.parameter_key == "default"]
-            )
-        if not rows:
             return None
         state = rows[0]
-        if state.status == StateStatus.UNKNOWN.value:
+        if state.status == StateStatus.UNKNOWN.value or (state.metadata or {}).get("reason"):
             return None
+        active = state.status == StateStatus.ACTIVE.value
+        if self.state_registry.get(rule.state_code).metadata.get("mode") == "edge":
+            active = active and bool((state.metadata or {}).get("transition", False))
         return StateObservation(
-            active=state.status == StateStatus.ACTIVE.value,
+            active=active,
             observation_date=state.trade_date,
             state=state,
             value_context=_state_value_context(state.metadata),
@@ -149,6 +158,7 @@ def _field(values: Any, field: str) -> float | None:
         field in values
         and isinstance(values[field], (int, float))
         and not isinstance(values[field], bool)
+        and math.isfinite(values[field])
     ):
         return float(values[field])
     folded = field.casefold()
@@ -158,6 +168,7 @@ def _field(values: Any, field: str) -> float | None:
             and key.casefold() == folded
             and isinstance(value, (int, float))
             and not isinstance(value, bool)
+            and math.isfinite(value)
         ):
             return float(value)
     return None

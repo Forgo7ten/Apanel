@@ -3,12 +3,12 @@ import test from "node:test";
 
 import { normalizeSettings, toSettingsPayload } from "../src/lib/settings-contract.mjs";
 
-test("normalizes settings without exposing a masked webhook", () => {
+test("normalizes settings using only the encrypted webhook marker", () => {
   const form = normalizeSettings({
     adjust_type: "none",
     indicator_settings: { defaults: ["RSI"], parameters: { RSI: { period: 21 } } },
     display_settings: { density: "comfortable", show_states: false },
-    notification_settings: { feishu_webhook_configured: true, feishu_webhook: "••••••" },
+    notification_settings: { feishu_webhook_configured: true },
   });
 
   assert.equal(form.adjustType, "none");
@@ -20,11 +20,11 @@ test("normalizes settings without exposing a masked webhook", () => {
   assert.equal(form.webhookConfigured, true);
 });
 
-test("does not copy an unmasked webhook returned by a legacy backend", () => {
+test("does not recognize obsolete raw webhook settings as configured", () => {
   const form = normalizeSettings({ notification_settings: { feishu_webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/secret" } });
 
   assert.equal(form.webhook, "");
-  assert.equal(form.webhookConfigured, true);
+  assert.equal(form.webhookConfigured, false);
 });
 
 test("omits an empty webhook so saving other settings keeps the secret", () => {

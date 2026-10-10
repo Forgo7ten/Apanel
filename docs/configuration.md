@@ -39,7 +39,7 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | `REFRESH_COOKIE_NAME` | `refresh_token` | 刷新 Cookie 名称 |
 | `REFRESH_COOKIE_SECURE` | Compose 默认 `false` | 是否给刷新 Cookie 设置 `Secure`；生产 Compose 环境必须明确设为 `true`，直接运行服务时生产环境可不设置并使用安全默认值 |
 
-后端也识别 `JWT_SECRET` 作为 `JWT_SECRET_KEY` 的别名，识别 `ENVIRONMENT` 作为 `APP_ENV` 的别名。Compose 使用上表中的规范变量名。
+运行环境与 JWT 配置的变量名分别为 `APP_ENV` 和 `JWT_SECRET_KEY`。
 
 ## 用户密钥与飞书
 
@@ -48,7 +48,6 @@ Compose 的 `DATABASE_URL` 使用 `postgresql+asyncpg://...@postgres:5432/...`�
 | `APP_SECRETS_KEY` | 本地可空；生产 Backend/Worker 必填 | URL-safe base64 编码的 32-byte AES-GCM master key，用于加密用户 Webhook |
 | `APP_SECRETS_KEY_VERSION` | `v1` | 写入 `user_secrets.key_version` 的密钥版本标识 |
 | `APP_SECRETS_PREVIOUS_KEYS` | 空 | 密钥轮换期间用于读取历史 ciphertext 的 JSON 版本到 key 映射 |
-| `LEGACY_WEBHOOK_FALLBACK_ENABLED` | `true` | Release A 兼容开关；完成迁移审计后可设为 `false` 禁用 legacy JSON 明文读取 |
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | `open.feishu.cn,open.larksuite.com` | 飞书/Lark Webhook hostname allowlist |
 
 Compose 只把 `APP_SECRETS_KEY*` 注入 `backend` 与 `worker`。`scheduler`、`frontend`、`market-data-hub` 和 `security-bootstrap` 不需要也不应获得该密钥。生产 Backend/Worker 会在启动时校验 current/previous key 的 URL-safe base64、解码后 32-byte 长度、previous JSON 结构和版本唯一性；`APP_SECRETS_PREVIOUS_KEYS` 不得包含与 `APP_SECRETS_KEY_VERSION` 相同的版本。错误配置会直接阻止进程启动，而不是延迟到发送 Webhook 时才暴露。
@@ -107,7 +106,7 @@ PYPI_MIRROR_URL=
 
 随后照常执行 `docker compose up --build`。`host` 模式是针对 Linux Docker Engine 的开发机配置；构建配置不会向运行时容器注入任何代理环境变量。
 
-行情服务还识别 `INTERNAL_SYNC_TOKEN` 和 `MARKET_DATA_INTERNAL_TOKEN` 作为 `INTERNAL_API_TOKEN` 的别名。生产环境若缺少内部 token，服务启动校验会失败。
+行情服务与后端只支持规范 `INTERNAL_API_TOKEN`，不再接受弃用别名。
 
 ## Scheduler 与交易时段
 
@@ -165,7 +164,6 @@ JWT_SECRET_KEY=<random-secret-at-least-32-bytes>
 INTERNAL_API_TOKEN=<random-service-token>
 APP_SECRETS_KEY=<urlsafe-base64-32-byte-key>
 APP_SECRETS_KEY_VERSION=v1
-LEGACY_WEBHOOK_FALLBACK_ENABLED=false
 REFRESH_COOKIE_SECURE=true
 ```
 

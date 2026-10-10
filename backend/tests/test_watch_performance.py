@@ -13,8 +13,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db.base import Base
 from app.models import (
     DailyBar,
-    IndicatorSnapshot,
-    IndicatorState,
     QuoteSnapshot,
     Security,
     TableColumn,
@@ -24,7 +22,11 @@ from app.models import (
     WatchTableSymbol,
 )
 from app.repositories.security import DIVIDEND_EVENTS_TABLE
+from app.schemas.state_row import StateRow
+from app.services.state_service import state_parameter_key
 from app.services.watch_table_service import WatchTableService
+from tests.snapshot_fixture import current_snapshot
+from tests.state_fixture import seed_current_state
 
 
 @pytest_asyncio.fixture
@@ -186,12 +188,12 @@ async def watch_performance_context(tmp_path):
                 close=Decimal("100"),
                 volume=100,
                 amount=10000,
-                adjust_type="qfq",
+                adjust_type="none",
             )
         )
         session.add_all(
             [
-                IndicatorSnapshot(
+                current_snapshot(
                     security_id=security.id,
                     trade_date=date(2026, 9, 23),
                     indicator_type="RSI",
@@ -203,19 +205,20 @@ async def watch_performance_context(tmp_path):
                 for security in securities
             ]
         )
-        session.add_all(
-            [
-                IndicatorState(
-                    security_id=security.id,
-                    trade_date=date(2026, 9, 23),
-                    state_code="RSI_OVERBOUGHT",
-                    indicator_type="RSI",
-                    status="ACTIVE",
-                    metadata={"name": "RSI 高位", "level": "WARNING", "active": True},
-                )
-                for security in securities
-            ]
-        )
+        for row in (
+            StateRow(
+                security_id=security.id,
+                trade_date=date(2026, 9, 23),
+                state_code="RSI_OVERBOUGHT",
+                indicator_type="RSI",
+                status="ACTIVE",
+                parameters={"period": 14},
+                parameter_key=state_parameter_key("RSI_OVERBOUGHT", {"period": 14}),
+                metadata={"name": "RSI 高位", "level": "WARNING", "active": True},
+            )
+            for security in securities
+        ):
+            await seed_current_state(session, row)
         await session.flush()
         await session.execute(
             DIVIDEND_EVENTS_TABLE.insert(),
@@ -265,7 +268,7 @@ async def test_watch_detail_query_count_is_independent_of_stock_count(
     assert len(small.stocks) == 1
     assert len(large.stocks) == 100
     assert small_count == large_count
-    # bootstrap_ready adds one fixed batched read. Keep the regression contract
+    # The publication share lock replaces the redundant dividend close read. Keep the contract
     # focused on query-count independence rather than the previous exact budget.
     assert large_count <= 10
     assert elapsed < 10

@@ -135,10 +135,10 @@ export type WatchTableStock = {
   market?: string;
   security?: Security;
   bootstrap_ready?: boolean;
+  analysis_status?: "READY" | "REBUILD_PENDING" | null;
+  analysis_trade_date?: string | null;
+  analysis_revision?: number | null;
   price?: PriceSnapshot | number | string | null;
-  indicators?: Record<string, unknown>;
-  indicator_values?: Record<string, unknown>;
-  values?: Record<string, unknown>;
   column_values?: Record<string, IndicatorColumnValue>;
   states?: IndicatorState[];
 };

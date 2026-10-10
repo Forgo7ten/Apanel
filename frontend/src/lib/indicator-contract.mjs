@@ -38,57 +38,17 @@ export function orderIndicatorFields(entries) {
 export function getColumnValue(stock, column) {
   if (!isRecord(stock) || !isRecord(column)) return undefined;
 
-  if (Object.hasOwn(stock, "column_values")) {
-    const columnValues = isRecord(stock.column_values) ? stock.column_values : {};
-    const id = column.id;
-    if (id === undefined || id === null) return undefined;
-    return columnValues[String(id)];
-  }
-
-  const keys = [column.key, column.indicator_type, column.type].filter(
-    (key) => typeof key === "string" && key.length > 0,
-  );
-  const sources = [stock.indicators, stock.indicator_values, stock.values];
-  for (const source of sources) {
-    if (!isRecord(source)) continue;
-    for (const key of keys) {
-      if (source[key] !== undefined) return source[key];
-    }
-  }
-  return undefined;
+  const columnValues = isRecord(stock.column_values) ? stock.column_values : {};
+  const id = column.id;
+  return id === undefined || id === null ? undefined : columnValues[String(id)];
 }
 
 /**
- * Return the composite fields in deterministic display order.  Older API
- * responses exposed the fields directly on the value, so that shape remains
- * readable during the compatibility window.
+ * Read the current composite field envelope, without historic fallbacks.
  */
 export function getColumnFields(value) {
   if (!isRecord(value)) return [];
-  if (isRecord(value.fields)) return orderIndicatorFields(Object.entries(value.fields));
-
-  const reserved = new Set([
-    "column_id",
-    "view_mode",
-    "indicator_type",
-    "parameters",
-    "available",
-    "error_code",
-    "value",
-    "current_value",
-    "previous_value",
-    "previous",
-    "previous_values",
-    "delta",
-    "change",
-    "direction",
-    "state",
-    "status",
-    "states",
-    "title",
-    "label",
-  ]);
-  return orderIndicatorFields(Object.entries(value).filter(([key]) => !reserved.has(key)));
+  return isRecord(value.fields) ? orderIndicatorFields(Object.entries(value.fields)) : [];
 }
 
 /**
@@ -97,10 +57,10 @@ export function getColumnFields(value) {
 export function getColumnFieldValue(field, key) {
   if (key === "value") {
     if (typeof field === "number" || typeof field === "string") return field;
-    if (isRecord(field)) return field.value ?? field.price ?? field.current ?? null;
+    if (isRecord(field)) return field.value ?? null;
     return null;
   }
   if (!isRecord(field)) return null;
-  if (key === "delta") return field.delta ?? field.change ?? null;
+  if (key === "delta") return field.delta ?? null;
   return field[key] ?? null;
 }

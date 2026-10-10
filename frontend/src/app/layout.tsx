@@ -21,9 +21,9 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body>
-        <QueryProvider>
-          <AuthProvider>{children}</AuthProvider>
-        </QueryProvider>
+        <AuthProvider>
+          <QueryProvider>{children}</QueryProvider>
+        </AuthProvider>
       </body>
     </html>
   );

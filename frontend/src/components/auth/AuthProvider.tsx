@@ -11,6 +11,7 @@ import {
   setSession,
   type AuthSession,
   type AuthUser,
+  type LoginIdentifierType,
 } from "@/lib/auth-session";
 import { clearSession, getSession, subscribeToSession } from "@/lib/auth-session";
 
@@ -20,7 +21,7 @@ type AuthContextValue = {
   status: AuthStatus;
   user: AuthUser | null;
   isAuthenticated: boolean;
-  login: (username: string, password: string) => Promise<AuthSession>;
+  login: (username: string, password: string, identifierType?: LoginIdentifierType) => Promise<AuthSession>;
   register: (username: string, password: string, inviteToken: string | null) => Promise<AuthSession>;
   logout: () => Promise<void>;
   refresh: () => Promise<AuthSession | null>;
@@ -61,11 +62,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, [commitSession]);
 
-  const login = useCallback(async (username: string, password: string) => {
+  const login = useCallback(async (username: string, password: string, identifierType?: LoginIdentifierType) => {
     operationId.current += 1;
 
     try {
-      return await loginRequest(username, password);
+      return await loginRequest(username, password, undefined, identifierType);
     } catch (error) {
       if (!getSession()) {
         commitSession(null);

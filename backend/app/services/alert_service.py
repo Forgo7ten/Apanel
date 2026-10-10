@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,7 +13,6 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
 
 from app.alerts import (
     AlertEvaluator,
@@ -26,6 +26,7 @@ from app.core.errors import ApiError
 from app.indicators.metadata import canonical_indicator_field
 from app.indicators.parameters import (
     canonicalize_parameters,
+    canonicalize_state_parameters,
     normalize_indicator_type,
     parameter_key,
 )
@@ -35,6 +36,8 @@ from app.models import (
     AlertRule,
     Notification,
     Security,
+    User,
+    UserStatus,
 )
 from app.providers.notification import (
     NotificationMessage,
@@ -51,6 +54,7 @@ from app.schemas.alerts import (
 )
 from app.schemas.security import SecurityData
 from app.services.alert_observation_service import AlertObservationService
+from app.services.analysis_control import ensure_monitor_capacity, lock_account, mark_demand_changed
 from app.services.bootstrap_scheduler import (
     NoopSecurityBootstrapScheduler,
     SecurityBootstrapScheduler,
@@ -63,6 +67,8 @@ from app.services.notification_service import (
 from app.services.state_service import state_parameter_key
 from app.states import DEFAULT_REGISTRY, StateRegistry, UnknownStateError
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class AlertEvaluationResult:
@@ -72,6 +78,8 @@ class AlertEvaluationResult:
     status: str
     triggered: bool
     notification_id: int | None = None
+    error_code: str | None = None
+    notification_ids: tuple[int, ...] = ()
 
 
 class AlertService:
@@ -92,7 +100,9 @@ class AlertService:
         self.repository = AlertRepository(session)
         self.notification_repository = NotificationRepository(session)
         self.state_registry = state_registry or DEFAULT_REGISTRY
-        self.observation_service = AlertObservationService(session)
+        self.observation_service = AlertObservationService(
+            session, state_registry=self.state_registry
+        )
         self.notification_service = NotificationService(
             session,
             provider=notification_provider,
@@ -105,6 +115,9 @@ class AlertService:
         return [_rule_data(item) for item in await self.repository.list_for_user(user_id)]
 
     async def create(self, user_id: int, payload: AlertRuleCreateRequest) -> AlertRuleData:
+        await lock_account(self.session, user_id)
+        if payload.enabled:
+            await ensure_monitor_capacity(self.session, user_id, payload.security_id)
         security = await self.session.get(Security, payload.security_id)
         if security is None:
             raise ApiError("SECURITY_NOT_FOUND", "Security was not found.", 404)
@@ -130,6 +143,8 @@ class AlertService:
         )
         self.session.add(rule)
         try:
+            if rule.enabled:
+                await mark_demand_changed(self.session, [rule.security_id])
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
@@ -144,7 +159,8 @@ class AlertService:
     async def update(
         self, user_id: int, rule_id: int, payload: AlertRuleUpdateRequest
     ) -> AlertRuleData:
-        rule = await self.repository.get_owned(rule_id, user_id)
+        await lock_account(self.session, user_id)
+        rule = await self.repository.get_for_evaluation(rule_id, user_id=user_id)
         if rule is None:
             raise ApiError("ALERT_NOT_FOUND", "Alert rule was not found.", 404)
         updates = payload.model_dump(exclude_unset=True)
@@ -170,6 +186,10 @@ class AlertService:
         parameters = updates.get("parameters") if "parameters" in updates else rule.parameters
         field = updates.get("field") if "field" in updates else rule.field
         adjust_type = updates.get("adjust_type") if "adjust_type" in updates else rule.adjust_type
+        if updates.get("enabled", rule.enabled):
+            await ensure_monitor_capacity(
+                self.session, user_id, security_id, exclude_rule_id=rule.id
+            )
         fields = _condition_fields(
             condition_type=condition_type,
             state_id=state_id,
@@ -189,6 +209,8 @@ class AlertService:
         if "enabled" in updates:
             rule.enabled = bool(updates["enabled"])
         new_signature = _rule_signature(rule)
+        if new_signature != old_signature:
+            rule.rule_version += 1
         if old_security_id != security.id:
             instance = await self.repository.get_instance(rule.id, old_security_id)
             if instance is not None:
@@ -198,7 +220,11 @@ class AlertService:
             if instance is not None:
                 instance.status = AlertInstanceStatus.RESET
                 instance.last_trigger_time = None
+                instance.rule_version = rule.rule_version
+                instance.last_evaluated_trade_date = None
         try:
+            if new_signature != old_signature:
+                await mark_demand_changed(self.session, [old_security_id, security.id])
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
@@ -211,9 +237,11 @@ class AlertService:
         return _rule_data(refreshed)
 
     async def delete(self, user_id: int, rule_id: int) -> None:
-        rule = await self.repository.get_owned(rule_id, user_id)
+        await lock_account(self.session, user_id)
+        rule = await self.repository.get_for_evaluation(rule_id, user_id=user_id)
         if rule is None:
             raise ApiError("ALERT_NOT_FOUND", "Alert rule was not found.", 404)
+        await mark_demand_changed(self.session, [rule.security_id])
         await self.session.delete(rule)
         try:
             await self.session.commit()
@@ -249,8 +277,8 @@ class AlertService:
     ) -> list[AlertEvaluationResult]:
         rules = await self.repository.list_for_user(user_id)
         return [
-            await self._evaluate_rule(rule, provider=provider, dispatch_after_commit=True)
-            for rule in rules
+            await self._evaluate_rule(rule_id, provider=provider, dispatch_after_commit=True)
+            for rule_id in [rule.id for rule in rules]
         ]
 
     async def evaluate_all(
@@ -259,25 +287,55 @@ class AlertService:
         provider: NotificationProvider | None = None,
         observation_date: date | None = None,
         dividend_unavailable_symbols: set[str] | frozenset[str] | None = None,
+        eligible_streams: tuple[tuple[str, str], ...] | None = None,
     ) -> list[AlertEvaluationResult]:
         """Evaluate every persisted rule; this is the scheduler integration seam."""
 
         statement = (
-            select(AlertRule)
-            .options(joinedload(AlertRule.security))
+            select(AlertRule.id, AlertRule.indicator_type, Security.symbol, AlertRule.adjust_type)
+            .join(Security, Security.id == AlertRule.security_id)
+            .join(User, User.id == AlertRule.user_id)
+            .where(
+                AlertRule.enabled.is_(True),
+                User.status == UserStatus.ACTIVE,
+                Security.status == "ACTIVE",
+            )
             .order_by(AlertRule.user_id.asc(), AlertRule.id.asc())
         )
-        rules = list((await self.session.execute(statement)).scalars())
+        targets = (await self.session.execute(statement)).all()
         blocked = {symbol.upper() for symbol in (dividend_unavailable_symbols or set())}
-        return [
-            await self._evaluate_rule(rule, provider=provider, observation_date=observation_date)
-            for rule in rules
-            if not (
-                str(rule.indicator_type or "").upper() == "DIVIDEND_YIELD"
-                and rule.security is not None
-                and rule.security.symbol.upper() in blocked
-            )
-        ]
+        results = []
+        eligible = None if eligible_streams is None else set(eligible_streams)
+        for rule_id, indicator, symbol, adjustment in targets:
+            if (
+                str(indicator or "").upper() != "DIVIDEND_YIELD"
+                and eligible is not None
+                and (symbol, adjustment) not in eligible
+            ):
+                continue
+            if str(indicator or "").upper() == "DIVIDEND_YIELD" and symbol.upper() in blocked:
+                continue
+            try:
+                results.append(
+                    await self._evaluate_rule(
+                        int(rule_id), provider=provider, observation_date=observation_date
+                    )
+                )
+            except ApiError as error:
+                await self.session.rollback()
+                logger.warning(
+                    "alert_evaluation_skipped",
+                    extra={
+                        "rule_id": rule_id,
+                        "error_code": error.code,
+                    },
+                )
+                results.append(
+                    AlertEvaluationResult(
+                        int(rule_id), AlertInstanceStatus.RESET.value, False, error_code=error.code
+                    )
+                )
+        return results
 
     async def evaluate_rule(
         self,
@@ -293,20 +351,21 @@ class AlertService:
 
     async def _evaluate_rule(
         self,
-        rule: AlertRule,
+        rule: AlertRule | int,
         *,
         provider: NotificationProvider | None,
         observation_date: date | None = None,
         dispatch_after_commit: bool = False,
     ) -> AlertEvaluationResult:
-        locked_rule = await self.repository.get_for_evaluation(rule.id)
+        rule_id = rule if isinstance(rule, int) else rule.id
+        locked_rule = await self.repository.get_for_evaluation(rule_id)
         if locked_rule is None:
             raise ApiError("ALERT_NOT_FOUND", "Alert rule was not found.", 404)
         rule = locked_rule
         if not rule.enabled:
+            await self.session.commit()
             return AlertEvaluationResult(rule.id, AlertInstanceStatus.RESET.value, False)
         _validate_rule_state(rule, self.state_registry)
-        _ensure_rule_target_identity(rule, self.state_registry)
 
         context: dict[str, Any]
         if rule.condition_type == "VALUE":
@@ -314,7 +373,7 @@ class AlertService:
             if resolved is None or (
                 observation_date is not None and resolved.observation_date != observation_date
             ):
-                return AlertEvaluationResult(rule.id, AlertInstanceStatus.RESET.value, False)
+                return await self._unavailable_observation(rule, observation_date)
             observation = {"value": resolved.value}
             context = {
                 "date": resolved.observation_date,
@@ -329,7 +388,7 @@ class AlertService:
             if resolved_state is None or (
                 observation_date is not None and resolved_state.observation_date != observation_date
             ):
-                return AlertEvaluationResult(rule.id, AlertInstanceStatus.RESET.value, False)
+                return await self._unavailable_observation(rule, observation_date)
             observation = resolved_state.active
             context = {
                 "date": resolved_state.observation_date,
@@ -343,8 +402,43 @@ class AlertService:
 
         domain_rule = _domain_rule(rule, registry=self.state_registry)
         instance = await self.repository.get_instance(rule.id, rule.security_id)
+        if instance is not None and instance.rule_version != rule.rule_version:
+            instance.status = AlertInstanceStatus.RESET
+            instance.last_evaluated_trade_date = None
+            instance.rule_version = rule.rule_version
+            instance.last_consumed_state_seq = 0
+        if (
+            observation_date is not None
+            and instance is not None
+            and instance.last_evaluated_trade_date is not None
+            and context["date"] < instance.last_evaluated_trade_date
+        ):
+            # Scheduled corrections/replays are not new real-time observations.
+            await self.session.commit()
+            return AlertEvaluationResult(rule.id, instance.status, False)
+        if (
+            observation_date is not None
+            and instance is not None
+            and instance.last_evaluated_trade_date is not None
+            and instance.last_evaluated_trade_date < context["date"]
+            and rule.indicator_type != "DIVIDEND_YIELD"
+        ):
+            from app.services.alert_replay import catch_up
+
+            replay = await catch_up(self, rule, instance, context, observation)
+            if replay is not None:
+                return replay
         prior_status = instance.status if instance is not None else AlertInstanceStatus.RESET
         evaluation = self.evaluator.evaluate(domain_rule, observation, previous_state=prior_status)
+        if (
+            observation_date is not None
+            and instance is not None
+            and instance.last_evaluated_trade_date == context["date"]
+        ):
+            # A correction updates the baseline but is not a fresh notification.
+            instance.status = evaluation.status.value
+            await self.session.commit()
+            return AlertEvaluationResult(rule.id, evaluation.status.value, False)
         now = datetime.now(UTC)
         if instance is None:
             instance = AlertInstance(
@@ -352,34 +446,110 @@ class AlertService:
                 security_id=rule.security_id,
                 status=evaluation.status.value,
                 last_trigger_time=now if evaluation.triggered else None,
-                trigger_sequence=1 if evaluation.triggered else 0,
+                trigger_sequence=rule.trigger_sequence,
+                rule_version=rule.rule_version,
+                last_evaluated_trade_date=context["date"],
             )
             self.session.add(instance)
         else:
             instance.status = evaluation.status.value
             if evaluation.triggered:
                 instance.last_trigger_time = now
-                instance.trigger_sequence += 1
+        instance.last_evaluated_trade_date = context["date"]
+        if rule.condition_type == "STATE":
+            from app.models import AnalysisStream
+
+            stream = await self.session.get(AnalysisStream, (rule.security_id, rule.adjust_type))
+            if stream is not None:
+                instance.last_consumed_state_seq = stream.event_sequence
         if not evaluation.triggered:
             await self.session.commit()
             return AlertEvaluationResult(rule.id, evaluation.status.value, False)
 
-        message = _notification_message(rule, context)
-        notification = await self.notification_service.enqueue(
-            user_id=rule.user_id,
-            alert_rule_id=rule.id,
-            security_id=rule.security_id,
-            title=_notification_title(rule, context),
-            message=message,
-            trigger_sequence=instance.trigger_sequence,
-            observation_date=context["date"],
-            created_at=now,
-        )
+        notification = await self._enqueue_trigger(rule, instance, context)
         # Edge state and PENDING outbox row become durable atomically.
         await self.session.commit()
         if dispatch_after_commit:
             await self.notification_service.dispatch(notification.id, provider=provider)
         return AlertEvaluationResult(rule.id, evaluation.status.value, True, notification.id)
+
+    async def _unavailable_observation(self, rule, observation_date):
+        from app.services.alert_replay import catch_up
+        from app.services.analysis_control import publication_is_current, published_stream_for_read
+
+        if observation_date is None:
+            await self.session.commit()
+            return AlertEvaluationResult(rule.id, AlertInstanceStatus.RESET.value, False)
+        stream = await published_stream_for_read(self.session, rule.security_id, rule.adjust_type)
+        # Do not consume the day while its publication is still pending. Once
+        # publication is complete, UNKNOWN is a checked observation, not a reset.
+        if (
+            stream is None
+            or not publication_is_current(stream)
+            or stream.state_through != observation_date
+        ):
+            await self.session.commit()
+            return AlertEvaluationResult(rule.id, AlertInstanceStatus.RESET.value, False)
+        instance = await self.repository.get_instance(rule.id, rule.security_id)
+        if instance is not None and instance.rule_version == rule.rule_version:
+            if (
+                instance.last_evaluated_trade_date is not None
+                and instance.last_evaluated_trade_date < observation_date
+            ):
+                context = {"date": observation_date, "snapshot": None, "state": None}
+                result = await catch_up(self, rule, instance, context, None)
+                if result is not None:
+                    return result
+        if instance is None:
+            instance = AlertInstance(
+                alert_rule_id=rule.id,
+                security_id=rule.security_id,
+                status=AlertInstanceStatus.RESET,
+                trigger_sequence=rule.trigger_sequence,
+                rule_version=rule.rule_version,
+                last_evaluated_trade_date=observation_date,
+                last_consumed_state_seq=stream.event_sequence,
+            )
+            self.session.add(instance)
+        elif instance.rule_version != rule.rule_version:
+            instance.rule_version = rule.rule_version
+            instance.status = AlertInstanceStatus.RESET
+            instance.last_evaluated_trade_date = observation_date
+            instance.last_consumed_state_seq = stream.event_sequence
+        elif (
+            instance.last_evaluated_trade_date is None
+            or instance.last_evaluated_trade_date <= observation_date
+        ):
+            instance.last_evaluated_trade_date = observation_date
+            instance.last_consumed_state_seq = stream.event_sequence
+        await self.session.commit()
+        return AlertEvaluationResult(rule.id, instance.status, False)
+
+    async def _enqueue_trigger(self, rule, instance, context):
+        """All trigger identities are owned by the locked rule, including catch-up."""
+        now = datetime.now(UTC)
+        rule.trigger_sequence = max(rule.trigger_sequence, instance.trigger_sequence) + 1
+        instance.trigger_sequence = rule.trigger_sequence
+        instance.last_trigger_time = now
+        notification = await self.notification_service.enqueue(
+            user_id=rule.user_id,
+            alert_rule_id=rule.id,
+            security_id=rule.security_id,
+            title=_notification_title(rule, context),
+            message=_notification_message(rule, context),
+            trigger_sequence=instance.trigger_sequence,
+            rule_version=rule.rule_version,
+            observation_date=context["date"],
+            created_at=now,
+        )
+        provenance = {
+            key: context[key]
+            for key in ("source_event_id", "source_revision", "catch_up")
+            if key in context
+        }
+        if provenance:
+            notification.content = {**notification.content, **provenance}
+        return notification
 
 
 # A descriptive alias makes the scheduler seam discoverable without creating
@@ -393,6 +563,7 @@ async def evaluate_all_alerts(
     provider: NotificationProvider | None = None,
     observation_date: date | None = None,
     dividend_unavailable_symbols: set[str] | frozenset[str] | None = None,
+    eligible_streams: tuple[tuple[str, str], ...] | None = None,
 ) -> list[AlertEvaluationResult]:
     """Stable scheduler entry point for one batch evaluation.
 
@@ -404,6 +575,7 @@ async def evaluate_all_alerts(
         provider=provider,
         observation_date=observation_date,
         dividend_unavailable_symbols=dividend_unavailable_symbols,
+        eligible_streams=eligible_streams,
     )
 
 
@@ -433,22 +605,7 @@ def _condition_fields(
             raise ApiError("INVALID_ALERT_RULE", "State condition fields do not match.", 400)
         resolved = _validated_state_code(registry, state_id or state_code)
         definition = registry.get(resolved)
-        if definition.indicator_type == "MA":
-            raw = dict(parameters or {"short_period": 5, "long_period": 10})
-            try:
-                short = int(raw.get("short_period", raw.get("short", 5)))
-                long = int(raw.get("long_period", raw.get("long", 10)))
-            except (TypeError, ValueError) as exc:
-                raise ApiError("INVALID_ALERT_RULE", "MA state periods are invalid.", 400) from exc
-            if short <= 0 or long <= 0 or short >= long:
-                raise ApiError("INVALID_ALERT_RULE", "MA state periods are invalid.", 400)
-            normalized_parameters = {"short_period": short, "long_period": long}
-        else:
-            normalized_parameters = canonicalize_parameters(
-                definition.indicator_type,
-                parameters,
-                fill_defaults=True,
-            )
+        normalized_parameters = canonicalize_state_parameters(definition.indicator_type, parameters)
         return {
             "condition_type": "STATE",
             "indicator_type": definition.indicator_type,
@@ -529,46 +686,6 @@ def _validated_state_code(registry: StateRegistry, state_code: str | None) -> st
         raise ApiError("INVALID_ALERT_RULE", "State condition is invalid.", 400) from exc
 
 
-def _ensure_rule_target_identity(
-    rule: AlertRule, registry: StateRegistry = DEFAULT_REGISTRY
-) -> None:
-    """Bridge legacy rules to precise targets without guessing composite fields."""
-
-    if rule.condition_type == "STATE":
-        if not rule.state_code:
-            return
-        definition = registry.get(rule.state_code)
-        if rule.parameters:
-            parameters = dict(rule.parameters)
-        elif definition.indicator_type == "MA":
-            parameters = {"short_period": 5, "long_period": 10}
-        else:
-            parameters = canonicalize_parameters(
-                definition.indicator_type, None, fill_defaults=True
-            )
-        rule.indicator_type = definition.indicator_type
-        rule.parameters = parameters
-        rule.parameter_key = rule.parameter_key or state_parameter_key(rule.state_code, parameters)
-        rule.adjust_type = rule.adjust_type or "qfq"
-        return
-    indicator = normalize_indicator_type(rule.indicator_type or "")
-    if indicator == "DIVIDEND_YIELD":
-        rule.parameters = {}
-        rule.parameter_key = rule.parameter_key or parameter_key(indicator, {})
-        rule.field = rule.field or "value"
-        rule.adjust_type = "none"
-        return
-    if rule.parameter_key and rule.field:
-        return
-    if indicator not in {"RSI", "PROJECTED_MA"}:
-        return
-    parameters = canonicalize_parameters(indicator, rule.parameters, fill_defaults=True)
-    rule.parameters = parameters
-    rule.parameter_key = parameter_key(indicator, parameters)
-    rule.field = canonical_indicator_field(indicator, parameters, rule.field)
-    rule.adjust_type = rule.adjust_type or "qfq"
-
-
 def _rule_signature(rule: AlertRule) -> tuple[Any, ...]:
     return (
         rule.security_id,
@@ -588,6 +705,7 @@ def _rule_data(rule: AlertRule) -> AlertRuleData:
     security = rule.security
     return AlertRuleData(
         id=rule.id,
+        rule_version=rule.rule_version,
         security_id=rule.security_id,
         condition_type=rule.condition_type,
         state_id=rule.state_code if rule.condition_type == "STATE" else None,

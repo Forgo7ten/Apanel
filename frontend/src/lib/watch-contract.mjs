@@ -135,6 +135,7 @@ function hasPrice(stock) {
  * readiness check only; indicator calculation remains entirely on the backend.
  */
 export function isWatchStockDataReady(stock, columns = []) {
+  if (isRecord(stock) && stock.analysis_status === "REBUILD_PENDING") return false;
   if (isRecord(stock) && typeof stock.bootstrap_ready === "boolean") {
     return stock.bootstrap_ready;
   }

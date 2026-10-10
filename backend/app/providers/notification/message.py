@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date as Date
@@ -50,6 +51,7 @@ class NotificationMessage:
     change: float | None
     value_details: Mapping[str, Mapping[str, float | None]]
     date: Date
+    event_id: str | None
 
     def __init__(
         self,
@@ -66,7 +68,14 @@ class NotificationMessage:
         symbol: str | None = None,
         state_id: str | None = None,
         trade_date: Date | datetime | None = None,
+        event_id: str | None = None,
     ) -> None:
+        if event_id is not None and (
+            not isinstance(event_id, str)
+            or re.fullmatch(r"[A-Za-z0-9:_-]{1,160}", event_id) is None
+        ):
+            raise ValueError("event_id must be a bounded safe identifier")
+        object.__setattr__(self, "event_id", event_id)
         if stock_code is not None and symbol is not None and stock_code != symbol:
             raise ValueError("stock_code and symbol do not match")
         resolved_code = stock_code if stock_code is not None else symbol
@@ -170,6 +179,7 @@ class NotificationMessage:
             "change": self.change,
             "value_details": {key: dict(value) for key, value in self.value_details.items()},
             "date": self.date.isoformat(),
+            **({"event_id": self.event_id} if self.event_id is not None else {}),
         }
 
     def render_text(self) -> str:
@@ -200,6 +210,8 @@ class NotificationMessage:
                 parts.append(f"变化 {delta:+g}")
             lines.append(" · ".join(parts))
         lines.append(f"日期：{self.date.isoformat()}")
+        if self.event_id is not None:
+            lines.append(f"事件编号：{self.event_id}")
         return "\n".join(lines)
 
 

@@ -23,6 +23,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      APP_ENV: test
       APANEL_TEST_POSTGRES_URL: postgresql+asyncpg://apanel:apanel_test_password@127.0.0.1:5432/apanel_test
       DATABASE_URL: postgresql+asyncpg://apanel:apanel_test_password@127.0.0.1:5432/apanel_test
       APP_SECRETS_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
@@ -48,10 +49,29 @@ jobs:
       - name: Migration smoke test
         if: always()
         working-directory: backend
-        run: alembic upgrade head
+        run: |
+          alembic upgrade head
+          alembic check
 
   market-data-hub:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: apanel
+          POSTGRES_PASSWORD: apanel_test_password
+          POSTGRES_DB: apanel_hub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apanel -d apanel_hub_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: test
+      APANEL_TEST_POSTGRES_URL: postgresql+asyncpg://apanel:apanel_test_password@127.0.0.1:5432/apanel_hub_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

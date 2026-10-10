@@ -63,9 +63,9 @@ test("different BOLL parameter columns keep their own composite fields", () => {
   assert.equal(getColumnValue(stock, { id: 202, indicator_type: "BOLL" }).parameters.multiplier, 3);
 });
 
-test("legacy responses fall back to indicator type only when column_values is absent", () => {
-  const legacy = { indicators: { MA: ma20 } };
-  assert.equal(getColumnValue(legacy, { id: 101, indicator_type: "MA", type: "MA" }), ma20);
+test("old indicator envelopes are not used when column_values is absent", () => {
+  const oldEnvelope = { indicators: { MA: ma20 } };
+  assert.equal(getColumnValue(oldEnvelope, { id: 101, indicator_type: "MA", type: "MA" }), undefined);
 
   const partial = { column_values: {}, indicators: { MA: ma20 } };
   assert.equal(getColumnValue(partial, { id: 101, indicator_type: "MA", type: "MA" }), undefined);
@@ -91,6 +91,10 @@ test("composite fields preserve scalar value, previous value, delta and directio
   assert.equal(getColumnFieldValue(boll.fields.upper, "previous_value"), 109);
   assert.equal(getColumnFieldValue(boll.fields.upper, "delta"), 1);
   assert.equal(getColumnFieldValue(boll.fields.upper, "direction"), "UP");
+});
+
+test("composite fields reject the obsolete unwrapped format", () => {
+  assert.deepEqual(getColumnFields({ upper: { value: 120 }, view_mode: "COMPOSITE" }), []);
 });
 
 test("scalar NUMBER and DELTA payloads are read without browser-side calculation", () => {

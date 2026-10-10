@@ -10,13 +10,12 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.config import get_settings
 from app.core.errors import ApiError
-from app.models import Notification, NotificationChannel, NotificationStatus, UserSetting
+from app.models import Notification, NotificationChannel, NotificationStatus
 from app.providers.notification import (
     DEFAULT_PROVIDER_REGISTRY,
     FEISHU_WEBHOOK_TIMEOUT_SECONDS,
@@ -34,13 +33,16 @@ class ProviderFactory(Protocol):
     def __call__(self, webhook_url: str | None) -> NotificationProvider: ...
 
 
-# A PENDING row older than this window is treated as an abandoned/legacy
+# A PENDING row older than this window is treated as an abandoned
 # attempt.  Recent PENDING rows remain owned by the original delivery path;
 # retrying them would risk a second provider POST.
 NOTIFICATION_PROVIDER_TIMEOUT = timedelta(seconds=FEISHU_WEBHOOK_TIMEOUT_SECONDS)
 NOTIFICATION_PENDING_RECOVERY_MARGIN = timedelta(seconds=5)
 NOTIFICATION_PENDING_RECOVERY_WINDOW = timedelta(minutes=5)
 NOTIFICATION_COMMIT_RECOVERY_ATTEMPTS = 2
+NOTIFICATION_MAX_AUTO_ATTEMPTS = 5
+NOTIFICATION_RETRY_BASE_SECONDS = 60
+NOTIFICATION_CLEANUP_TIMEOUT_SECONDS = 1.0
 NOTIFICATION_PERSISTENCE_ERROR_CODE = "NOTIFICATION_PERSISTENCE_FAILED"
 NOTIFICATION_PERSISTENCE_ERROR_MESSAGE = "Notification delivery outcome could not be saved."
 _RETRY_LOCKS_GUARD = threading.Lock()
@@ -84,7 +86,7 @@ def is_notification_retryable(
 
     validate_pending_recovery_window(recovery_window)
     if notification.status == NotificationStatus.FAILED:
-        return True
+        return notification.error_code != "INVALID_NOTIFICATION_CONTENT"
     if notification.status != NotificationStatus.PENDING:
         return False
     current = _utc_datetime(now or datetime.now(UTC))
@@ -116,6 +118,7 @@ class NotificationService:
         self.provider_registry = provider_registry or DEFAULT_PROVIDER_REGISTRY
         self.pending_recovery_window = validate_pending_recovery_window(pending_recovery_window)
         self.clock = clock or (lambda: datetime.now(UTC))
+        self._delivery_baselines: dict[int, tuple] = {}
 
     async def enqueue(
         self,
@@ -127,12 +130,14 @@ class NotificationService:
         message: NotificationMessage,
         trigger_sequence: int | None,
         observation_date: date,
+        rule_version: int = 1,
         created_at: datetime | None = None,
     ) -> Notification:
         """Add one PENDING outbox row without committing or sending."""
 
         content = message.to_dict()
         content["title"] = title
+        content["rule_version"] = rule_version
         if trigger_sequence is not None:
             content["event_id"] = f"alert:{alert_rule_id}:{security_id}:{trigger_sequence}"
         notification = Notification(
@@ -144,6 +149,7 @@ class NotificationService:
             content=content,
             status=NotificationStatus.PENDING,
             trigger_sequence=trigger_sequence,
+            rule_version=rule_version,
             observation_date=observation_date,
             created_at=created_at or datetime.now(UTC),
         )
@@ -156,43 +162,43 @@ class NotificationService:
         notification_id: int,
         *,
         provider: NotificationProvider | None = None,
+        recover: bool = False,
     ) -> Notification:
-        """Deliver an already committed PENDING outbox row."""
-
+        """Dispatch initial outbox or a due recovery, rechecking eligibility under lock."""
         async with _retry_lock(notification_id):
             notification = await self._locked_notification(notification_id)
             if notification is None:
                 raise ApiError("NOTIFICATION_NOT_FOUND", "Notification was not found.", 404)
+            if recover:
+                now = _utc_datetime(self.clock())
+                due_failure = (
+                    notification.status == NotificationStatus.FAILED
+                    and notification.next_retry_at is not None
+                    and _utc_datetime(notification.next_retry_at) <= now
+                    and notification.attempt_count < NOTIFICATION_MAX_AUTO_ATTEMPTS
+                )
+                old_pending = (
+                    notification.status == NotificationStatus.PENDING
+                    and is_notification_retryable(
+                        notification, now=now, recovery_window=self.pending_recovery_window
+                    )
+                )
+                if not (due_failure or old_pending):
+                    await self.session.commit()
+                    return notification
+                notification.status = NotificationStatus.PENDING
             if notification.status != NotificationStatus.PENDING:
+                await self.session.commit()
                 return notification
-            message = _message_from_content(notification.content)
+            try:
+                message = _message_from_content(notification.content)
+            except (ValueError, TypeError, KeyError):
+                notification.status = NotificationStatus.FAILED
+                notification.error_code = "INVALID_NOTIFICATION_CONTENT"
+                notification.error_message = "Notification content cannot be delivered."
+                notification.next_retry_at = None
+                return await self._commit_delivery(notification)
             return await self._deliver_existing(notification, message, provider=provider)
-
-    async def deliver(
-        self,
-        *,
-        user_id: int,
-        alert_rule_id: int,
-        security_id: int,
-        title: str,
-        message: NotificationMessage,
-        provider: NotificationProvider | None = None,
-        created_at: datetime | None = None,
-    ) -> Notification:
-        """Backward-compatible create-and-deliver helper for non-alert callers."""
-
-        notification = await self.enqueue(
-            user_id=user_id,
-            alert_rule_id=alert_rule_id,
-            security_id=security_id,
-            title=title,
-            message=message,
-            trigger_sequence=None,
-            observation_date=message.date,
-            created_at=created_at,
-        )
-        await self.session.commit()
-        return await self.dispatch(notification.id, provider=provider)
 
     async def retry(
         self,
@@ -246,11 +252,12 @@ class NotificationService:
                 notification.status = NotificationStatus.FAILED
                 notification.error_code = "INVALID_NOTIFICATION_CONTENT"
                 notification.error_message = "Notification content cannot be retried."
+                notification.next_retry_at = None
                 await self.session.commit()
                 return notification
 
-            content = message.to_dict()
-            content["title"] = notification.title
+            content = dict(notification.content or {})
+            content.pop("error", None)
             notification.status = NotificationStatus.PENDING
             notification.error_code = None
             notification.error_message = None
@@ -290,14 +297,23 @@ class NotificationService:
         conditions = [Notification.id == notification_id]
         if user_id is not None:
             conditions.append(Notification.user_id == user_id)
-        return (
+        notification = (
             await self.session.execute(
                 select(Notification)
                 .options(selectinload(Notification.security))
                 .where(*conditions)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+        if notification is not None:
+            self._delivery_baselines[notification.id] = (
+                notification.status,
+                notification.attempt_count,
+                notification.error_code,
+                notification.next_retry_at,
+            )
+        return notification
 
     async def _deliver_existing(
         self,
@@ -312,6 +328,9 @@ class NotificationService:
         active_provider = provider if provider is not None else self.provider
         owns_provider = False
         content = dict(notification.content or {})
+        content.pop("error", None)
+        notification.attempt_count = (notification.attempt_count or 0) + 1
+        notification.next_retry_at = None
         try:
             # The destination lookup is part of the provider boundary.  It
             # must be covered by the same failure handling as provider.send so
@@ -326,12 +345,23 @@ class NotificationService:
                         webhook,
                     )
                 owns_provider = True
-            await active_provider.send({"settings": {"feishu_webhook": webhook}}, message)
+            async with asyncio.timeout(NOTIFICATION_PROVIDER_TIMEOUT.total_seconds()):
+                await active_provider.send({"settings": {"feishu_webhook": webhook}}, message)
         except Exception as exc:
             code, safe_message = _safe_delivery_error(exc, webhook)
             notification.status = NotificationStatus.FAILED
             notification.error_code = code
             notification.error_message = safe_message
+            transient = isinstance(exc, TimeoutError) or bool(getattr(exc, "retryable", False))
+            status_code = getattr(exc, "status_code", None)
+            transient = transient or (
+                type(status_code) is int and (status_code == 429 or 500 <= status_code <= 599)
+            )
+            if transient and notification.attempt_count < NOTIFICATION_MAX_AUTO_ATTEMPTS:
+                seconds = NOTIFICATION_RETRY_BASE_SECONDS * (2 ** (notification.attempt_count - 1))
+                notification.next_retry_at = _utc_datetime(self.clock()) + timedelta(
+                    seconds=seconds
+                )
             notification.content = {
                 **content,
                 "error": {"code": code, "message": safe_message},
@@ -347,9 +377,12 @@ class NotificationService:
                 close = getattr(active_provider, "close", None)
                 if close is not None:
                     try:
-                        result = close()
-                        if hasattr(result, "__await__"):
-                            await result
+                        # A hung transport cleanup must not retain the row lock
+                        # forever or prevent committing an already-known outcome.
+                        async with asyncio.timeout(NOTIFICATION_CLEANUP_TIMEOUT_SECONDS):
+                            result = close()
+                            if hasattr(result, "__await__"):
+                                await result
                     except Exception:
                         # A close failure must not hide the already recorded
                         # provider outcome or leak transport diagnostics.
@@ -360,12 +393,15 @@ class NotificationService:
         """Commit a terminal outcome without overwriting a concurrent winner."""
 
         notification_id = notification.id
+        baseline = self._delivery_baselines.get(notification_id)
         outcome = {
             "status": notification.status,
             "error_code": notification.error_code,
             "error_message": notification.error_message,
             "sent_at": notification.sent_at,
             "content": dict(notification.content or {}),
+            "attempt_count": notification.attempt_count,
+            "next_retry_at": notification.next_retry_at,
         }
         try:
             await self.session.commit()
@@ -380,18 +416,27 @@ class NotificationService:
                     persisted = await self._locked_notification(notification_id)
                     if persisted is None:
                         raise RuntimeError("notification disappeared during outcome recovery")
-                    if persisted.status in {
-                        NotificationStatus.SENT,
-                        NotificationStatus.FAILED,
-                    }:
-                        return persisted
-                    if persisted.status != NotificationStatus.PENDING:
+                    durable = (
+                        persisted.status,
+                        persisted.attempt_count,
+                        persisted.error_code,
+                        persisted.next_retry_at,
+                    )
+                    # A retry starts from a durable FAILED row. If our commit
+                    # rolled back, that unchanged previous failure is not a
+                    # concurrent winner; persist the cached send outcome.
+                    unchanged_claim = baseline is not None and durable == baseline
+                    if persisted.status in {NotificationStatus.SENT, NotificationStatus.FAILED}:
+                        if not unchanged_claim:
+                            return persisted
+                    elif persisted.status != NotificationStatus.PENDING:
                         raise RuntimeError("notification has an invalid delivery status")
                     result = await self.session.execute(
                         update(Notification)
                         .where(
                             Notification.id == notification_id,
-                            Notification.status == NotificationStatus.PENDING,
+                            Notification.status == persisted.status,
+                            Notification.attempt_count == persisted.attempt_count,
                         )
                         .values(**outcome)
                     )
@@ -447,23 +492,8 @@ class NotificationService:
         }
 
     async def _user_webhook(self, user_id: int) -> str | None:
-        encrypted = await UserSecretService(self.session).get_feishu_webhook(user_id)
-        if encrypted:
-            return encrypted
-        if not get_settings().legacy_webhook_fallback_enabled:
-            return None
-        # Release-A compatibility only: read a legacy plaintext value until
-        # the migration CLI has removed every such JSON key.
-        setting = (
-            await self.session.execute(select(UserSetting).where(UserSetting.user_id == user_id))
-        ).scalar_one_or_none()
-        if setting is None or not isinstance(setting.settings, dict):
-            return None
-        nested = setting.settings.get("notification_settings")
-        if not isinstance(nested, dict):
-            nested = setting.settings.get("notification")
-        webhook = nested.get("feishu_webhook") if isinstance(nested, dict) else None
-        return webhook.strip() if isinstance(webhook, str) and webhook.strip() else None
+        """Only encrypted per-user secrets are valid delivery destinations."""
+        return await UserSecretService(self.session).get_feishu_webhook(user_id)
 
 
 async def dispatch_notifications(
@@ -496,7 +526,8 @@ async def dispatch_pending_notifications(
     """
 
     window = validate_pending_recovery_window(recovery_window)
-    cutoff = _utc_datetime(now or datetime.now(UTC)) - window
+    current = _utc_datetime(now or datetime.now(UTC))
+    cutoff = current - window
 
     ids = tuple(
         int(item)
@@ -504,15 +535,29 @@ async def dispatch_pending_notifications(
             await session.execute(
                 select(Notification.id)
                 .where(
-                    Notification.status == NotificationStatus.PENDING,
-                    Notification.created_at <= cutoff,
+                    or_(
+                        and_(
+                            Notification.status == NotificationStatus.PENDING,
+                            Notification.created_at <= cutoff,
+                        ),
+                        and_(
+                            Notification.status == NotificationStatus.FAILED,
+                            Notification.next_retry_at <= current,
+                            Notification.attempt_count < NOTIFICATION_MAX_AUTO_ATTEMPTS,
+                        ),
+                    ),
                 )
                 .order_by(Notification.created_at.asc(), Notification.id.asc())
                 .limit(limit)
             )
         ).scalars()
     )
-    return await dispatch_notifications(session, ids, provider=provider)
+    service = NotificationService(
+        session, provider=provider, pending_recovery_window=window, clock=lambda: current
+    )
+    for notification_id in ids:
+        await service.dispatch(notification_id, recover=True)
+    return await service.summarize_deliveries(ids)
 
 
 async def summarize_deliveries(
@@ -540,6 +585,7 @@ def _message_from_content(content: object) -> NotificationMessage:
         change=content.get("change"),
         value_details=content.get("value_details"),
         date=date.fromisoformat(raw_date),
+        event_id=content.get("event_id"),
     )
 
 

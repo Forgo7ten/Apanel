@@ -410,8 +410,8 @@ export function createRefreshEpochGuard(getEpoch) {
   };
 }
 
-export function createAuthStateMessage({ source, epoch, status, timestamp = Date.now() }) {
-  return { source, epoch, status, timestamp };
+export function createAuthStateMessage({ source, epoch, status, timestamp = Date.now(), userId }) {
+  return { source, epoch, status, timestamp, ...(userId === undefined ? {} : { userId: String(userId) }) };
 }
 
 export function isAuthStateMessage(value) {
@@ -420,11 +420,12 @@ export function isAuthStateMessage(value) {
   }
 
   const keys = Object.keys(value);
-  if (keys.some((key) => !["source", "epoch", "status", "timestamp"].includes(key))) {
+  if (keys.some((key) => !["source", "epoch", "status", "timestamp", "userId"].includes(key))) {
     return false;
   }
 
   return (
+    (value.userId === undefined || (typeof value.userId === "string" && value.userId.length > 0)) &&
     typeof value.source === "string" &&
     value.source.length > 0 &&
     typeof value.epoch === "number" &&

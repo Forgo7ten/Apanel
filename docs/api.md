@@ -151,7 +151,7 @@ http://localhost:8080/api/v1
 }
 ```
 
-Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、按 column id 键控的 `column_values`、当前可见 states，以及每只证券的 `bootstrap_ready`。`bootstrap_ready` 只有在该证券自加入当前监控表后完成一轮完整 bootstrap（日线、指标、状态、股息同步）时才为 `true`，前端据此决定何时结束“数据准备中”，而不根据股息率是否为 0 或状态是否为空来猜测。当前交易日存在更新的 Quote 时价格使用 Quote；未开盘或 Quote 仍停留在上一交易日时，价格回退到最近未复权日线收盘价。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列。
+Watch Table detail 是表格渲染的聚合读模型：包含证券、最新价格、只通过 column id 键控的 `column_values`、当前可见 states，以及每只证券的 `bootstrap_ready`。`bootstrap_ready` 只有在该证券自加入当前监控表后完成一轮完整 bootstrap（日线、指标、状态、股息同步）时才为 `true`，前端据此决定何时结束“数据准备中”，而不根据股息率是否为 0 或状态是否为空来猜测。当前交易日存在更新的 Quote 时价格使用 Quote；未开盘或 Quote 仍停留在上一交易日时，价格回退到最近未复权日线收盘价。服务端按用户当前 `adjust_type` 设置选择 `qfq` 或 `none` 分析序列；指标字段统一由列 ID 键控的 `column_values` 返回。
 
 ## Settings API
 
@@ -178,6 +178,12 @@ Settings 响应不会返回 Webhook 明文，只返回 `notification_settings.fe
 指标历史 item 包含 `indicator_type`、`parameter_key`、`parameters`、`adjust_type`、`values`、`previous_values` 和 `delta`。状态历史 item 还包含 `state_code`、`parameter_key`、`parameters`、`adjust_type` 与 metadata。状态 history 支持按 `state_code` / `parameter_key` / `indicator_type` 精确筛选。
 
 状态 `status` 可为 `ACTIVE`、`INACTIVE` 或 `UNKNOWN`。`UNKNOWN` 表示系统无法证明该日与上一真实交易日之间的数据连续性（例如上一交易日指标缺失或交易日历不可用）；此时 `transition=false`，状态型告警不会把 UNKNOWN 当作 RESET，也不会据此触发通知。
+
+### 状态事件查询
+
+`GET /securities/{symbol}/states/events` 与日度 `/states/history` 不是同一种结果。支持 `start/end`、`adjust`、`state_code`、`parameter_key`、`after_seq`、`limit` 和 `generation`。`limit` 默认 500、最大 1000；返回 `items`、`generation`、`source_revision` 和 `next_cursor`。后续页携带第一页的 `generation`，对应有效时间线的 `state_generation`，不能用全局 event ID 或最大的 `stream_seq` 代替版本。只有撤销、没有新增事件时也会使旧页失效，返回 409。全新库首次 State 尚未发布返回 `STATE_EVENTS_NOT_READY`，重算未发布返回 `ANALYSIS_REBUILD_PENDING`。
+
+日度历史的起始日允许周末、节假日；只读重建从区间第一条真实 observation 的确认前驱开始。未知日历或真实开市日缺数据仍返回 UNKNOWN，不把缺口抹平。详细语义见 [状态事件存储](state-events.md)。
 
 ## 告警通知 API
 
@@ -243,10 +249,10 @@ STATE 通知会在 `content.value_details` 中保留触发该状态时实际参�
 
 - `SENT`：幂等成功返回原记录，不会再次调用 Feishu。
 - `FAILED`：重新投递；成功后变为 `SENT`，失败后保留 `FAILED` 和安全错误字段。
-- 过期的 `PENDING`：按遗留/中断投递恢复。服务端使用行锁和并发保护，避免同一通知
+- 过期的 `PENDING`：按中断投递恢复。服务端使用行锁和并发保护，避免同一通知
   并发产生重复 POST。
 - 首次投递在写入 `PENDING` 后也会重新取得同一通知行锁，并持锁完成 provider 请求；因此
-  首次投递与遗留恢复请求之间同样不会并发 POST。
+  首次投递与超时恢复请求之间同样不会并发 POST。
 - 近期 `PENDING`：返回 `409 NOTIFICATION_RETRY_CONFLICT`，调用方应稍后再试。恢复窗口为
   5 分钟，严格大于 Feishu 5 秒 provider 超时及数据库收敛余量。
 - 其他不可重试状态：返回 `409 NOTIFICATION_NOT_RETRYABLE`。
@@ -331,7 +337,7 @@ Authorization: Bearer <INTERNAL_API_TOKEN>
 
 ### `POST /internal/sync/quotes` / `POST /internal/sync/dividends`
 
-两者都使用内部 token，接收 `{"symbols":[...]}`。Quote 使用 provider 原生批量快照；Dividend 使用有界并发并逐证券返回同步结果。Hub 同时保留 `/internal/sync/quote` 与 `/internal/sync/dividend` 单数别名用于兼容，Backend 使用复数规范路径。
+两者都使用内部 token，接收 `{"symbols":[...]}`。Quote 使用 provider 原生批量快照；Dividend 使用有界并发并逐证券返回同步结果。Backend 统一调用复数形式的规范接口。
 
 ### `POST /internal/calendar/validate`
 
@@ -348,5 +354,9 @@ token 返回 `503`。
 ## 版本与限制
 
 - `/api/v1` 是后端当前实际挂载的 API 路径；行情数据中枢不使用该前缀。
-- 通知历史和失败/遗留投递恢复端点见“告警通知 API”；告警规则由 `/alerts` 端点管理。
+- 通知历史、失败重试和超时投递恢复端点见“告警通知 API”；告警规则由 `/alerts` 端点管理。
 - 行情读取只读持久化结果；Quote/Daily/Dividend 写入都通过受内部 token 保护的同步端点触发。
+
+### 登录标识选择
+
+`POST /api/v1/auth/login` 支持可选的 `identifier_type`：`auto`（默认）、`username`、`email`。当登录标识无法唯一归属一个用户时，`auto` 返回 `INVALID_CREDENTIALS`；指定类型后只查询对应字段。

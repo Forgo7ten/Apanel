@@ -33,3 +33,9 @@ redis-data/
 .DS_Store
 .idea/
 .vscode/
+
+# Generated validation, review and measurement artifacts (not formal docs)
+/docs/benchmarks/
+/docs/*-review-*.md
+/docs/*-validation-*.md
+/docs/*-retirement-*.md

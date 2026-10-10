@@ -9,9 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
+from app.indicators.parameters import parameter_key
 from app.models import (
     AlertRule,
-    IndicatorSnapshot,
     Notification,
     Security,
     User,
@@ -19,6 +19,7 @@ from app.models import (
 )
 from app.tasks.contracts import PipelineConfigurationError, PipelineContext
 from app.tasks.pipeline import build_default_eod_steps
+from tests.snapshot_fixture import current_snapshot
 
 
 class FakeMarketDataHubClientProtocol:
@@ -64,11 +65,15 @@ async def pipeline_context(tmp_path) -> AsyncIterator[dict[str, object]]:
                     security_id=security.id,
                     condition_type="VALUE",
                     indicator_type="RSI",
+                    parameters={"period": 14},
+                    parameter_key=parameter_key("RSI", {"period": 14}),
+                    field="value",
+                    adjust_type="qfq",
                     operator=">=",
                     threshold=70,
                     enabled=True,
                 ),
-                IndicatorSnapshot(
+                current_snapshot(
                     security_id=security.id,
                     trade_date=date(2026, 9, 24),
                     indicator_type="RSI",

@@ -99,6 +99,7 @@ class AlertRuleData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: int
+    rule_version: int = 1
     security_id: int
     condition_type: str
     state_id: str | None = None
