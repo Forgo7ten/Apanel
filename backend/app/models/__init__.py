@@ -301,6 +301,19 @@ class TradingCalendar(Base):
     )
 
 
+class InstallationSetup(Base):
+    """Single durable first-installation gate, independent of user deletion."""
+
+    __tablename__ = "installation_setup"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class User(Base):
     """An authenticated Apanel account."""
 

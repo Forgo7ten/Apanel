@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { AuthFrame } from "@/components/auth/AuthFrame";
 import { RegisterForm } from "@/components/auth/RegisterForm";
+import { SetupGuard } from "@/components/auth/SetupGuard";
 
 export const metadata = {
   title: "注册",
@@ -9,7 +10,7 @@ export const metadata = {
 
 export default function RegisterPage() {
   return (
-    <AuthFrame
+    <SetupGuard><AuthFrame
       eyebrow="Invitation only"
       title="创建 Apanel 账号"
       description="使用管理员提供的邀请链接完成注册，注册成功后会直接进入工作台。"
@@ -21,6 +22,6 @@ export default function RegisterPage() {
       }
     >
       <RegisterForm />
-    </AuthFrame>
+    </AuthFrame></SetupGuard>
   );
 }

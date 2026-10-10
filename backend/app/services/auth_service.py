@@ -21,6 +21,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models import (
+    InstallationSetup,
     Invitation,
     InvitationStatus,
     RefreshSession,
@@ -292,30 +293,53 @@ async def bootstrap_admin(
     email: str,
     password: str,
 ) -> User:
-    """Create the first administrator and refuse once any admin exists."""
+    """Create the first administrator manually and permanently close web setup."""
 
     async with session.begin():
         await _lock_bootstrap_admin(session)
-        existing_admin = (
+        setup = (
             await session.execute(
-                select(User.id).where(User.role == UserRole.ADMIN).with_for_update()
+                select(InstallationSetup).where(InstallationSetup.id == 1).with_for_update()
             )
         ).scalar_one_or_none()
-        if existing_admin is not None:
+        if setup is not None and setup.completed_at is not None:
             raise ApiError("ADMIN_ALREADY_EXISTS", "An administrator already exists.", 409)
-        await _reserve_login_identifiers(session, username, email)
-        user = User(
-            username=username.strip(),
-            email=normalize_identifier(email),
-            password_hash=hash_password(password),
-            role=UserRole.ADMIN,
-            status=UserStatus.ACTIVE,
+        user = await _create_first_admin_locked(
+            session, username=username, email=email, password=password
         )
-        session.add(user)
-        try:
-            await session.flush()
-        except IntegrityError as exc:
-            raise ApiError("INVALID_REQUEST", "Username or email is already in use.", 409) from exc
+        if setup is None:
+            session.add(InstallationSetup(id=1, token_hash=None, completed_at=utc_now()))
+        else:
+            setup.token_hash = None
+            setup.completed_at = utc_now()
+    return user
+
+
+async def _create_first_admin_locked(
+    session: AsyncSession, *, username: str, email: str, password: str
+) -> User:
+    """Shared admin writer; caller must hold BOOTSTRAP_ADMIN_ADVISORY_LOCK_KEY."""
+
+    existing_admin = (
+        await session.execute(
+            select(User.id).where(User.role == UserRole.ADMIN).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing_admin is not None:
+        raise ApiError("ADMIN_ALREADY_EXISTS", "An administrator already exists.", 409)
+    await _reserve_login_identifiers(session, username, email)
+    user = User(
+        username=username.strip(),
+        email=normalize_identifier(email),
+        password_hash=hash_password(password),
+        role=UserRole.ADMIN,
+        status=UserStatus.ACTIVE,
+    )
+    session.add(user)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        raise ApiError("INVALID_REQUEST", "Username or email is already in use.", 409) from exc
     return user
 
 

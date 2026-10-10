@@ -23,6 +23,7 @@ yarn-debug.log*
 pnpm-debug.log*
 
 # Local data and generated output
+.apanel-setup-token
 *.log
 coverage.xml
 htmlcov/

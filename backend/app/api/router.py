@@ -9,11 +9,13 @@ from app.api.indicator_state import router as indicator_state_router
 from app.api.notifications import router as notifications_router
 from app.api.securities import router as securities_router
 from app.api.settings import router as settings_router
+from app.api.setup import router as setup_router
 from app.api.watch_tables import router as watch_tables_router
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(health_router, prefix="/health", tags=["health"])
 api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
+api_router.include_router(setup_router, prefix="/setup", tags=["setup"])
 api_router.include_router(indicator_state_router, tags=["indicators", "states"])
 api_router.include_router(securities_router, tags=["securities", "market-data"])
 api_router.include_router(watch_tables_router, tags=["watch-tables"])

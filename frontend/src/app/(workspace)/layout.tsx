@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
+import { SetupGuard } from "@/components/auth/SetupGuard";
 import { WorkspaceShell } from "@/components/layout/WorkspaceShell";
 
 // Workspace pages depend on a browser-only in-memory session. Do not let a
@@ -9,8 +10,8 @@ export const dynamic = "force-dynamic";
 
 export default function WorkspaceLayout({ children }: { children: ReactNode }) {
   return (
-    <ProtectedRoute>
+    <SetupGuard><ProtectedRoute>
       <WorkspaceShell>{children}</WorkspaceShell>
-    </ProtectedRoute>
+    </ProtectedRoute></SetupGuard>
   );
 }

@@ -52,6 +52,12 @@ http://localhost:8080/api/v1
 
 ## 认证 API
 
+### 首次安装 Setup API
+
+- `GET /setup/status`：匿名、禁止缓存，返回 `data.state`（`NOT_READY`/`PENDING`/`COMPLETED`），不返回令牌或用户信息。
+- `POST /setup/complete`：匿名但需高熵一次性令牌及 Redis 限流。请求为 `{"token":"apanel_setup_...","username":"admin","email":"admin@example.com","password":"..."}`；成功返回 HTTP `201` 与安全的 `data.user`，不自动登录或返回敏感字段。
+- 错误包含 `INVALID_SETUP_TOKEN`（403）、`SETUP_ALREADY_COMPLETED`（409）、`SETUP_NOT_READY`（503）、`SETUP_RATE_LIMITED`（429）。令牌只在数据库中保存 SHA-256，并随创建管理员同事务消费；已完成初始化后永久禁用入口。
+
 ### `POST /auth/invitations`
 
 管理员创建一次邀请。

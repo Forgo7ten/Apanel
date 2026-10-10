@@ -23,6 +23,10 @@
 
 ## 用户密码与邀请
 
+首次安装由 `admin-bootstrap` 在 PostgreSQL 迁移后生成 48 字节随机令牌（URL-safe 编码）并原子写入宿主项目根目录 `.apanel-setup-token`，文件权限 `0600`，不会出现在构建镜像、前端 API 或容器日志。数据库只保存 SHA-256；Web `/setup` 页面通过 `POST /api/v1/setup/complete` 在 PostgreSQL 锁保护的单事务中创建管理员、删除令牌哈希并写入永久完成状态。状态公开查询只返回 `NOT_READY`、`PENDING`、`COMPLETED`。限流通过 Redis 共享计数器限制每分钟最多 30 次请求，Redis 不可用时拒绝初始化。Setup Token 不通过 URL 或查询字符串传递。生产入口必须启用 HTTPS。
+
+令牌文件保留时只代表历史凭据；数据库已 `COMPLETED` 的令牌永久失效。项目所有者可以手动删除。仅一次性容器挂载宿主项目根目录写权限，Backend 和 Frontend 不可访问该目录。失去尚未使用的令牌时，管理员可以在服务器运行显式 `--rotate` 命令恢复，不能通过 Web 匿名生成令牌。
+
 - 用户密码使用 Argon2id 哈希，不保存明文。
 - 登录查询不到用户时仍使用 dummy password hash 做验证，避免简单的用户枚举时间差。
 - 邀请 token 使用高熵 URL-safe 随机值；数据库只保存 SHA-256 哈希，原始 token 只在创建邀请的响应中返回一次。

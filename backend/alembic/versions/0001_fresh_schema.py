@@ -82,6 +82,19 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("market", "trade_date"),
     )
     op.create_table(
+        "installation_setup",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("token_hash", sa.String(length=64), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_table(
         "users",
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("username", sa.String(length=64), nullable=False),

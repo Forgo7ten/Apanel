@@ -6,7 +6,7 @@ Apanel 不预测价格、不提供买卖建议，也不执行自动交易。当�
 
 ## 当前能力
 
-- 管理员初始化、邀请注册、登录、刷新和退出登录。
+- 首次 Web 初始化向导、一次性管理员创建、邀请注册、登录、刷新和退出登录。
 - FastAPI 后端提供证券查询、动态 Watch Table、指标/状态历史、提醒规则、通知记录和用户设置 API，统一使用 JSON 成功/错误响应。
 - 可插拔指标注册表内置 MA、Projected MA、RSI、KDJ、BOLL、MACD；历史计算提供线性 series path，并把结果按参数与 `qfq`/`none` 口径持久化。
 - 状态引擎内置交叉、方向、带宽变化和突破状态；状态按参数 identity 与复权口径保存，可直接作为 Alert 条件。
@@ -49,7 +49,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-首次启动会等待 PostgreSQL 和 Redis 就绪，运行 `alembic upgrade head`，再启动 Market Data Hub、证券主数据 bootstrap、Backend、Celery worker/Beat、Frontend 和 Nginx。默认访问地址：
+首次启动会等待 PostgreSQL 和 Redis 就绪，运行 `alembic upgrade head`，再运行一次性的 `admin-bootstrap`（仅新库生成根目录 `.apanel-setup-token`）、启动 Market Data Hub、证券主数据 bootstrap、Backend、Celery worker/Beat、Frontend 和 Nginx。默认访问地址：
 
 - Web：<http://localhost:8080>
 - Nginx 存活检查：<http://localhost:8080/health>
@@ -70,14 +70,15 @@ DOCKER_BUILD_NETWORK=host
 
 ## 初始化管理员
 
-迁移完成且后端容器健康后，创建第一个管理员：
+首次安装无需命令创建管理员。查看项目根目录的一次性令牌：
 
 ```bash
-docker compose exec backend python -m app.cli bootstrap-admin \
-  --username admin --email admin@example.com
+cat .apanel-setup-token
 ```
 
-命令会交互式读取并确认至少 8 个字符的密码。第一个管理员只能创建一次；管理员登录后可调用 `POST /api/v1/auth/invitations` 创建邀请，再让受邀用户使用 `/register#token=<token>` 完成注册。
+打开 `http://localhost:8080/setup`，填写令牌、用户名、邮箱和密码，完成首次初始化。令牌文件仅供部署服务器本地查看（权限 `0600`），不会被提交到 Git；创建成功后数据库中的令牌哈希立即清空，文件即使保留也不能重复使用。可以手工 `rm .apanel-setup-token` 清理。
+
+重复启动会跳过已完成的初始化，绝不重置管理员密码。如果首次创建前丢失了令牌文件，可在确认数据库仍未初始化后运行 `docker compose run --rm admin-bootstrap python -m app.cli prepare-setup --output /setup-root/.apanel-setup-token --rotate` 轮换；旧令牌立即失效。管理员登录后仍可使用邀请注册。
 
 ## 验证当前仓库
 

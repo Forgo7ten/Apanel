@@ -2,6 +2,8 @@
 
 Compose 从仓库根目录的 `.env` 读取变量。`.env.example` 是本地模板，`.env` 被 Git 忽略；不要提交真实凭据。
 
+首次管理员账号、邮箱和密码**不需要**配置到 `.env`。一次性 `admin-bootstrap` 任务在 `migrate` 完成后生成项目根目录的 `.apanel-setup-token`，通过浏览器 `/setup` 完成设置。初始化完成后该令牌永久失效；请保护项目根目录访问权限。
+
 ## Compose 入口变量
 
 | 变量 | 默认值/要求 | 作用 |

@@ -59,6 +59,26 @@ services:
     networks:
       - apanel
 
+  admin-bootstrap:
+    build:
+      <<: *build-settings
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      APP_ENV: ${APP_ENV:?APP_ENV is required; copy .env.example to .env}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-apanel}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required; copy .env.example to .env}@postgres:5432/${POSTGRES_DB:-apanel}
+    command: ["python", "-m", "app.cli", "prepare-setup", "--output", "/setup-root/.apanel-setup-token"]
+    volumes:
+      - type: bind
+        source: .
+        target: /setup-root
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - apanel
+
   market-data-hub:
     build:
       <<: *build-settings
@@ -191,6 +211,8 @@ services:
       market-data-hub:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      admin-bootstrap:
         condition: service_completed_successfully
     healthcheck:
       test:

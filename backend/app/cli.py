@@ -22,6 +22,7 @@ from app.core.config import get_settings
 from app.core.errors import ApiError
 from app.db.session import create_engine, dispose_engine
 from app.services.auth_service import bootstrap_admin
+from app.services.installation_setup import prepare_setup
 from app.services.trading_calendar_import import import_annual_calendar, parse_annual_calendar
 
 
@@ -41,6 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap = commands.add_parser("bootstrap-admin", help="Create the first administrator")
     bootstrap.add_argument("--username")
     bootstrap.add_argument("--email")
+    setup = commands.add_parser("prepare-setup", help="Generate one-time Web setup token")
+    setup.add_argument("--output", type=Path, required=True)
+    setup.add_argument("--rotate", action="store_true")
     securities = commands.add_parser(
         "bootstrap-securities",
         help="Synchronize security metadata from the market-data provider",
@@ -91,6 +95,18 @@ async def _bootstrap_admin(args: argparse.Namespace) -> int:
     finally:
         await dispose_engine(engine)
     print(f"Created administrator {user.username} (id={user.id}).")
+    return 0
+
+
+async def _prepare_setup(args: argparse.Namespace, settings: Any) -> int:
+    settings.validate_database_credentials()
+    engine = create_engine(settings.database_url)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            result = await prepare_setup(session, output=args.output, rotate=args.rotate)
+    finally:
+        await dispose_engine(engine)
+    print(f"Web setup: {result.lower()}; token file: {args.output}")
     return 0
 
 
@@ -319,6 +335,8 @@ def main(
     try:
         if args.command == "bootstrap-admin":
             return asyncio.run(_bootstrap_admin(args))
+        if args.command == "prepare-setup":
+            return asyncio.run(_prepare_setup(args, settings or get_settings()))
         if args.command == "import-trading-calendar":
             return asyncio.run(_import_trading_calendar(args, settings or get_settings()))
         if args.command == "bootstrap-securities":

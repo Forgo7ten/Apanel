@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { AuthFrame } from "@/components/auth/AuthFrame";
 import { LoginForm } from "@/components/auth/LoginForm";
+import { SetupGuard } from "@/components/auth/SetupGuard";
 
 export const metadata = {
   title: "登录",
@@ -9,7 +10,7 @@ export const metadata = {
 
 export default function LoginPage() {
   return (
-    <AuthFrame
+    <SetupGuard><AuthFrame
       eyebrow="Secure access"
       title="登录 Apanel"
       description="使用你的账号进入指标监控工作台。"
@@ -21,6 +22,6 @@ export default function LoginPage() {
       }
     >
       <LoginForm />
-    </AuthFrame>
+    </AuthFrame></SetupGuard>
   );
 }

@@ -78,16 +78,25 @@ curl -i http://localhost:8080/api/v1/health
 
 三条路径分别检查 Nginx、Next.js 和后端。后端健康响应会探测 PostgreSQL 和 Redis；依赖不可用时返回 HTTP `503`。
 
-## 创建管理员
+## 首次 Web 初始化管理员
 
-后端健康后只需执行一次：
+在第一次启动并等待 `admin-bootstrap` 一次性任务完成后，项目根目录会生成仅项目目录所有者可读的初始化令牌（权限为 `0600`）：
 
 ```bash
-docker compose exec backend python -m app.cli bootstrap-admin \
-  --username admin --email admin@example.com
+docker compose ps admin-bootstrap
+cat .apanel-setup-token
 ```
 
-命令会读取两次管理员密码。用户名至少 3 个字符，密码至少 8 个字符。若数据库中已有管理员，命令会以 `ADMIN_ALREADY_EXISTS` 失败，不会覆盖已有账号。
+访问 <http://localhost:8080/setup>，输入令牌，设定首位管理员的用户名、邮箱、密码和确认密码。用户名至少 3 字符，密码至少 8 字符。系统使用 Argon2id 保存密码哈希；成功时创建管理员并在同一事务内清空令牌哈希、持久标记 `COMPLETED`。此后即使令牌文件仍在、管理员被删除或服务重新启动，也不会再允许首次初始化；可用 `rm .apanel-setup-token` 手动清理明文令牌文件。
+
+如果设置页面提示未就绪，先检查 `docker compose logs admin-bootstrap`。如果令牌在完成前遗失，管理员可在服务器上执行：
+
+```bash
+docker compose run --rm admin-bootstrap python -m app.cli prepare-setup \
+  --output /setup-root/.apanel-setup-token --rotate
+```
+
+此操作仅允许在尚未完成初始化时轮换令牌；不影响已创建的管理员，也不会重置完成状态。项目不提供通过删除令牌或账户来重开安装向导的捷径。
 
 打开 <http://localhost:8080/login> 登录。访问令牌返回在 JSON 中，刷新令牌只设置为 HttpOnly Cookie，浏览器不需要也不应该读取刷新令牌内容。
 

@@ -41,6 +41,7 @@ Nginx 的路由规则如下：
 | `postgres` | PostgreSQL 16，挂载 `postgres_data` | 自带 `pg_isready` 检查 |
 | `redis` | Redis 7，开启 AOF，挂载 `redis_data` | `redis-cli ping` 成功 |
 | `migrate` | 在后端镜像中执行 `alembic upgrade head` | PostgreSQL 健康 |
+| `admin-bootstrap` | 一次性准备首次安装令牌并写入项目根目录，已完成安装时跳过 | `migrate` 成功 |
 | `market-data-hub` | Provider routing、行情/分红同步、日历校验和共享行情持久化 | PostgreSQL、Redis 健康且迁移成功 |
 | `security-bootstrap` | 一次性同步证券主数据，provider 暂时不可用时独立重试 | `market-data-hub` 健康 |
 | `backend` | 认证、证券、Watch、Settings、指标/状态、Alert、Notification API | PostgreSQL、Redis、行情数据中枢健康且迁移成功 |
