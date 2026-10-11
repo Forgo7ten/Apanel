@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, Request
+from fastapi import BackgroundTasks, Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,7 +41,9 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:  # noqa
     return user
 
 
-def get_security_bootstrap_scheduler() -> SecurityBootstrapScheduler:
-    from app.tasks.bootstrap_scheduler import CelerySecurityBootstrapScheduler
+def get_security_bootstrap_scheduler(
+    background_tasks: BackgroundTasks,
+) -> SecurityBootstrapScheduler:
+    from app.tasks.bootstrap_scheduler import DeferredSecurityBootstrapScheduler
 
-    return CelerySecurityBootstrapScheduler()
+    return DeferredSecurityBootstrapScheduler(background_tasks)

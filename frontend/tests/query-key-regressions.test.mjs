@@ -49,7 +49,7 @@ test("column mode transitions validate fields, state parameters and clear old id
     view_mode: "NUMBER", state_code: null, parameters: { period: 20, multiplier: 2, field: "upper" },
   });
   assert.throws(() => buildColumnModeUpdate({ indicatorType: "BOLL", viewMode: "NUMBER", parameters: base.parameters }), /字段/);
-  assert.deepEqual(columnModeParameters({ ...base, view_mode: "STATUS", parameters: { period: 9 } }, "NUMBER"), { period: 20, multiplier: 2 });
+  assert.deepEqual(columnModeParameters({ ...base, view_mode: "STATUS", parameters: { period: 9 } }, "NUMBER"), { period: 9 });
   assert.deepEqual(columnModeParameters({ ...base, view_mode: "COMPOSITE" }, "STATUS"), { period: 20, multiplier: 2 });
   assert.deepEqual(columnModeParameters({ indicator_type: "MA", view_mode: "COMPOSITE", parameters: { periods: [5, 10] } }, "STATUS"), { short_period: 5, long_period: 10 });
   assert.deepEqual(columnModeFields("MA", { periods: [5, 10] }).map((option) => option.value), ["ma5", "ma10"]);
@@ -105,4 +105,30 @@ test("confirm-delete, drag MIME payload, fixed header and expanded states have i
   assert.match(wizard, /createPortal\(/);
   assert.match(wizard, /trapDialogTab\(/);
   assert.match(wizard, /stopImmediatePropagation\(\)/);
+});
+
+test("custom indicator mode transitions retain exact periods and multipliers", async () => {
+  const { columnModeParameters, maModeNeedsConfirmation } = await import("../src/lib/column-mode-contract.mjs");
+  for (const [indicator_type, parameters] of [
+    ["BOLL", { period: 30, multiplier: 2.5 }],
+    ["MACD", { fast_period: 6, slow_period: 13, signal_period: 5 }],
+    ["RSI", { period: 21 }],
+    ["KDJ", { period: 14, k_period: 4, d_period: 3 }],
+  ]) for (const from of ["COMPOSITE", "STATUS", "NUMBER"]) for (const to of ["COMPOSITE", "STATUS", "NUMBER", "DELTA"]) {
+    assert.deepEqual(columnModeParameters({ indicator_type, view_mode: from, parameters: { ...parameters, field: "value" } }, to), parameters);
+  }
+  assert.deepEqual(columnModeParameters({ indicator_type: "MA", view_mode: "STATUS", parameters: { short_period: 20, long_period: 60 } }, "NUMBER"), { periods: [20, 60] });
+  assert.deepEqual(columnModeParameters({ indicator_type: "MA", view_mode: "NUMBER", parameters: { periods: [20, 60] } }, "STATUS"), { short_period: 20, long_period: 60 });
+  assert.equal(maModeNeedsConfirmation({ indicator_type: "MA", view_mode: "NUMBER", parameters: { periods: [5, 10, 30] } }, "STATUS"), true);
+});
+
+test("state column matching uses exact indicator identity and parameters", async () => {
+  const { stateMatchesIndicatorColumn, selectColumnStateHistory } = await import("../src/lib/state-column-contract.mjs");
+  const state = { indicator_type: "BOLL", state_code: "BOLL_WIDTH_NARROWING", parameters: { period: 30, multiplier: 2.5 } };
+  const matching = { indicator_type: "BOLL", view_mode: "COMPOSITE", parameters: { period: 30, multiplier: 2.5 } };
+  assert.equal(stateMatchesIndicatorColumn(state, matching), true);
+  assert.equal(stateMatchesIndicatorColumn(state, { ...matching, parameters: { period: 20, multiplier: 2 } }), false);
+  assert.equal(stateMatchesIndicatorColumn(state, { ...matching, indicator_type: "MACD" }), false);
+  assert.deepEqual(selectColumnStateHistory([state], matching), [state]);
+  assert.deepEqual(selectColumnStateHistory([state], { ...matching, parameters: { period: 20, multiplier: 2 } }), []);
 });

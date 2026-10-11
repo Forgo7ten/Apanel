@@ -40,7 +40,7 @@ export function normalizeSettings(input) {
 
   return {
     adjustType: source.adjust_type === "none" ? "none" : "qfq",
-    defaults: defaults.length > 0 ? defaults : DEFAULT_INDICATORS.slice(),
+    defaults,
     parameters: cloneParameters(indicatorSettings.parameters),
     density: displaySettings.density === "comfortable" ? "comfortable" : "compact",
     showStates: displaySettings.show_states !== false,

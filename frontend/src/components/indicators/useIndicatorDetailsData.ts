@@ -1,6 +1,7 @@
 "use client";
 
 import { queryKeys } from "@/lib/query-keys.mjs";
+import { selectColumnStateHistory } from "@/lib/state-column-contract.mjs";
 
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
@@ -60,7 +61,11 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
         parameter_key: selection.state.parameter_key,
       };
     }
-    return { indicator_type: selection.column.indicator_type ?? selection.column.type };
+    return {
+      indicator_type: selection.column.indicator_type ?? selection.column.type,
+      ...(selection.column.view_mode === "STATUS" && selection.column.state_code
+        ? { state_code: selection.column.state_code } : {}),
+    };
   }, [selection]);
   const stateQuery = useQuery({
     queryKey: queryKeys.stateHistory(symbol, range.start, range.end, adjustment, stateHistoryFilter),
@@ -84,7 +89,8 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
   ), [historyColumn, indicatorQuery.data?.items, parameterKey]);
   const stateItems = useMemo(() => {
     const items = stateQuery.data?.items ?? [];
-    if (!selection || selection.kind !== "state") return items;
+    if (!selection) return [];
+    if (selection.kind === "indicator") return selectColumnStateHistory(items, selection.column);
     return selectStateHistory(items, selection.state.state_code ?? selection.state.state_id);
   }, [selection, stateQuery.data?.items]);
   const indicatorState = detailViewState({

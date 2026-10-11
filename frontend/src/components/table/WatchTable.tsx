@@ -217,7 +217,7 @@ function buildColumnDefs(
             <IndicatorCell
               mode={isDividendYieldColumn(column) ? "NUMBER" : column.view_mode === "DELTA" && !showDeltas ? "NUMBER" : column.view_mode}
               value={getIndicatorValue(row.original, column)}
-              states={row.original.states}
+              states={row.original.column_states?.[id] ?? []}
               percentage={isDividendYieldColumn(column)}
             />
           </button>

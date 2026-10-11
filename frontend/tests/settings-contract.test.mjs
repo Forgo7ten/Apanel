@@ -46,3 +46,10 @@ test("trims a replacement webhook only at the API boundary", () => {
 
   assert.equal(payload.notification_settings.feishu_webhook, "https://open.feishu.cn/open-apis/bot/v2/hook/example");
 });
+
+test("saved empty defaults are distinct from missing defaults", () => {
+  const saved = normalizeSettings({ indicator_settings: { defaults: [] } });
+  assert.deepEqual(saved.defaults, []);
+  assert.deepEqual(toSettingsPayload(saved).indicator_settings.defaults, []);
+  assert.deepEqual(normalizeSettings({}).defaults, ["MA", "RSI", "KDJ", "BOLL", "MACD"]);
+});

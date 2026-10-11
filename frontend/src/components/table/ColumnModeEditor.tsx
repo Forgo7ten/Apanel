@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import type { IndicatorParameters, IndicatorViewMode, UpdateColumnInput, WatchTableColumn } from "@/api/types";
 import { ALERT_STATE_OPTIONS } from "@/lib/notification-contract.mjs";
-import { buildColumnModeUpdate, columnModeFields, columnModeParameters } from "@/lib/column-mode-contract.mjs";
+import { buildColumnModeUpdate, columnModeFields, columnModeParameters, maModeNeedsConfirmation } from "@/lib/column-mode-contract.mjs";
 
 export function ColumnModeEditor({ column, mode, onSave, onCancel }: {
   column: WatchTableColumn;
@@ -22,10 +22,12 @@ export function ColumnModeEditor({ column, mode, onSave, onCancel }: {
   const [stateCode, setStateCode] = useState(column.view_mode === "STATUS" ? column.state_code ?? states[0]?.id ?? "" : states[0]?.id ?? "");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const requiresMaConfirmation = maModeNeedsConfirmation(column, mode);
+  const [maConfirmed, setMaConfirmed] = useState(false);
   const numeric = mode === "NUMBER" || mode === "DELTA";
 
   async function save() {
-    if (saving) return;
+    if (saving || (requiresMaConfirmation && !maConfirmed)) return;
     setError(null);
     try {
       const payload = buildColumnModeUpdate({ indicatorType: indicator, viewMode: mode, parameters, field, stateCode });
@@ -47,6 +49,12 @@ export function ColumnModeEditor({ column, mode, onSave, onCancel }: {
           <select value={stateCode} onChange={(event) => setStateCode(event.target.value)} disabled={saving || states.length === 0} className="mt-2 block w-full rounded-panel border border-line bg-card px-3 py-2 text-primary">
             {states.length === 0 ? <option value="">该指标暂无可选状态</option> : states.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.id}</option>)}
           </select>
+        </label>
+      ) : null}
+      {requiresMaConfirmation ? (
+        <label className="flex items-start gap-2 rounded-panel border border-line bg-card/40 p-3 text-xs leading-5 text-secondary">
+          <input type="checkbox" checked={maConfirmed} onChange={(event) => setMaConfirmed(event.target.checked)} disabled={saving} className="mt-1 accent-brand" />
+          <span>当前 MA 列不是双周期。转换为状态模式需要选定短周期和长周期，会改变该列的计算参数；请检查下方两个周期并确认。</span>
         </label>
       ) : null}
       {Object.entries(parameters).length ? (
@@ -72,7 +80,7 @@ export function ColumnModeEditor({ column, mode, onSave, onCancel }: {
       {error ? <p role="alert" className="text-xs text-negative">{error}</p> : null}
       <div className="flex justify-end gap-2 border-t border-line pt-3">
         <button type="button" onClick={onCancel} disabled={saving} className="rounded-panel border border-line px-3 py-2 text-xs text-secondary disabled:opacity-40">取消</button>
-        <button type="submit" disabled={saving || (mode === "STATUS" && states.length === 0)} className="rounded-panel bg-brand px-3 py-2 text-xs text-white disabled:opacity-50">{saving ? "保存中…" : "保存展示模式"}</button>
+        <button type="submit" disabled={saving || (mode === "STATUS" && states.length === 0) || (requiresMaConfirmation && !maConfirmed)} className="rounded-panel bg-brand px-3 py-2 text-xs text-white disabled:opacity-50">{saving ? "保存中…" : "保存展示模式"}</button>
       </div>
     </form>
   );

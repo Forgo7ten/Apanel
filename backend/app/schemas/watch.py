@@ -161,6 +161,8 @@ class WatchTableStockData(BaseModel):
     price: PriceData | None = None
     # Dynamic columns have a unique identity, even for repeated indicator types.
     column_values: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Active states belonging to the exact indicator and parameters of each column.
+    column_states: dict[str, list[CurrentStateData]] = Field(default_factory=dict)
     states: list[CurrentStateData] = Field(default_factory=list)
 
 

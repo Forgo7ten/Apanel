@@ -251,6 +251,11 @@ async def test_tab1_detail_matches_snapshot_parameters_and_projects_values(tab1_
         "direction": "DOWN",
     }
     assert stock["states"][0]["state_id"] == "BOLL_WIDTH_NARROWING"
+    assert [
+        item["state_code"] for item in stock["column_states"][str(boll_column.json()["data"]["id"])]
+    ] == ["BOLL_WIDTH_NARROWING"]
+    assert stock["column_states"][str(ma_column.json()["data"]["id"])] == []
+    assert stock["column_states"][str(bad_column.json()["data"]["id"])] == []
     assert stock["column_values"][str(bad_column.json()["data"]["id"])]["available"] is False
 
 
@@ -299,3 +304,51 @@ async def test_tab1_detail_isolated_and_bad_parameters_are_rejected(tab1_context
     _as_user(app, user_two)
     isolated = await client.get(f"/api/v1/watch-tables/{table_id}")
     assert isolated.status_code == 404
+
+
+async def test_custom_boll_state_appears_only_in_matching_column(tab1_context) -> None:
+    client, session_factory, user, _ = tab1_context
+    _as_user(client._transport.app, user)  # type: ignore[attr-defined]
+    async with session_factory() as session:
+        await seed_current_state(
+            session,
+            StateRow(
+                security_id=1,
+                trade_date=date(2026, 9, 23),
+                state_code="BOLL_WIDTH_NARROWING",
+                indicator_type="BOLL",
+                status="ACTIVE",
+                parameters={"period": 30, "multiplier": 2.5},
+                parameter_key=state_parameter_key(
+                    "BOLL_WIDTH_NARROWING", {"period": 30, "multiplier": 2.5}
+                ),
+                metadata={"name": "自定义带口收窄", "level": "WARNING", "active": True},
+            ),
+        )
+        await session.commit()
+
+    await client.put("/api/v1/settings", json={"indicator_settings": {"defaults": []}})
+    created = await client.post("/api/v1/watch-tables", json={"name": "自定义状态身份"})
+    table_id = created.json()["data"]["id"]
+    assert (
+        await client.post(f"/api/v1/watch-tables/{table_id}/stocks", json={"security_id": 1})
+    ).status_code == 201
+    ids = []
+    for parameters in [{"period": 20, "multiplier": 2}, {"period": 30, "multiplier": 2.5}]:
+        response = await client.post(
+            f"/api/v1/watch-tables/{table_id}/columns",
+            json={
+                "column_type": "INDICATOR",
+                "indicator_type": "BOLL",
+                "view_mode": "COMPOSITE",
+                "parameters": parameters,
+            },
+        )
+        assert response.status_code == 201, response.text
+        ids.append(str(response.json()["data"]["id"]))
+    detail = await client.get(f"/api/v1/watch-tables/{table_id}")
+    assert detail.status_code == 200
+    stock = detail.json()["data"]["stocks"][0]
+    assert [item["parameters"]["period"] for item in stock["column_states"][ids[0]]] == [20]
+    assert [item["parameters"]["period"] for item in stock["column_states"][ids[1]]] == [30]
+    assert {item["parameters"]["period"] for item in stock["states"]} == {20, 30}

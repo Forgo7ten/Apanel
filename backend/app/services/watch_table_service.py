@@ -233,6 +233,15 @@ class WatchTableService:
                     }
             visible_states = _visible_states(all_states, table.columns)
             state_data = [_state_data(state) for state in visible_states]
+            column_states = {
+                str(column.id): [
+                    _state_data(state)
+                    for state in all_states
+                    if _state_matches_column(state, column)
+                ]
+                for column in table.columns
+                if column.column_type.upper() in {"INDICATOR", "STATE"}
+            }
             stocks.append(
                 WatchTableStockData(
                     security_id=security.id,
@@ -258,6 +267,7 @@ class WatchTableService:
                     else None,
                     price=price,
                     column_values=column_values,
+                    column_states=column_states,
                     states=state_data,
                 )
             )
@@ -991,33 +1001,73 @@ def _column_parameter_key(indicator_type: str, parameters: Mapping[str, Any]) ->
     return parameter_key(indicator_type, _calculation_parameters(parameters))
 
 
-def _visible_states(states: Sequence[Any], columns: Sequence[TableColumn]) -> list[Any]:
-    explicit: set[tuple[str, str]] = set()
-    for column in columns:
-        if column.view_mode.upper() != "STATUS" or not column.state_code:
-            continue
-        explicit.add(
-            (
-                column.state_code.upper(),
-                state_parameter_key(column.state_code.upper(), dict(column.parameters or {})),
-            )
+def _state_matches_column(state: Any, column: TableColumn) -> bool:
+    """Associate an active state with one column's exact calculation identity.
+
+    State keys include the state code, while numeric column keys do not.  We
+    therefore compare their canonical calculation parameters, not key strings.
+    MA states are emitted only for a two-period variant, or the built-in 5/10
+    pair embedded in a larger MA variant (see state_service._state_variant_pairs).
+    """
+    if state.status != "ACTIVE":
+        return False
+    if column.column_type.upper() not in {"INDICATOR", "STATE"}:
+        return False
+    mode = column.view_mode.upper()
+    if mode == "STATUS" or column.column_type.upper() == "STATE":
+        if not column.state_code:
+            return False
+        code = column.state_code.upper()
+        try:
+            expected = state_parameter_key(code, dict(column.parameters or {}))
+        except (ApiError, TypeError, ValueError):
+            return False
+        return state.state_code.upper() == code and state.parameter_key == expected
+    indicator = _normalize_indicator_type(column.indicator_type)
+    if not indicator or indicator != _normalize_indicator_type(state.indicator_type):
+        return False
+    try:
+        own = canonicalize_parameters(
+            indicator, _calculation_parameters(dict(column.parameters or {})), fill_defaults=True
         )
+        observed = canonicalize_state_parameters(indicator, dict(state.parameters or {}))
+    except (ApiError, TypeError, ValueError):
+        return False
+    if indicator != "MA":
+        return own == observed
+    periods = own.get("periods", [own["period"]] if "period" in own else [])
+    if len(periods) == 2:
+        short, long = periods
+    elif len(periods) > 2 and {5, 10}.issubset(periods):
+        short, long = 5, 10
+    else:
+        return False
+    return observed == {"short_period": short, "long_period": long}
+
+
+def _visible_states(states: Sequence[Any], columns: Sequence[TableColumn]) -> list[Any]:
+    """Preserve default summary states and include active custom monitored variants."""
+    selected = {
+        (state.state_code, state.parameter_key)
+        for column in columns
+        for state in states
+        if _state_matches_column(state, column)
+    }
     visible = []
     for state in states:
         if state.status != "ACTIVE":
             continue
         parameters = dict(getattr(state, "parameters", {}) or {})
-        is_default_ma = parameters == {"short_period": 5, "long_period": 10}
         if getattr(state, "indicator_type", "") == "MA":
-            is_default = is_default_ma
+            is_default = parameters == {"short_period": 5, "long_period": 10}
         else:
             try:
-                is_default = parameters == canonicalize_parameters(
-                    state.indicator_type, None, fill_defaults=True
-                )
+                is_default = canonicalize_state_parameters(
+                    state.indicator_type, parameters
+                ) == canonicalize_parameters(state.indicator_type, None, fill_defaults=True)
             except ApiError:
                 is_default = False
-        if is_default or (state.state_code, state.parameter_key) in explicit:
+        if is_default or (state.state_code, state.parameter_key) in selected:
             visible.append(state)
     return visible
 

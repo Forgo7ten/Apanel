@@ -142,6 +142,7 @@ export type WatchTableStock = {
   analysis_revision?: number | null;
   price?: PriceSnapshot | number | string | null;
   column_values?: Record<string, IndicatorColumnValue>;
+  column_states?: Record<string, IndicatorState[]>;
   states?: IndicatorState[];
 };
 

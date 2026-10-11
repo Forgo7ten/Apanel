@@ -670,7 +670,10 @@ def enqueue_security_bootstrap(symbol: str) -> None:
     if get_settings().app_env.casefold() == "test":
         return
     try:
-        bootstrap_security_data.delay(symbol)
+        bootstrap_security_data.apply_async(
+            args=(symbol,),
+            retry=False,
+        )
     except Exception:
         logger.warning(
             "security_bootstrap_enqueue_failed",
