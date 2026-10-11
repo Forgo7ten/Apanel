@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.alert import AlertRepository
@@ -15,6 +17,11 @@ class NotificationRepository:
 
     async def list_for_user(self, user_id: int, *, limit: int = 100) -> list:
         return await self._repository.list_notifications(user_id, limit=limit)
+
+    async def history_page_for_user(
+        self, user_id: int, *, limit: int, before: tuple[datetime, int] | None = None
+    ) -> list:
+        return await self._repository.notification_history_page(user_id, limit=limit, before=before)
 
 
 __all__ = ["NotificationRepository"]

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -175,6 +175,35 @@ class AlertRepository:
         if state_date is None:
             return snapshot_date
         return max(snapshot_date, state_date)
+
+    async def notification_history_page(
+        self,
+        user_id: int,
+        *,
+        limit: int,
+        before: tuple[datetime, int] | None = None,
+    ) -> list[Notification]:
+        """Stable keyset pagination, scoped before ordering and limits."""
+        statement = (
+            select(Notification)
+            .where(Notification.user_id == user_id)
+            .options(joinedload(Notification.security), joinedload(Notification.alert_rule))
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
+            .limit(limit + 1)
+        )
+        if before is not None:
+            created_at, notification_id = before
+            statement = statement.where(
+                or_(
+                    Notification.created_at < created_at,
+                    and_(Notification.created_at == created_at, Notification.id < notification_id),
+                )
+            )
+        return list(
+            (
+                await self.session.execute(statement.execution_options(populate_existing=True))
+            ).scalars()
+        )
 
     async def list_notifications(self, user_id: int, *, limit: int = 100) -> list:
         statement = (

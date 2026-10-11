@@ -1,5 +1,5 @@
 import type { AlertRule } from "@/api/types";
-import { ALERT_STATE_OPTIONS } from "@/lib/notification-contract.mjs";
+import { ALERT_STATE_OPTIONS, alertThresholdLabel } from "@/lib/notification-contract.mjs";
 import { stateToneFromLevel, StateTag } from "@/components/ui/StateTag";
 
 const stateById = new Map(ALERT_STATE_OPTIONS.map((option) => [option.id, option]));
@@ -23,7 +23,7 @@ function getConditionLabel(rule: AlertRule): string {
   }
 
   const indicator = rule.indicator ?? rule.indicator_type ?? "指标";
-  return `${indicator} ${rule.operator ?? ""} ${rule.threshold ?? ""}`.trim();
+  return `${indicator} ${rule.operator ?? ""} ${alertThresholdLabel(indicator, rule.threshold)}`.trim();
 }
 
 export function AlertCard({
@@ -95,7 +95,7 @@ export function AlertCard({
       </div>
 
       <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-line/70 pt-3 text-[11px] text-muted">
-        <span>渠道：飞书 Webhook</span>
+        <span>渠道：Webhook 通知</span>
         {rule.created_at ? <span>创建于：{formatDate(rule.created_at)}</span> : null}
         <span className="font-mono">规则 #{String(rule.id)}</span>
       </div>

@@ -23,9 +23,11 @@ declare module "@/lib/watch-contract.mjs" {
     targetId: string | number,
     position?: "before" | "after",
   ): Array<string | number>;
+  export function reorderStockIdsForDrop(ids: Array<number | string>, sourceId: number | string, targetId: number | string): Array<number | string> | null;
   export const WATCH_DETAIL_REFRESH_INTERVAL_MS: number;
   export const WATCH_BOOTSTRAP_POLL_INTERVAL_MS: number;
   export const WATCH_BOOTSTRAP_TIMEOUT_MS: number;
+  export function watchRefreshInterval(detail: unknown, firstObserved: Map<string, number>, now?: number): number;
   export function isWatchStockDataReady(stock: unknown, columns?: unknown[]): boolean;
   export function expectedCompositeFieldCount(columns?: unknown[]): number;
   export function filterWatchStocks(

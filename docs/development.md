@@ -154,3 +154,7 @@ APP_ENV=test APANEL_BENCHMARK_POSTGRES_URL="$DEDICATED_EMPTY_BENCHMARK_URL" \
 ```
 
 脚本覆盖 qfq/none 的冷物化、次日增量和同日幂等重放；结果写到仓库外的临时目录，**不得提交测试 JSON 或跑分报告**。它统计耗时、SQL 数、实际存储行数和 Python 进程峰值 RSS。它不调用真实行情源、Alert 或飞书，因此不是完整 EOD 端到端耗时；生成数据与初始建表不计入阶段耗时。`per_stream_p95_ms` 表示这一轮股票/复权序列之间的分位数，不是多轮负载压测的服务 SLA。
+
+### 前端 Query Key 一致性
+
+所有 TanStack Query 的读取、更新、失效、取消与移除都统一使用 `frontend/src/lib/query-keys.mjs`。Watch 明细完整键包含表 ID 和复权口径：`queryKeys.watchTable(id, adjustment)`。当同一业务变更会影响两个复权口径时使用 `queryClient.setQueriesData({ queryKey: queryKeys.watchTablePrefix(id) }, updater)`，**不要**把 `watchTablePrefix` 传给单值 `setQueryData`，否则会生成没有消费者的幽灵缓存。删除表格使用同一前缀移除所有复权明细，历史通知使用 `queryKeys.notificationHistory()` 与后端游标分页。新增查询键/写入路径需运行 `frontend/tests/query-key-regressions.test.mjs`。

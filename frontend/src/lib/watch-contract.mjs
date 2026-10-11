@@ -115,6 +115,29 @@ export const WATCH_DETAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 export const WATCH_BOOTSTRAP_POLL_INTERVAL_MS = 5 * 1000;
 export const WATCH_BOOTSTRAP_TIMEOUT_MS = 2 * 60 * 1000;
 
+/**
+ * Fast-poll only streams observed as incomplete by the backend, with a bounded
+ * window from first observation even after a refetch or a browser reload.
+ * The Map is local to the mounted watch page and never shared across accounts.
+ */
+export function watchRefreshInterval(detail, firstObserved, now = Date.now()) {
+  if (!detail || !Array.isArray(detail.stocks)) return WATCH_DETAIL_REFRESH_INTERVAL_MS;
+  const scope = `${detail.id}:${detail.adjust_type ?? "qfq"}:`;
+  const pending = new Set();
+  let fastPoll = false;
+  for (const stock of detail.stocks) {
+    if (isWatchStockDataReady(stock, detail.columns)) continue;
+    const key = `${scope}${stock.security_id}`;
+    pending.add(key);
+    if (!firstObserved.has(key)) firstObserved.set(key, now);
+    if (now - firstObserved.get(key) < WATCH_BOOTSTRAP_TIMEOUT_MS) fastPoll = true;
+  }
+  for (const key of firstObserved.keys()) {
+    if (key.startsWith(scope) && !pending.has(key)) firstObserved.delete(key);
+  }
+  return fastPoll ? WATCH_BOOTSTRAP_POLL_INTERVAL_MS : WATCH_DETAIL_REFRESH_INTERVAL_MS;
+}
+
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -351,4 +374,16 @@ export function virtualScrollTopForKey(
     default:
       return null;
   }
+}
+
+/** Only a complete, unique set of IDs may be submitted to the reorder API. */
+export function reorderStockIdsForDrop(ids, sourceId, targetId) {
+  if (!Array.isArray(ids) || ids.some((id) => id === null || id === undefined) || new Set(ids.map(String)).size !== ids.length) return null;
+  const source = ids.findIndex((id) => String(id) === String(sourceId));
+  const target = ids.findIndex((id) => String(id) === String(targetId));
+  if (source < 0 || target < 0 || source === target) return null;
+  const result = [...ids];
+  const [moved] = result.splice(source, 1);
+  result.splice(target, 0, moved);
+  return result;
 }

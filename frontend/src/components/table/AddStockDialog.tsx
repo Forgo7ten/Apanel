@@ -1,5 +1,7 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type RefObject } from "react";
 
@@ -32,7 +34,7 @@ export function AddStockDialog({
   const [selected, setSelected] = useState<Security | null>(null);
   const trimmedQuery = query.trim();
   const searchQuery = useQuery({
-    queryKey: ["securities", "search", trimmedQuery],
+    queryKey: queryKeys.securitySearch(trimmedQuery),
     queryFn: () => searchSecurities(trimmedQuery),
     enabled: trimmedQuery.length >= 2,
     staleTime: 60_000,
@@ -44,8 +46,8 @@ export function AddStockDialog({
       if (payload === null) throw new Error("搜索结果缺少 security_id，暂时无法添加。");
       return addStockToWatchTable(tableId, payload);
     },
-    onSuccess: (stock) => {
-      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => {
+    onSuccess: async (stock) => {
+      queryClient.setQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) }, (current) => {
         if (!current) return current;
         if (current.stocks.some((item) => String(item.security_id) === String(stock.security_id))) {
           return current;
@@ -53,13 +55,17 @@ export function AddStockDialog({
         const stocks = [...current.stocks, stock];
         return { ...current, stocks, stock_count: stocks.length };
       });
-      queryClient.setQueryData<WatchTableSummary[]>(["watch-tables"], (current) => current?.map((summary) => (
+      queryClient.setQueryData<WatchTableSummary[]>(queryKeys.watchTables(), (current) => current?.map((summary) => (
         String(summary.id) === String(tableId)
           ? { ...summary, stock_count: summary.stock_count + 1 }
           : summary
       )));
       onAdded?.(stock);
       onClose();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTables() }),
+      ]);
     },
   });
   const pendingRef = useRef(false);

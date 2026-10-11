@@ -1,5 +1,7 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import {
   flexRender,
   getCoreRowModel,
@@ -12,11 +14,11 @@ import {
 } from "@tanstack/react-table";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import type {
   Identifier,
   IndicatorState,
-  IndicatorViewMode,
   UpdateColumnInput,
   WatchTableColumn,
   WatchTableDetails,
@@ -26,6 +28,7 @@ import type {
 import {
   deleteWatchTableColumn,
   removeStockFromWatchTable,
+  reorderWatchTableStocks,
   reorderWatchTableColumns,
   updateWatchTableColumn,
 } from "@/api/watch";
@@ -34,12 +37,11 @@ import { IndicatorCell } from "@/components/indicators/IndicatorCell";
 import { isApiError } from "@/lib/api-errors";
 import { isDetailActivationKey } from "@/lib/detail-contract.mjs";
 import {
-  calculateVirtualRange,
   expectedCompositeFieldCount,
   filterWatchStocks,
   reorderColumnIdsForDrop,
+  reorderStockIdsForDrop,
   toColumnOrderPayload,
-  virtualScrollTopForKey,
   WATCH_COMPOSITE_LAYOUT,
   watchRowLayoutContract,
 } from "@/lib/watch-contract.mjs";
@@ -54,13 +56,11 @@ import {
 
 import { ColumnManager, type ColumnManagerItem } from "./ColumnManager";
 
-const WATCH_OVERSCAN = 4;
-const DEFAULT_VIEWPORT_HEIGHT = 560;
 const DEFAULT_COLUMN_WIDTHS = {
   security: 190,
   price: 120,
   states: 220,
-  actions: 88,
+  actions: 135,
   scalar: 132,
   composite: 220,
 } as const;
@@ -115,27 +115,68 @@ function SortableHeader({ header }: { header: Header<WatchTableStock, unknown> }
 }
 
 function StateList({ states, onOpen }: { states: IndicatorState[]; onOpen?: (state: IndicatorState, trigger: HTMLButtonElement) => void }) {
-  if (states.length === 0) return <span className="text-xs text-muted">—</span>;
+  const [expanded, setExpanded] = useState(false);
+  const [anchor, setAnchor] = useState<{ left: number; top: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const overflow = states.slice(WATCH_COMPOSITE_LAYOUT.maxStateTags);
 
+  useEffect(() => {
+    if (!expanded) return;
+    popoverRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); setExpanded(false); triggerRef.current?.focus(); }
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (!popoverRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) setExpanded(false);
+    };
+    const onScroll = (event: Event) => {
+      // Scrolling inside the expanded list must not dismiss it.
+      if (!popoverRef.current?.contains(event.target as Node)) setExpanded(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [expanded]);
+
+  if (states.length === 0) return <span className="text-xs text-muted">—</span>;
   return (
-    <div className="flex h-5 max-w-[260px] flex-nowrap items-center gap-1 overflow-x-auto">
+    <div className="flex h-6 max-w-[260px] flex-nowrap items-center gap-1 overflow-x-auto">
       {states.slice(0, WATCH_COMPOSITE_LAYOUT.maxStateTags).map((state) => (
         <button
-          key={state.state_id}
+          key={`${state.state_id}-${state.parameter_key ?? ""}`}
           type="button"
           onClick={(event) => onOpen?.(state, event.currentTarget)}
-          onKeyDown={(event) => {
-            if (!isDetailActivationKey(event.key)) return;
-            event.preventDefault();
-            onOpen?.(state, event.currentTarget);
-          }}
           className="rounded-full focus:outline-none focus:ring-2 focus:ring-brand/40"
           aria-label={`查看状态${state.title}详情`}
         >
           <StateTag compact tone={stateToneFromLevel(state.level ?? state.severity)}>{state.title}</StateTag>
         </button>
       ))}
-      {states.length > WATCH_COMPOSITE_LAYOUT.maxStateTags ? <span className="shrink-0 self-center text-[11px] text-muted">+{states.length - WATCH_COMPOSITE_LAYOUT.maxStateTags}</span> : null}
+      {overflow.length ? (
+        <button ref={triggerRef} type="button" aria-expanded={expanded} aria-label={`展开其余${overflow.length}个状态`} onClick={() => {
+          if (expanded) { setExpanded(false); return; }
+          const bounds = triggerRef.current?.getBoundingClientRect();
+          if (!bounds) return;
+          setAnchor({ left: Math.max(8, Math.min(bounds.left, window.innerWidth - 290)), top: Math.max(8, Math.min(bounds.bottom + 6, window.innerHeight - 120)) });
+          setExpanded(true);
+        }} className="shrink-0 rounded px-1 text-xs text-brand hover:bg-brand/10 focus:outline-none focus:ring-2 focus:ring-brand/40">+{overflow.length}</button>
+      ) : null}
+      {expanded && anchor ? createPortal(
+        <div ref={popoverRef} role="group" aria-label="更多股票状态" className="fixed z-40 max-h-[min(60vh,20rem)] w-72 space-y-1 overflow-y-auto rounded-panel border border-line bg-panel p-2 shadow-panel" style={anchor}>
+          {overflow.map((state) => (
+            <button key={`${state.state_id}-${state.parameter_key ?? ""}`} type="button" className="block w-full rounded px-2 py-2 text-left text-xs text-secondary hover:bg-card" onClick={(event) => {
+              onOpen?.(state, triggerRef.current ?? event.currentTarget);
+              setExpanded(false);
+            }}>{state.title}{state.parameters && Object.keys(state.parameters).length ? <span className="mt-1 block text-[10px] text-muted">{Object.entries(state.parameters).map(([key, value]) => `${key}=${value}`).join("、")}</span> : null}</button>
+          ))}
+        </div>, document.body
+      ) : null}
     </div>
   );
 }
@@ -249,7 +290,13 @@ function buildColumnDefs(
 function buildActionColumn({
   onRemove,
   pendingSecurityId,
+  onMove,
+  canMove = false,
+  stockOrder = [],
 }: {
+  onMove?: (securityId: Identifier, offset: -1 | 1) => void;
+  canMove?: boolean;
+  stockOrder?: Identifier[];
   onRemove?: (securityId: Identifier) => void;
   pendingSecurityId?: Identifier;
 }): ColumnDef<WatchTableStock, unknown> {
@@ -261,7 +308,11 @@ function buildActionColumn({
       const securityId = row.original.security_id;
       if (securityId === undefined || securityId === null || !onRemove) return <span className="text-xs text-muted">—</span>;
       const pending = pendingSecurityId !== undefined && String(pendingSecurityId) === String(securityId);
+      const index = stockOrder.findIndex((id) => String(id) === String(securityId));
       return (
+        <div className="flex items-center gap-1">
+        <button type="button" title="上移股票" aria-label={`上移${row.original.name ?? row.original.symbol}`} disabled={!canMove || index <= 0} onClick={() => onMove?.(securityId, -1)} className="text-xs text-muted disabled:opacity-30">↑</button>
+        <button type="button" title="下移股票" aria-label={`下移${row.original.name ?? row.original.symbol}`} disabled={!canMove || index < 0 || index === stockOrder.length - 1} onClick={() => onMove?.(securityId, 1)} className="text-xs text-muted disabled:opacity-30">↓</button>
         <button
           type="button"
           disabled={pending}
@@ -271,6 +322,7 @@ function buildActionColumn({
         >
           {pending ? "删除中…" : "移除"}
         </button>
+        </div>
       );
     },
     meta: { label: "操作", movable: false, toggleable: false },
@@ -341,11 +393,11 @@ export function WatchTable({
   const [actionError, setActionError] = useState<string | null>(null);
   const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
   const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const viewportRef = useRef<HTMLDivElement | null>(null);
-  const [scrollTop, setScrollTop] = useState(0);
+  const [draggedStockId, setDraggedStockId] = useState<Identifier | null>(null);
+  const tableViewportRef = useRef<HTMLDivElement>(null);
+  const [fixedHeader, setFixedHeader] = useState<{ left: number; width: number; scrollLeft: number } | null>(null);
   const [filterQuery, setFilterQuery] = useState("");
   const [stateFilter, setStateFilter] = useState("ALL");
-  const [viewportHeight, setViewportHeight] = useState(DEFAULT_VIEWPORT_HEIGHT);
   const tableId = table.id;
 
   const openIndicatorDetail = useCallback((stock: WatchTableStock, column: WatchTableColumn, trigger: HTMLButtonElement) => {
@@ -368,33 +420,55 @@ export function WatchTable({
     mutationFn: ({ securityId }: { securityId: Identifier }) => removeStockFromWatchTable(tableId, securityId),
     onMutate: () => setActionError(null),
     onSuccess: async (_result, variables) => {
-      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => {
+      queryClient.setQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) }, (current) => {
         if (!current) return current;
         const stocks = current.stocks.filter((stock) => String(stock.security_id) !== String(variables.securityId));
         return { ...current, stocks, stock_count: stocks.length };
       });
-      queryClient.setQueryData<WatchTableSummary[]>(["watch-tables"], (current) => current?.map((summary) => (
+      queryClient.setQueryData<WatchTableSummary[]>(queryKeys.watchTables(), (current) => current?.map((summary) => (
         String(summary.id) === String(tableId) ? { ...summary, stock_count: Math.max(0, summary.stock_count - 1) } : summary
       )));
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTables() }),
       ]);
     },
     onError: (error) => setActionError(mutationErrorMessage(error)),
+  });
+
+  const reorderStockMutation = useMutation({
+    mutationFn: (securityIds: Identifier[]) => reorderWatchTableStocks(tableId, securityIds),
+    onMutate: async (securityIds) => {
+      setActionError(null);
+      await queryClient.cancelQueries({ queryKey: queryKeys.watchTablePrefix(tableId) });
+      const previous = queryClient.getQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) });
+      queryClient.setQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) }, (current) => {
+        if (!current) return current;
+        const byId = new Map(current.stocks.map((stock) => [String(stock.security_id), stock]));
+        if (securityIds.length !== current.stocks.length || securityIds.some((id) => !byId.has(String(id)))) return current;
+        return { ...current, stocks: securityIds.map((id) => byId.get(String(id))!) };
+      });
+      return { previous };
+    },
+    onError: (error, _ids, context) => {
+      context?.previous.forEach(([key, value]) => queryClient.setQueryData<WatchTableDetails>(key, value));
+      setActionError(mutationErrorMessage(error));
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) });
+    },
   });
 
   const updateColumnMutation = useMutation({
     mutationFn: ({ columnId, input }: { columnId: Identifier; input: UpdateColumnInput }) => updateWatchTableColumn(columnId, input),
     onMutate: () => setActionError(null),
     onSuccess: async (updated) => {
-      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => current ? {
+      queryClient.setQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) }, (current) => current ? {
         ...current,
         columns: current.columns.map((column) => String(column.id) === String(updated.id) ? updated : column),
       } : current);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) }),
       ]);
     },
     onError: (error) => setActionError(mutationErrorMessage(error)),
@@ -404,10 +478,9 @@ export function WatchTable({
     mutationFn: (columnIds: Identifier[]) => reorderWatchTableColumns(tableId, columnIds),
     onMutate: () => setActionError(null),
     onSuccess: async (updatedColumns) => {
-      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => current ? { ...current, columns: updatedColumns } : current);
+      queryClient.setQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) }, (current) => current ? { ...current, columns: updatedColumns } : current);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) }),
       ]);
     },
     onError: (error) => setActionError(mutationErrorMessage(error)),
@@ -417,13 +490,12 @@ export function WatchTable({
     mutationFn: (columnId: Identifier) => deleteWatchTableColumn(columnId),
     onMutate: () => setActionError(null),
     onSuccess: async (_result, columnId) => {
-      queryClient.setQueryData<WatchTableDetails>(["watch-table", tableId], (current) => current ? {
+      queryClient.setQueriesData<WatchTableDetails>({ queryKey: queryKeys.watchTablePrefix(tableId) }, (current) => current ? {
         ...current,
         columns: current.columns.filter((column) => String(column.id) !== String(columnId)),
       } : current);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) }),
       ]);
     },
     onError: (error) => setActionError(mutationErrorMessage(error)),
@@ -433,23 +505,6 @@ export function WatchTable({
     () => [...(table.columns ?? [])].sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER)),
     [table.columns],
   );
-  const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
-  const removeStock = removeStockMutation.mutate;
-  const baseColumnDefs = useMemo(
-    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas, isBootstrapping),
-    [columns, isBootstrapping, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas],
-  );
-  const columnDefs = useMemo(
-    () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId })],
-    [baseColumnDefs, pendingSecurityId, removeStock],
-  );
-  const allColumnIds = useMemo(() => columnDefs.map((column) => String(column.id)), [columnDefs]);
-  const dynamicColumnIds = useMemo(() => columns.map(columnId), [columns]);
-  const initialVisibility = useMemo(() => toVisibility(columns), [columns]);
-  const serverView = useMemo(() => ({
-    order: ["security", "price", ...dynamicColumnIds, "states", "actions"],
-    visibility: { security: true, price: true, ...initialVisibility, states: workspaceSettings.showStates, actions: true },
-  }), [dynamicColumnIds, initialVisibility, workspaceSettings.showStates]);
   const {
     columnOrder,
     columnVisibility,
@@ -458,6 +513,24 @@ export function WatchTable({
     setColumnVisibility,
     setSorting,
   } = useWatchStore();
+  const pendingSecurityId = removeStockMutation.isPending ? removeStockMutation.variables?.securityId : undefined;
+  const removeStock = removeStockMutation.mutate;
+  const baseColumnDefs = useMemo(
+    () => buildColumnDefs(columns, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas, isBootstrapping),
+    [columns, isBootstrapping, openIndicatorDetail, openStateDetail, workspaceSettings.showDeltas],
+  );
+  const columnDefs = useMemo(
+    () => [...baseColumnDefs, buildActionColumn({ onRemove: (securityId) => removeStock({ securityId }), pendingSecurityId, onMove: moveStockByOffset, canMove: !filterQuery.trim() && stateFilter === "ALL" && sorting.length === 0 && !reorderStockMutation.isPending, stockOrder: table.stocks.map((stock) => stock.security_id).filter((id): id is Identifier => id != null) })],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [baseColumnDefs, pendingSecurityId, removeStock, filterQuery, stateFilter, sorting, reorderStockMutation.isPending, table.stocks],
+  );
+  const allColumnIds = useMemo(() => columnDefs.map((column) => String(column.id)), [columnDefs]);
+  const dynamicColumnIds = useMemo(() => columns.map(columnId), [columns]);
+  const initialVisibility = useMemo(() => toVisibility(columns), [columns]);
+  const serverView = useMemo(() => ({
+    order: ["security", "price", ...dynamicColumnIds, "states", "actions"],
+    visibility: { security: true, price: true, ...initialVisibility, states: workspaceSettings.showStates, actions: true },
+  }), [dynamicColumnIds, initialVisibility, workspaceSettings.showStates]);
 
   useEffect(() => {
     setColumnOrder(serverView.order);
@@ -505,6 +578,26 @@ export function WatchTable({
     getSortedRowModel: getSortedRowModel(),
   });
   const tableRows = tableInstance.getRowModel().rows;
+  useEffect(() => {
+    const viewport = tableViewportRef.current;
+    if (!viewport) return;
+    const update = () => {
+      const bounds = viewport.getBoundingClientRect();
+      const height = workspaceSettings.density === "comfortable" ? 48 : 40;
+      const shown = bounds.top < 0 && bounds.bottom > height && bounds.right > 0 && bounds.left < window.innerWidth;
+      const next = shown ? { left: bounds.left, width: bounds.width, scrollLeft: viewport.scrollLeft } : null;
+      setFixedHeader((current) => current?.left === next?.left && current?.width === next?.width && current?.scrollLeft === next?.scrollLeft ? current : next);
+    };
+    update();
+    window.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    viewport.addEventListener("scroll", update, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      viewport.removeEventListener("scroll", update);
+    };
+  }, [workspaceSettings.density]);
   const visibleLeafColumns = tableInstance.getVisibleLeafColumns();
   const tablePixelWidth = visibleLeafColumns.reduce(
     (total, column) => total + columnPixelWidth(columns, column.id),
@@ -528,49 +621,18 @@ export function WatchTable({
     [maxCompositeFields, workspaceSettings.density],
   );
   const rowHeight = rowLayout.rowHeight;
-  const virtualRange = useMemo(
-    () => calculateVirtualRange({
-      itemCount: tableRows.length,
-      scrollTop,
-      viewportHeight,
-      rowHeight,
-      overscan: WATCH_OVERSCAN,
-    }),
-    [rowHeight, scrollTop, tableRows.length, viewportHeight],
-  );
-  const visibleRows = tableRows.slice(virtualRange.start, virtualRange.end);
-  const updateViewportHeight = useCallback(() => {
-    const element = viewportRef.current;
-    if (element) setViewportHeight(element.clientHeight || DEFAULT_VIEWPORT_HEIGHT);
-  }, []);
-  const handleViewportScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
-    setScrollTop(event.currentTarget.scrollTop);
-  }, []);
-  const handleViewportKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.target !== event.currentTarget) return;
-    const nextScrollTop = virtualScrollTopForKey(
-      event.key,
-      event.currentTarget.scrollTop,
-      event.currentTarget.clientHeight,
-      virtualRange.totalHeight,
-      rowHeight,
-    );
-    if (nextScrollTop === null) return;
-    event.preventDefault();
-    event.currentTarget.scrollTop = nextScrollTop;
-    setScrollTop(nextScrollTop);
-  }, [rowHeight, virtualRange.totalHeight]);
-
-  useEffect(() => {
-    setScrollTop(0);
-    if (viewportRef.current) viewportRef.current.scrollTop = 0;
-  }, [filterQuery, stateFilter, tableId]);
-
-  useEffect(() => {
-    updateViewportHeight();
-    window.addEventListener("resize", updateViewportHeight);
-    return () => window.removeEventListener("resize", updateViewportHeight);
-  }, [updateViewportHeight]);
+  const canReorderStocks = !filterQuery.trim() && stateFilter === "ALL" && sorting.length === 0 && !reorderStockMutation.isPending;
+  const stockOrder = table.stocks.map((stock) => stock.security_id).filter((id): id is Identifier => id !== undefined && id !== null);
+  function moveStock(sourceId: Identifier, targetId: Identifier) {
+    if (!canReorderStocks || stockOrder.length !== table.stocks.length) return;
+    const next = reorderStockIdsForDrop(stockOrder, sourceId, targetId);
+    if (next) reorderStockMutation.mutate(next);
+  }
+  function moveStockByOffset(sourceId: Identifier, offset: -1 | 1) {
+    const index = stockOrder.findIndex((id) => String(id) === String(sourceId));
+    if (index < 0 || index + offset < 0 || index + offset >= stockOrder.length) return;
+    moveStock(sourceId, stockOrder[index + offset]);
+  }
 
   function updateColumn(id: string, input: UpdateColumnInput) {
     const columnIdValue = persistentColumnId(id);
@@ -624,6 +686,9 @@ export function WatchTable({
       toggleable: !fixed,
       width: source?.width,
       viewMode: dividendYield ? "NUMBER" : source?.view_mode,
+      indicatorType: source?.indicator_type,
+      parameters: source?.parameters,
+      stateCode: source?.state_code,
       viewModeLocked: dividendYield,
       deletable: !fixed,
       pending: anyColumnMutationPending && (reorderColumnsMutation.isPending || (pendingColumnId !== undefined && pendingColumnId !== null && String(pendingColumnId) === column.id)),
@@ -672,7 +737,11 @@ export function WatchTable({
             onMove={handleMove}
             onReorder={handleReorder}
             onWidthChange={(id, width) => updateColumn(id, { width })}
-            onViewModeChange={(id, viewMode) => viewMode && updateColumn(id, { view_mode: viewMode as IndicatorViewMode })}
+            onViewModeChange={async (id, input) => {
+              const columnIdValue = persistentColumnId(id);
+              if (columnIdValue === null) throw new Error("该列缺少后端 ID。");
+              await updateColumnMutation.mutateAsync({ columnId: columnIdValue, input });
+            }}
             onDelete={(id) => {
               const columnIdValue = persistentColumnId(id);
               if (columnIdValue === null) {
@@ -684,18 +753,9 @@ export function WatchTable({
           />
         </div>
       </div>
+      <p className="border-b border-line px-4 py-2 text-[11px] text-muted">默认顺序下可拖动股票行或使用操作列的 ↑↓ 按钮调整顺序；筛选或按列排序时暂停手动排序。</p>
       {actionError ? <p className="border-b border-negative/30 bg-negative/10 px-4 py-2 text-xs text-negative" role="alert">{actionError}</p> : null}
-      <div
-        ref={viewportRef}
-        className="max-h-[min(70vh,720px)] min-h-[180px] overflow-auto focus:outline-none focus:ring-2 focus:ring-brand/40"
-        onScroll={handleViewportScroll}
-        onKeyDown={handleViewportKeyDown}
-        tabIndex={0}
-        role="region"
-        aria-label={`${table.name}股票监控数据`}
-        aria-describedby={`watch-table-keyboard-help-${String(tableId)}`}
-      >
-        <p id={`watch-table-keyboard-help-${String(tableId)}`} className="sr-only">聚焦此区域后，使用上下方向键按行移动，PageUp/PageDown 按页移动，Home/End 跳转首尾；移动后按 Tab 访问当前区域内的操作。</p>
+      <div ref={tableViewportRef} className="overflow-x-auto overflow-y-visible" role="region" aria-label={`${table.name}股票监控数据`} tabIndex={0}>
         <table
           className="table-fixed border-collapse text-left"
           style={{ width: tablePixelWidth, minWidth: "100%" }}
@@ -705,7 +765,7 @@ export function WatchTable({
           <colgroup>
             {visibleLeafColumns.map((column) => <col key={column.id} style={columnWidthStyle(columns, column.id)} />)}
           </colgroup>
-          <thead className={`sticky top-0 z-10 border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary ${comfortableDensity ? "h-12" : "h-10"}`}>
+          <thead className={`border-b border-line bg-card/50 text-[11px] font-medium uppercase tracking-wide text-secondary ${comfortableDensity ? "h-12" : "h-10"}`}>
             {tableInstance.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id} aria-rowindex={1}>
                 {headerGroup.headers.map((header) => (
@@ -730,13 +790,8 @@ export function WatchTable({
             ) : null}
             {tableRows.length > 0 ? (
               <>
-                {virtualRange.offsetTop > 0 ? (
-                  <tr aria-hidden="true" role="presentation">
-                    <td colSpan={Math.max(1, visibleLeafColumns.length)} className="p-0" style={{ height: virtualRange.offsetTop }} />
-                  </tr>
-                ) : null}
-                {visibleRows.map((row, visibleIndex) => (
-              <tr key={row.id} aria-rowindex={virtualRange.start + visibleIndex + 2} style={{ height: rowHeight }} className="align-middle transition-colors hover:bg-card/40">
+                {tableRows.map((row, visibleIndex) => (
+              <tr key={row.id} aria-rowindex={visibleIndex + 2} style={{ height: rowHeight }} draggable={canReorderStocks} onDragStart={(event) => { if (!canReorderStocks || row.original.security_id == null) { event.preventDefault(); return; } setDraggedStockId(row.original.security_id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(row.original.security_id)); }} onDragOver={(event) => { if (canReorderStocks && draggedStockId !== null) event.preventDefault(); }} onDrop={(event) => { event.preventDefault(); if (draggedStockId !== null && row.original.security_id != null) moveStock(draggedStockId, row.original.security_id); setDraggedStockId(null); }} onDragEnd={() => setDraggedStockId(null)} className={`align-middle transition-colors hover:bg-card/40 ${canReorderStocks ? "cursor-grab" : ""} ${draggedStockId !== null && String(draggedStockId) === String(row.original.security_id) ? "opacity-50" : ""}`} >
                 {row.getVisibleCells().map((cell) => (
                   <td key={cell.id} style={{ ...(columnWidthStyle(columns, cell.column.id) ?? {}), height: rowHeight }} className={`whitespace-nowrap py-0 ${comfortableDensity ? "px-5 first:pl-6 last:pr-6" : "px-4 first:pl-5 last:pr-5"}`}>
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -744,16 +799,25 @@ export function WatchTable({
                 ))}
               </tr>
                 ))}
-                {virtualRange.offsetBottom > 0 ? (
-                  <tr aria-hidden="true" role="presentation">
-                    <td colSpan={Math.max(1, visibleLeafColumns.length)} className="p-0" style={{ height: virtualRange.offsetBottom }} />
-                  </tr>
-                ) : null}
               </>
             ) : null}
           </tbody>
         </table>
       </div>
+      {fixedHeader ? (
+        <div className="pointer-events-auto fixed top-0 z-30 overflow-hidden border-b border-line bg-panel shadow-panel" style={{ left: fixedHeader.left, width: fixedHeader.width, height: comfortableDensity ? 48 : 40 }}>
+          <table className="table-fixed border-collapse text-left" style={{ width: tablePixelWidth, minWidth: "100%", transform: `translateX(-${fixedHeader.scrollLeft}px)` }} aria-label={`${table.name}固定表头`}>
+            <colgroup>{visibleLeafColumns.map((column) => <col key={column.id} style={columnWidthStyle(columns, column.id)} />)}</colgroup>
+            <thead className={`text-[11px] font-medium uppercase tracking-wide text-secondary ${comfortableDensity ? "h-12" : "h-10"}`}>
+              {tableInstance.getHeaderGroups().map((group) => (
+                <tr key={group.id}>
+                  {group.headers.map((header) => <th key={header.id} style={columnWidthStyle(columns, header.column.id)} className={`whitespace-nowrap font-medium ${comfortableDensity ? "px-5 first:pl-6 last:pr-6" : "px-4 first:pl-5 last:pr-5"}`}>{header.isPlaceholder ? null : <SortableHeader header={header} />}</th>)}
+                </tr>
+              ))}
+            </thead>
+          </table>
+        </div>
+      ) : null}
       <IndicatorDetailsDrawer
         selection={detailSelection}
         onClose={closeDetail}

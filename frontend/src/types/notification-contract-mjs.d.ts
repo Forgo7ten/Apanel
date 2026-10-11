@@ -20,5 +20,7 @@ declare module "@/lib/notification-contract.mjs" {
     field?: string;
     adjust_type?: "qfq" | "none";
   }): Record<string, unknown>;
+  export function displayAlertThreshold(indicator: string | undefined, threshold: number | string | null | undefined): string;
+  export function alertThresholdLabel(indicator: string | undefined, threshold: number | string | null | undefined): string;
   export function shouldShowNotificationRetry(record: unknown): boolean;
 }

@@ -73,3 +73,10 @@ export function reorderWatchTableColumns(tableId: Identifier, columnIds: Identif
 export function deleteWatchTableColumn(columnId: Identifier): Promise<void> {
   return apiFetch<void>(`/columns/${encodeURIComponent(columnId)}`, { method: "DELETE" });
 }
+
+export function reorderWatchTableStocks(tableId: Identifier, securityIds: Identifier[]): Promise<WatchTableStock[]> {
+  return apiFetch<WatchTableStock[]>(`/watch-tables/${encodeURIComponent(tableId)}/stocks/reorder`, {
+    method: "PUT",
+    body: JSON.stringify({ items: securityIds.map((security_id, position) => ({ security_id, position })) }),
+  });
+}

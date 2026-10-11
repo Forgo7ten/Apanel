@@ -983,3 +983,86 @@ async def test_settings_mask_and_clear_webhook(alert_context) -> None:
         stored = (await session.execute(select(UserSetting))).scalar_one()
         assert "feishu_webhook" not in stored.settings.get("notification_settings", {})
         assert (await session.execute(select(UserSecret))).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_notification_history_keyset_is_user_scoped_and_stable(alert_context) -> None:
+    client = alert_context["client"]
+    session_factory = alert_context["session_factory"]
+    user_one, user_two, security = (
+        alert_context["user_one"],
+        alert_context["user_two"],
+        alert_context["security"],
+    )
+    baseline = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        for index in range(5):
+            session.add(
+                Notification(
+                    user_id=user_one.id,
+                    security_id=security.id,
+                    channel="FEISHU",
+                    title=f"first-{index}",
+                    content={},
+                    status="SENT",
+                    created_at=baseline - timedelta(seconds=index // 2),
+                )
+            )
+        session.add(
+            Notification(
+                user_id=user_two.id,
+                security_id=security.id,
+                channel="FEISHU",
+                title="private",
+                content={},
+                status="SENT",
+                created_at=baseline,
+            )
+        )
+        await session.commit()
+
+    path = "/api/v1/notifications/history?limit=2"
+    first = await client.get(path)
+    assert first.status_code == 200
+    first_data = first.json()["data"]
+    assert len(first_data["items"]) == 2
+    assert first_data["next_cursor"]
+
+    # A new row between page requests must never cause a duplicate/skip.
+    async with session_factory() as session:
+        session.add(
+            Notification(
+                user_id=user_one.id,
+                security_id=security.id,
+                channel="FEISHU",
+                title="new-arrival",
+                content={},
+                status="SENT",
+                created_at=baseline + timedelta(seconds=5),
+            )
+        )
+        await session.commit()
+
+    seen = [item["id"] for item in first_data["items"]]
+    page = first_data
+    while page["next_cursor"] is not None:
+        response = await client.get(path, params={"cursor": page["next_cursor"]})
+        assert response.status_code == 200
+        page = response.json()["data"]
+        seen.extend(item["id"] for item in page["items"])
+    assert len(seen) == len(set(seen)) == 5
+
+    latest = await client.get(path)
+    assert latest.status_code == 200
+    assert latest.json()["data"]["items"][0]["title"] == "new-arrival"
+    assert (await client.get(path, params={"cursor": "invalid%%%"})).status_code == 400
+    assert (await client.get(path, params={"cursor": "eA"})).status_code == 400
+
+    alert_context["current_user"]["value"] = user_two
+    others = await client.get(path)
+    assert others.status_code == 200
+    assert [item["title"] for item in others.json()["data"]["items"]] == ["private"]
+    # Even another user's cursor cannot reveal a cross-account record.
+    probe = await client.get(path, params={"cursor": first_data["next_cursor"]})
+    assert probe.status_code == 200
+    assert all(item["title"] == "private" for item in probe.json()["data"]["items"])

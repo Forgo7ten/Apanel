@@ -1,9 +1,11 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { CreateAlertInput, Identifier, WatchTableStock } from "@/api/types";
+import type { CreateAlertInput, Identifier } from "@/api/types";
 import { createAlert } from "@/api/alerts";
 import { createWatchTable, deleteWatchTable, getWatchTable, getWatchTables } from "@/api/watch";
 import { AddStockDialog } from "@/components/table/AddStockDialog";
@@ -17,8 +19,7 @@ import { isApiError } from "@/lib/api-errors";
 import {
   isCurrentWatchDetail,
   isWatchStockDataReady,
-  WATCH_BOOTSTRAP_POLL_INTERVAL_MS,
-  WATCH_BOOTSTRAP_TIMEOUT_MS,
+  watchRefreshInterval,
   WATCH_DETAIL_REFRESH_INTERVAL_MS,
   watchDetailViewState,
 } from "@/lib/watch-contract.mjs";
@@ -29,75 +30,45 @@ function sameId(left: Identifier | null, right: Identifier | null): boolean {
   return left !== null && right !== null && String(left) === String(right);
 }
 
-const EMPTY_BOOTSTRAP_DEADLINES: Readonly<Record<string, number>> = Object.freeze({});
-
 export default function WatchPage() {
   const queryClient = useQueryClient();
   const { settings: workspaceSettings } = useWorkspaceSettings();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [createName, setCreateName] = useState("");
+  const [creatingTable, setCreatingTable] = useState(false);
   const [alertDraft, setAlertDraft] = useState<AlertWizardDraft | null>(null);
-  const [bootstrapDeadlinesByTable, setBootstrapDeadlinesByTable] = useState<Record<string, Record<string, number>>>({});
+  const firstObservedRef = useRef(new Map<string, number>());
   const addStockTriggerRef = useRef<HTMLButtonElement | null>(null);
   const closeAddStockDialog = useCallback(() => setAddDialogOpen(false), []);
   const { selectedTableId, setSelectedTableId, resetTableView } = useWatchStore();
-  const tablesQuery = useQuery({ queryKey: ["watch-tables"], queryFn: getWatchTables });
+  const tablesQuery = useQuery({ queryKey: queryKeys.watchTables(), queryFn: getWatchTables });
   const tables = useMemo(() => tablesQuery.data ?? [], [tablesQuery.data]);
   const selectedTable = tables.find((table) => sameId(table.id, selectedTableId)) ?? tables[0];
   const activeTableId = selectedTable?.id ?? null;
-  const activeBootstrapDeadlines = activeTableId === null
-    ? EMPTY_BOOTSTRAP_DEADLINES
-    : bootstrapDeadlinesByTable[String(activeTableId)] ?? EMPTY_BOOTSTRAP_DEADLINES;
   const detailsQuery = useQuery({
-    queryKey: ["watch-table", activeTableId, workspaceSettings.adjustType],
+    queryKey: queryKeys.watchTable(activeTableId, workspaceSettings.adjustType),
     queryFn: () => getWatchTable(activeTableId as Identifier),
     enabled: activeTableId !== null,
     placeholderData: (previous) => previous,
     refetchInterval: (query) => {
-      const pendingEntries = Object.entries(activeBootstrapDeadlines)
-        .filter(([, deadline]) => deadline > Date.now());
-      if (pendingEntries.length === 0) return WATCH_DETAIL_REFRESH_INTERVAL_MS;
       const data = query.state.data;
-      const detail = data && isCurrentWatchDetail(data, activeTableId, workspaceSettings.adjustType) ? data : undefined;
-      const stillPreparing = pendingEntries.some(([securityId]) => {
-        const stock = detail?.stocks.find((item) => String(item.security_id) === securityId);
-        return !detail || (stock ? !isWatchStockDataReady(stock, detail.columns) : false);
-      });
-      return stillPreparing ? WATCH_BOOTSTRAP_POLL_INTERVAL_MS : WATCH_DETAIL_REFRESH_INTERVAL_MS;
+      return data && isCurrentWatchDetail(data, activeTableId, workspaceSettings.adjustType)
+        ? watchRefreshInterval(data, firstObservedRef.current)
+        : WATCH_DETAIL_REFRESH_INTERVAL_MS;
     },
     refetchIntervalInBackground: false,
   });
   const currentDetail = detailsQuery.data && isCurrentWatchDetail(detailsQuery.data, activeTableId, workspaceSettings.adjustType)
     ? detailsQuery.data
     : undefined;
-  const bootstrappingStockIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const securityId of Object.keys(activeBootstrapDeadlines)) {
-      const stock = currentDetail?.stocks.find((item) => String(item.security_id) === securityId);
-      if (!currentDetail || (stock && !isWatchStockDataReady(stock, currentDetail.columns))) {
-        ids.add(securityId);
-      }
-    }
-    return ids;
-  }, [activeBootstrapDeadlines, currentDetail]);
+  const bootstrappingStockIds = useMemo(() => new Set(
+    currentDetail?.stocks.filter((stock) => !isWatchStockDataReady(stock, currentDetail.columns)).map((stock) => String(stock.security_id)) ?? [],
+  ), [currentDetail]);
   const detailState = watchDetailViewState({
     isPending: detailsQuery.isPending || (!currentDetail && !detailsQuery.isError),
     isError: detailsQuery.isError,
     hasData: Boolean(currentDetail),
   });
-  const markStockBootstrapping = useCallback((stock: WatchTableStock) => {
-    if (activeTableId === null) return;
-    const securityId = stock.security_id ?? stock.security?.security_id ?? stock.security?.id;
-    if (securityId === undefined || securityId === null) return;
-    const tableKey = String(activeTableId);
-    setBootstrapDeadlinesByTable((current) => ({
-      ...current,
-      [tableKey]: {
-        ...(current[tableKey] ?? {}),
-        [String(securityId)]: Date.now() + WATCH_BOOTSTRAP_TIMEOUT_MS,
-      },
-    }));
-  }, [activeTableId]);
   const createMutation = useMutation({
     mutationFn: () => {
       const name = createName.trim();
@@ -106,7 +77,8 @@ export default function WatchPage() {
     },
     onSuccess: async (table) => {
       setCreateName("");
-      await queryClient.invalidateQueries({ queryKey: ["watch-tables"] });
+      setCreatingTable(false);
+      await queryClient.invalidateQueries({ queryKey: queryKeys.watchTables() });
       setSelectedTableId(table.id);
       resetTableView();
     },
@@ -114,11 +86,11 @@ export default function WatchPage() {
   const deleteMutation = useMutation({
     mutationFn: (tableId: Identifier) => deleteWatchTable(tableId),
     onSuccess: async (_result, tableId) => {
-      queryClient.setQueryData<typeof tables>(["watch-tables"], (current) => current?.filter((table) => !sameId(table.id, tableId)));
-      queryClient.removeQueries({ queryKey: ["watch-table", tableId] });
+      queryClient.setQueryData<typeof tables>(queryKeys.watchTables(), (current) => current?.filter((table) => !sameId(table.id, tableId)));
+      queryClient.removeQueries({ queryKey: queryKeys.watchTablePrefix(tableId) });
       setSelectedTableId(null);
       resetTableView();
-      await queryClient.invalidateQueries({ queryKey: ["watch-tables"] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.watchTables() });
     },
   });
 
@@ -126,7 +98,7 @@ export default function WatchPage() {
     mutationFn: (input: CreateAlertInput) => createAlert(input),
     onSuccess: async () => {
       setAlertDraft(null);
-      await queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.alerts() });
     },
   });
 
@@ -148,24 +120,6 @@ export default function WatchPage() {
       resetTableView();
     }
   }, [resetTableView, selectedTableId, setSelectedTableId, tables]);
-
-  useEffect(() => {
-    const deadlines = Object.values(bootstrapDeadlinesByTable).flatMap((bySecurity) => Object.values(bySecurity));
-    if (deadlines.length === 0) return;
-    const nextDeadline = Math.min(...deadlines);
-    const timeout = window.setTimeout(() => {
-      const now = Date.now();
-      setBootstrapDeadlinesByTable((current) => Object.fromEntries(
-        Object.entries(current)
-          .map(([tableId, bySecurity]) => [
-            tableId,
-            Object.fromEntries(Object.entries(bySecurity).filter(([, deadline]) => deadline > now)),
-          ] as const)
-          .filter(([, bySecurity]) => Object.keys(bySecurity).length > 0),
-      ));
-    }, Math.max(50, nextDeadline - Date.now() + 50));
-    return () => window.clearTimeout(timeout);
-  }, [bootstrapDeadlinesByTable]);
 
   function selectTable(id: Identifier) {
     if (sameId(id, selectedTableId)) return;
@@ -202,10 +156,18 @@ export default function WatchPage() {
                 <span className="text-base leading-none">+</span>
                 添加股票
               </button>
+              <button type="button" onClick={() => { createMutation.reset(); setCreatingTable((value) => !value); }} className="inline-flex h-9 items-center justify-center rounded-panel border border-line bg-card px-3 text-sm font-medium text-secondary hover:text-primary" aria-expanded={creatingTable}>
+                {creatingTable ? "取消新建" : "+ 新建监控表"}
+              </button>
               <button
                 type="button"
                 disabled={deleteMutation.isPending}
-                onClick={() => deleteMutation.mutate(activeTableId)}
+                onClick={() => {
+                  const name = selectedTable?.name ?? "当前监控表";
+                  if (window.confirm(`确定删除监控表「${name}」？其中的股票和指标列配置将一并删除，此操作不可撤销。`)) {
+                    deleteMutation.mutate(activeTableId);
+                  }
+                }}
                 className="inline-flex h-9 items-center justify-center rounded-panel border border-negative/30 bg-negative/5 px-3 text-sm font-medium text-negative transition hover:bg-negative/10 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {deleteMutation.isPending ? "删除中…" : "删除当前表格"}
@@ -214,6 +176,15 @@ export default function WatchPage() {
           ) : null}
         </div>
       </section>
+
+      {creatingTable && activeTableId !== null ? (
+        <form onSubmit={(event) => { event.preventDefault(); if (createName.trim()) createMutation.mutate(); }} className="flex flex-wrap items-center gap-2 rounded-panel border border-line bg-panel p-3" aria-label="新建监控表">
+          <label htmlFor="new-watch-table-name" className="text-xs text-secondary">监控表名称</label>
+          <input id="new-watch-table-name" autoFocus maxLength={128} value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder="例如：长期观察" className="h-9 rounded-panel border border-line bg-card px-3 text-xs text-primary" />
+          <button type="submit" disabled={!createName.trim() || createMutation.isPending} className="h-9 rounded-panel bg-brand px-3 text-xs font-medium text-white disabled:opacity-50">{createMutation.isPending ? "创建中…" : "创建监控表"}</button>
+          {createErrorMessage ? <p role="alert" className="w-full text-xs text-negative">{createErrorMessage}</p> : null}
+        </form>
+      ) : null}
 
       {deleteErrorMessage ? <p className="rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs text-negative" role="alert">{deleteErrorMessage}</p> : null}
 
@@ -288,7 +259,6 @@ export default function WatchPage() {
         <AddStockDialog
           tableId={activeTableId}
           restoreFocusRef={addStockTriggerRef}
-          onAdded={markStockBootstrapping}
           onClose={closeAddStockDialog}
         />
       ) : null}

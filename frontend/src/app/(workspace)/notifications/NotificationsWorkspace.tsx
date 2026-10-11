@@ -1,10 +1,12 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/query-keys.mjs";
+
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { createAlert, deleteAlert, getAlerts, updateAlert } from "@/api/alerts";
-import { getNotifications, retryNotification } from "@/api/notifications";
+import { getNotificationHistory, retryNotification } from "@/api/notifications";
 import type { AlertRule, CreateAlertInput, Identifier, NotificationRecord } from "@/api/types";
 import { AlertCard } from "@/components/alerts/AlertCard";
 import { AlertWizard } from "@/components/alerts/AlertWizard";
@@ -86,15 +88,24 @@ export function NotificationsWorkspace() {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<AlertRule | null>(null);
 
-  const notificationsQuery = useQuery({ queryKey: ["notifications"], queryFn: getNotifications });
-  const alertsQuery = useQuery({ queryKey: ["alerts"], queryFn: getAlerts });
+  const notificationsQuery = useInfiniteQuery({
+    queryKey: queryKeys.notificationHistory(),
+    queryFn: ({ pageParam }) => getNotificationHistory(pageParam, 50),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+  });
+  const notifications = useMemo(() => notificationsQuery.data?.pages.flatMap((page) => page.items) ?? [], [notificationsQuery.data]);
+  const alertsQuery = useQuery({ queryKey: queryKeys.alerts(), queryFn: getAlerts });
 
   const createMutation = useMutation({
     mutationFn: (input: CreateAlertInput) => createAlert(input),
     onSuccess: async () => {
       setWizardOpen(false);
       setEditingRule(null);
-      await queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.alerts() });
     },
   });
   const updateMutation = useMutation({
@@ -102,20 +113,20 @@ export function NotificationsWorkspace() {
     onSuccess: async () => {
       setWizardOpen(false);
       setEditingRule(null);
-      await queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.alerts() });
     },
   });
   const toggleMutation = useMutation({
     mutationFn: ({ id, enabled }: { id: Identifier; enabled: boolean }) => updateAlert(id, { enabled }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alerts"] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.alerts() }),
   });
   const deleteMutation = useMutation({
     mutationFn: (id: Identifier) => deleteAlert(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alerts"] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.alerts() }),
   });
   const retryMutation = useMutation({
     mutationFn: (id: Identifier) => retryNotification(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.notificationHistory() }),
   });
 
   const rules = useMemo(() => alertsQuery.data ?? [], [alertsQuery.data]);
@@ -176,10 +187,13 @@ export function NotificationsWorkspace() {
               <p className="text-sm font-semibold text-primary">通知记录</p>
               <p className="mt-1 text-xs text-muted">边缘触发后产生的通知会出现在这里</p>
             </div>
-            {notificationsQuery.data ? <StateTag tone="neutral">{notificationsQuery.data.length} 条</StateTag> : null}
+            <div className="flex items-center gap-2">
+              {notificationsQuery.data ? <StateTag tone="neutral">已加载 {notifications.length} 条</StateTag> : null}
+              <button type="button" onClick={() => notificationsQuery.refetch()} disabled={notificationsQuery.isFetching} className="rounded border border-line px-2 py-1 text-xs text-secondary disabled:opacity-50">{notificationsQuery.isFetching ? "刷新中…" : "刷新"}</button>
+            </div>
           </div>
           {notificationsQuery.isPending ? <LoadingState label="正在加载通知记录…" /> : null}
-          {notificationsQuery.isError ? (
+          {notificationsQuery.isError && !notificationsQuery.data ? (
             <QueryErrorState
               error={notificationsQuery.error}
               onRetry={() => notificationsQuery.refetch()}
@@ -187,11 +201,11 @@ export function NotificationsWorkspace() {
               missingDescription="后端尚未提供通知记录接口，请完成服务端路由后重试。"
             />
           ) : null}
-          {!notificationsQuery.isPending && !notificationsQuery.isError && notificationsQuery.data?.length === 0 ? (
-            <EmptyState title="还没有通知记录" description="监听规则触发后，飞书通知记录会在此处留下记录。" />
+          {!notificationsQuery.isPending && !notificationsQuery.isError && notifications.length === 0 ? (
+            <EmptyState title="还没有通知记录" description="监听规则触发后，通知记录会在此处显示。" />
           ) : null}
-          {!notificationsQuery.isPending && !notificationsQuery.isError && notificationsQuery.data?.length ? (
-            <div>{notificationsQuery.data.map((record, index) => <NotificationItem
+          {notifications.length ? (
+            <div>{notifications.map((record, index) => <NotificationItem
               key={String(record.id ?? `${record.symbol}-${record.created_at}-${index}`)}
               record={record}
               onRetry={(id) => {
@@ -201,6 +215,15 @@ export function NotificationsWorkspace() {
               isRetrying={retryMutation.isPending && sameId(retryMutation.variables, record.id)}
             />)}</div>
           ) : null}
+          {notificationsQuery.isError && notifications.length > 0 && !notificationsQuery.isFetchNextPageError ? <p role="status" className="px-4 py-2 text-xs text-warning">刷新通知失败，已保留上次加载的记录。</p> : null}
+          {notificationsQuery.hasNextPage ? (
+            <div className="border-t border-line p-3 text-center">
+              <button type="button" disabled={notificationsQuery.isFetchingNextPage} onClick={() => notificationsQuery.fetchNextPage()} className="rounded-panel border border-line px-4 py-2 text-xs text-secondary disabled:opacity-50">
+                {notificationsQuery.isFetchingNextPage ? "正在加载…" : "加载更早通知"}
+              </button>
+            </div>
+          ) : null}
+          {notificationsQuery.isFetchNextPageError ? <p role="alert" className="px-4 py-2 text-xs text-negative">加载更早记录失败，请重试。</p> : null}
           {retryMutation.error ? <p className="mx-4 mb-4 rounded-panel border border-negative/30 bg-negative/10 px-3 py-2 text-xs text-negative" role="alert">{errorMessage(retryMutation.error, "通知重试失败，请稍后重试。")}</p> : null}
         </div>
 

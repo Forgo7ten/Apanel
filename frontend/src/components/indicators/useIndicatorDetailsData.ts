@@ -1,5 +1,7 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 
@@ -42,7 +44,7 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
     return parameterKey ? { ...selection.column, parameter_key: parameterKey } : selection.column;
   }, [parameterKey, selection]);
   const indicatorQuery = useQuery({
-    queryKey: ["indicator-history", symbol, range.start, range.end, adjustment, parameterKey ?? null],
+    queryKey: queryKeys.indicatorHistory(symbol, range.start, range.end, adjustment, parameterKey),
     queryFn: () => getIndicatorHistory(symbol, {
       ...range,
       adjust: adjustment,
@@ -61,14 +63,7 @@ export function useIndicatorDetailsData(selection: DetailSelection | null) {
     return { indicator_type: selection.column.indicator_type ?? selection.column.type };
   }, [selection]);
   const stateQuery = useQuery({
-    queryKey: [
-      "state-history",
-      symbol,
-      range.start,
-      range.end,
-      adjustment,
-      stateHistoryFilter,
-    ],
+    queryKey: queryKeys.stateHistory(symbol, range.start, range.end, adjustment, stateHistoryFilter),
     queryFn: () => getStateHistory(symbol, {
       ...range,
       adjust: adjustment,

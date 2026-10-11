@@ -51,6 +51,7 @@ from app.schemas.alerts import (
     AlertRuleData,
     AlertRuleUpdateRequest,
     NotificationData,
+    NotificationHistoryData,
 )
 from app.schemas.security import SecurityData
 from app.services.alert_observation_service import AlertObservationService
@@ -59,6 +60,7 @@ from app.services.bootstrap_scheduler import (
     NoopSecurityBootstrapScheduler,
     SecurityBootstrapScheduler,
 )
+from app.services.notification_cursor import decode_notification_cursor, encode_notification_cursor
 from app.services.notification_service import (
     NotificationService,
     ProviderFactory,
@@ -252,6 +254,24 @@ class AlertService:
     async def notifications(self, user_id: int, *, limit: int = 100) -> list[NotificationData]:
         records = await self.notification_repository.list_for_user(user_id, limit=limit)
         return [_notification_data(item) for item in records]
+
+    async def notification_history(
+        self, user_id: int, *, limit: int = 50, cursor: str | None = None
+    ) -> NotificationHistoryData:
+        before = decode_notification_cursor(cursor) if cursor is not None else None
+        records = await self.notification_repository.history_page_for_user(
+            user_id, limit=limit, before=before
+        )
+        more = len(records) > limit
+        visible = records[:limit]
+        next_cursor = (
+            encode_notification_cursor(visible[-1].created_at, visible[-1].id)
+            if more and visible
+            else None
+        )
+        return NotificationHistoryData(
+            items=[_notification_data(item) for item in visible], next_cursor=next_cursor
+        )
 
     async def retry_notification(
         self,

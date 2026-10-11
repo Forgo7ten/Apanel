@@ -1,5 +1,7 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
@@ -17,7 +19,7 @@ function errorMessage(error: unknown): string {
 
 export function SettingsWorkspace() {
   const queryClient = useQueryClient();
-  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
+  const settingsQuery = useQuery({ queryKey: queryKeys.settings(), queryFn: getSettings });
   const [draft, setDraft] = useState<SettingsForm | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -30,7 +32,7 @@ export function SettingsWorkspace() {
       setDraft(normalizeSettings(settings));
       setValidationError(null);
       setSaved(true);
-      await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.settings() });
     },
   });
 
@@ -69,7 +71,7 @@ export function SettingsWorkspace() {
         const url = new URL(webhook);
         if (url.protocol !== "https:") throw new Error("protocol");
       } catch {
-        setValidationError("飞书 Webhook 必须是有效的 HTTPS 地址。");
+        setValidationError("Webhook 地址必须是有效的 HTTPS 地址。");
         return;
       }
     }
@@ -220,11 +222,11 @@ export function SettingsWorkspace() {
             <section className="rounded-panel border border-line bg-panel shadow-panel">
               <div className="border-b border-line px-4 py-4">
                 <h2 className="text-sm font-semibold text-primary">通知渠道</h2>
-                <p className="mt-1 text-xs leading-5 text-muted">Webhook 仅用于后端发送飞书通知，前端不会记录或打印该地址。</p>
+                <p className="mt-1 text-xs leading-5 text-muted">Webhook 由后端用于发送通知，前端不会记录或打印该地址。目前支持飞书/Lark Webhook。</p>
               </div>
               <div className="px-4 py-4">
                 <fieldset disabled={saveMutation.isPending}>
-                  <label htmlFor="feishu-webhook" className="text-xs font-medium text-secondary">飞书 Webhook</label>
+                  <label htmlFor="feishu-webhook" className="text-xs font-medium text-secondary">Webhook 通知</label>
                   <input
                     id="feishu-webhook"
                     type="password"

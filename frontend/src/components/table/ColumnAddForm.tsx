@@ -1,5 +1,7 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
@@ -142,9 +144,8 @@ export function ColumnAddForm({
     },
     onSuccess: async () => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["watch-table", tableId] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-tables"] }),
-        queryClient.invalidateQueries({ queryKey: ["watch-table-columns", tableId] }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTablePrefix(tableId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.watchTables() }),
       ]);
       onCreated?.();
     },

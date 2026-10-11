@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import type { Identifier } from "@/api/types";
+import type { Identifier, IndicatorParameters, IndicatorViewMode, UpdateColumnInput } from "@/api/types";
 
 import { trapDialogTab } from "../ui/dialog-focus";
 import { ColumnAddForm } from "./ColumnAddForm";
+import { ColumnModeEditor } from "./ColumnModeEditor";
 
 export type ColumnManagerItem = {
   id: string;
@@ -15,7 +16,10 @@ export type ColumnManagerItem = {
   movable?: boolean;
   toggleable?: boolean;
   width?: number;
-  viewMode?: "NUMBER" | "DELTA" | "STATUS" | "COMPOSITE";
+  viewMode?: IndicatorViewMode;
+  indicatorType?: string;
+  parameters?: IndicatorParameters;
+  stateCode?: string;
   viewModeLocked?: boolean;
   deletable?: boolean;
   pending?: boolean;
@@ -37,11 +41,12 @@ export function ColumnManager({
   onMove: (id: string, direction: "up" | "down") => void;
   onReorder: (sourceId: string, targetId: string, position: "before" | "after") => void;
   onWidthChange?: (id: string, width: number) => void;
-  onViewModeChange?: (id: string, viewMode: ColumnManagerItem["viewMode"]) => void;
+  onViewModeChange?: (id: string, input: UpdateColumnInput) => Promise<void>;
   onDelete?: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [panel, setPanel] = useState<"columns" | "add">("columns");
+  const [panel, setPanel] = useState<"columns" | "add" | "mode">("columns");
+  const [modeEdit, setModeEdit] = useState<{ id: string; mode: IndicatorViewMode } | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [dragOverPosition, setDragOverPosition] = useState<"before" | "after">("before");
@@ -52,6 +57,7 @@ export function ColumnManager({
   const closeManager = useCallback(() => {
     setOpen(false);
     setPanel("columns");
+    setModeEdit(null);
     setDraggedId(null);
     setDragOverId(null);
     setDragOverPosition("before");
@@ -155,7 +161,17 @@ export function ColumnManager({
             <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
               {panel === "add" ? (
                 <ColumnAddForm tableId={tableId} onCreated={() => setPanel("columns")} />
-              ) : (
+              ) : panel === "mode" && modeEdit && onViewModeChange ? (() => {
+                const item = items.find((entry) => entry.id === modeEdit.id);
+                if (!item) return <p className="text-xs text-warning">该列已不存在，请返回列列表。</p>;
+                return <ColumnModeEditor
+                  key={`${modeEdit.id}-${modeEdit.mode}`}
+                  column={{ id: item.id, type: "INDICATOR", view_mode: item.viewMode ?? "COMPOSITE", indicator_type: item.indicatorType, parameters: item.parameters, state_code: item.stateCode }}
+                  mode={modeEdit.mode}
+                  onSave={async (input) => { await onViewModeChange(modeEdit.id, input); setModeEdit(null); setPanel("columns"); }}
+                  onCancel={() => { setModeEdit(null); setPanel("columns"); }}
+                />;
+              })() : (
                 <div className="space-y-1">
                   <p className="px-1 pb-2 text-[11px] leading-5 text-muted">拖动动态指标列左侧手柄可调整顺序；固定列不可移动或隐藏。</p>
                   {items.map((item) => {
@@ -235,7 +251,10 @@ export function ColumnManager({
                             <select
                               value={item.viewMode}
                               disabled={item.pending || item.viewModeLocked}
-                              onChange={(event) => onViewModeChange(item.id, event.target.value as ColumnManagerItem["viewMode"])}
+                              onChange={(event) => {
+                                const mode = event.target.value as IndicatorViewMode;
+                                if (mode !== item.viewMode) { setModeEdit({ id: item.id, mode }); setPanel("mode"); }
+                              }}
                               aria-label={`${item.label}展示模式`}
                               className="h-7 rounded border border-line bg-card px-2 text-[11px] text-secondary outline-none focus:border-brand disabled:cursor-not-allowed disabled:opacity-60"
                             >
@@ -293,7 +312,7 @@ export function ColumnManager({
             </div>
 
             <div className="flex shrink-0 items-center justify-between gap-3 border-t border-line px-5 py-3">
-              <p className="text-[11px] text-muted">{panel === "add" ? "新增列后会自动返回现有列列表。" : "修改会立即保存到当前监控表。"}</p>
+              <p className="text-[11px] text-muted">{panel === "add" ? "新增列后会自动返回现有列列表。" : panel === "mode" ? "确认状态和字段后才会保存。" : "修改会立即保存到当前监控表。"}</p>
               <button type="button" onClick={closeManager} className="rounded-panel border border-line bg-card px-3 py-2 text-xs font-medium text-secondary hover:text-primary">
                 完成
               </button>

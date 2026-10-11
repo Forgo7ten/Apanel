@@ -496,7 +496,13 @@ class WatchTableService:
         candidate = ColumnCreateRequest(
             column_type=column.column_type,
             indicator_type=column.indicator_type,
-            state_code=request.state_code if request.state_code is not None else column.state_code,
+            state_code=(
+                request.state_code
+                if "state_code" in request.model_fields_set
+                else None
+                if request.view_mode and request.view_mode != "STATUS"
+                else column.state_code
+            ),
             parameters=request.parameters if request.parameters is not None else column.parameters,
             view_mode=request.view_mode or column.view_mode,
         )

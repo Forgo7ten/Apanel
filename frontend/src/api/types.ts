@@ -223,7 +223,7 @@ export type UpdateColumnInput = Partial<{
   order: number;
   width: number;
   view_mode: IndicatorViewMode;
-  state_code: string;
+  state_code: string | null;
   parameters: IndicatorParameters;
 }>;
 

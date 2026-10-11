@@ -420,3 +420,47 @@ async def test_settings_and_public_security_contracts(watch_context) -> None:
     bars = await client.get("/api/v1/securities/600519/daily-bars", params={"adjust_type": "qfq"})
     assert bars.status_code == 200
     assert len(bars.json()["data"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_column_mode_transition_clears_stale_state_identity(watch_context) -> None:
+    client, _session_factory, user_one, _user_two = watch_context
+    app = client._transport.app  # type: ignore[attr-defined]
+    _as_user(app, user_one)
+    await client.put("/api/v1/settings", json={"indicator_settings": {"defaults": []}})
+    created = await client.post("/api/v1/watch-tables", json={"name": "指标模式切换"})
+    assert created.status_code == 201
+    table_id = created.json()["data"]["id"]
+    column = await client.post(
+        f"/api/v1/watch-tables/{table_id}/columns",
+        json={
+            "indicator_type": "BOLL",
+            "view_mode": "STATUS",
+            "state_code": "BOLL_BREAK_UPPER",
+            "parameters": {"period": 20, "multiplier": 2},
+        },
+    )
+    assert column.status_code == 201, column.text
+    column_id = column.json()["data"]["id"]
+    numeric = await client.put(
+        f"/api/v1/columns/{column_id}",
+        json={
+            "view_mode": "NUMBER",
+            "state_code": None,
+            "parameters": {"period": 20, "multiplier": 2, "field": "upper"},
+        },
+    )
+    assert numeric.status_code == 200, numeric.text
+    assert numeric.json()["data"]["state_code"] is None
+    assert numeric.json()["data"]["parameters"]["field"] == "upper"
+    invalid = await client.put(
+        f"/api/v1/columns/{column_id}",
+        json={"view_mode": "DELTA", "parameters": {"period": 20, "multiplier": 2}},
+    )
+    assert invalid.status_code == 400
+    composite = await client.put(
+        f"/api/v1/columns/{column_id}",
+        json={"view_mode": "COMPOSITE", "parameters": {"period": 20, "multiplier": 2}},
+    )
+    assert composite.status_code == 200, composite.text
+    assert composite.json()["data"]["state_code"] is None

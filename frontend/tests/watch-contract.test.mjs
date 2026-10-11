@@ -168,7 +168,7 @@ test("watch detail polling interval is five minutes", () => {
   assert.equal(WATCH_BOOTSTRAP_POLL_INTERVAL_MS, 5_000);
   assert.equal(WATCH_BOOTSTRAP_TIMEOUT_MS, 120_000);
   const source = readFileSync(new URL("../src/app/(workspace)/watch/page.tsx", import.meta.url), "utf8");
-  assert.match(source, /stillPreparing \? WATCH_BOOTSTRAP_POLL_INTERVAL_MS : WATCH_DETAIL_REFRESH_INTERVAL_MS/);
+  assert.match(source, /watchRefreshInterval\(data, firstObservedRef\.current\)/);
   assert.match(source, /query\.state\.data/);
   assert.match(source, /refetchIntervalInBackground: false/);
   assert.doesNotMatch(source, /正在刷新监控数据/);
@@ -177,7 +177,7 @@ test("watch detail polling interval is five minutes", () => {
 test("add-stock dialog bounds long search results and inserts a stable bootstrap row", () => {
   const source = readFileSync(new URL("../src/components/table/AddStockDialog.tsx", import.meta.url), "utf8");
   assert.match(source, /max-h-\[15rem\].*overflow-y-auto/);
-  assert.match(source, /setQueryData<WatchTableDetails>/);
+  assert.match(source, /setQueriesData<WatchTableDetails>/);
   assert.match(source, /onAdded\?\.\(stock\)/);
   assert.doesNotMatch(source, /BOOTSTRAP_REFRESH_DELAYS_MS/);
   assert.match(source, /title=\{security\.name\}/);
@@ -398,4 +398,36 @@ test("watch page remounts the table only when its persisted table id changes", (
 test("completed short-history analysis is not a permanently spinning bootstrap", () => {
   assert.equal(isWatchStockDataReady({ bootstrap_ready: true, analysis_status: "READY", column_values: { "1": { available: false } } }, [{ id: 1, visible: true }]), true);
   assert.equal(isWatchStockDataReady({ bootstrap_ready: true, analysis_status: "REBUILD_PENDING", price: { value: 10 } }), false);
+});
+
+
+test("stock reorder preserves the full unique ordered ID set", async () => {
+  const { reorderStockIdsForDrop } = await import("../src/lib/watch-contract.mjs");
+  assert.deepEqual(reorderStockIdsForDrop([1, 2, 3], 1, 3), [2, 3, 1]);
+  assert.deepEqual(reorderStockIdsForDrop([1, 2, 3], 3, 1), [3, 1, 2]);
+  assert.equal(reorderStockIdsForDrop([1, 1, 3], 1, 3), null);
+  assert.equal(reorderStockIdsForDrop([1, 2, 3], 1, 7), null);
+  assert.equal(reorderStockIdsForDrop([1, 2, 3], 2, 2), null);
+});
+
+test("existing watch tables offer creation and scrolling is only horizontal", () => {
+  const page = readFileSync(new URL("../src/app/(workspace)/watch/page.tsx", import.meta.url), "utf8");
+  const table = readFileSync(new URL("../src/components/table/WatchTable.tsx", import.meta.url), "utf8");
+  const api = readFileSync(new URL("../src/api/watch.ts", import.meta.url), "utf8");
+  assert.match(page, /creatingTable && activeTableId !== null/);
+  assert.match(table, /onDragStart=/);
+  assert.match(table, /onDrop=/);
+  assert.match(api, /stocks\/reorder/);
+  assert.match(table, /overflow-x-auto overflow-y-visible/);
+  assert.doesNotMatch(table, /max-h-\[min\(70vh,720px\)\]/);
+});
+
+test("notification copy identifies the actual available webhook provider", () => {
+  const notice = readFileSync(new URL("../src/app/(workspace)/notifications/NotificationsWorkspace.tsx", import.meta.url), "utf8");
+  const settings = readFileSync(new URL("../src/app/(workspace)/settings/SettingsWorkspace.tsx", import.meta.url), "utf8");
+  const alert = readFileSync(new URL("../src/components/alerts/AlertCard.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(notice, /飞书通知记录/);
+  assert.match(settings, /Webhook 通知/);
+  assert.match(settings, /目前支持飞书\/Lark Webhook/);
+  assert.match(alert, /渠道：Webhook 通知/);
 });

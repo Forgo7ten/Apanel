@@ -144,9 +144,17 @@ class NotificationData(BaseModel):
     sent_at: datetime | None = None
 
 
+class NotificationHistoryData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[NotificationData]
+    next_cursor: str | None = None
+
+
 __all__ = [
     "AlertRuleCreateRequest",
     "AlertRuleData",
     "AlertRuleUpdateRequest",
     "NotificationData",
+    "NotificationHistoryData",
 ]

@@ -145,6 +145,8 @@ http://localhost:8080/api/v1
 
 新增股票会 best-effort enqueue `bootstrap_security_data`，无需等待未来交易日即可准备历史日线、分红、指标和状态。相同股票可以出现在多个 Watch Table；共享市场/分析数据不会因从某个表移除而删除。
 
+动态列从 `STATUS` 切换到数值/变化/组合模式时，客户端应提交新的 `parameters` 和显式 `state_code: null`，由后端清理过期状态身份；切换到 `STATUS` 时必须选择状态码并提供对应参数。
+
 动态指标列支持 `NUMBER`、`DELTA`、`COMPOSITE`、`STATUS`。`NUMBER/DELTA` 对多值指标必须通过 `parameters.field` 明确具体 scalar；`STATUS` 必须提交 `state_code`，并把该状态需要的参数一并持久化，例如：
 
 ```json
@@ -212,11 +214,15 @@ VALUE 规则必须最终解析到一个 scalar field，例如：
 }
 ```
 
-RSI / Projected MA 等单值指标可省略 `field`，服务端会规范化为 `value`；MA、KDJ、BOLL、MACD 等多值指标必须明确具体 field。`DIVIDEND_YIELD` 固定为 `field=value` 且 `adjust_type=none`。
+RSI / Projected MA 等单值指标可省略 `field`，服务端会规范化为 `value`；MA、KDJ、BOLL、MACD 等多值指标必须明确具体 field。`DIVIDEND_YIELD` 固定为 `field=value` 且 `adjust_type=none`。股息率提醒阈值 API 始终使用小数比例（例如 4% 对应 `0.04`）；前端负责百分比输入与回显，不可将显示值 `4` 直接提交到阈值。
 
 STATE 规则提交 `state_id`/`state_code` 与可选参数；MA 状态可指定 `short_period` / `long_period`。服务端会规范化参数并自行生成稳定 `parameter_key`，客户端不能把 hash 当作可信输入，因此不同周期组合可以并存。Alert response 会返回规范化后的 `parameters`、`parameter_key`、`field`、`adjust_type` 与 `needs_review`。
 
 Edge Trigger 只在 RESET → ACTIVE 时创建通知事件。状态切回 RESET 后再次进入 ACTIVE 才会重新触发。
+
+### `GET /notifications/history`
+
+通知历史分页接口，需登录，返回 `data.items` 和 `data.next_cursor`。默认每页 50 条，`limit` 上限 100，传入上一页的 `next_cursor` 获取更早记录；无下一页时为 `null`。服务端按照 `created_at DESC, id DESC` 游标分页，并始终按当前用户归属过滤。`next_cursor` 为不透明标记，不应由前端自行解析或拼接。新增通知不会让已加载的历史分页重复或漏行。
 
 ### `GET /notifications`
 

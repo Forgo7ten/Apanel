@@ -18,7 +18,7 @@ test("workspace header displays the real backend health query instead of placeho
   const header = readFileSync(new URL("../src/components/layout/Header.tsx", import.meta.url), "utf8");
   const healthApi = readFileSync(new URL("../src/api/health.ts", import.meta.url), "utf8");
 
-  assert.match(header, /queryKey: \["backend-health"\]/);
+  assert.match(header, /queryKey: queryKeys\.backendHealth\(\)/);
   assert.match(header, /queryFn: getBackendHealth/);
   assert.match(header, /refetchInterval: HEALTH_REFRESH_INTERVAL_MS/);
   assert.match(header, /后端服务正常/);

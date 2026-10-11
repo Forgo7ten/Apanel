@@ -1,7 +1,11 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { trapDialogTab } from "@/components/ui/dialog-focus";
 
 import { searchSecurities } from "@/api/securities";
 import type { AlertRule, CreateAlertInput, IndicatorParameters, Security } from "@/api/types";
@@ -14,6 +18,7 @@ import {
   ALERT_OPERATOR_OPTIONS,
   ALERT_STATE_OPTIONS,
   buildAlertPayload,
+  displayAlertThreshold,
 } from "@/lib/notification-contract.mjs";
 
 type SelectedSecurity = Security & { id: number | string };
@@ -78,7 +83,10 @@ export function AlertWizard({
   const [stateId, setStateId] = useState(initialRule?.state_id ?? initialRule?.state_code ?? initialDraft?.state_id ?? ALERT_STATE_OPTIONS[0]?.id ?? "");
   const [indicator, setIndicator] = useState(initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator ?? ALERT_INDICATOR_OPTIONS[0]?.id ?? "RSI");
   const [operator, setOperator] = useState(initialRule?.operator ?? ALERT_OPERATOR_OPTIONS[0]?.id ?? ">=");
-  const [threshold, setThreshold] = useState(initialRule?.threshold === null || initialRule?.threshold === undefined ? "70" : String(initialRule.threshold));
+  const [threshold, setThreshold] = useState(() => displayAlertThreshold(
+    initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator,
+    initialRule?.threshold,
+  ));
   const initialIndicator = initialRule?.indicator ?? initialRule?.indicator_type ?? initialDraft?.indicator ?? "RSI";
   const [parameters, setParameters] = useState<IndicatorParameters>(() => initialValueParameters(
     initialIndicator,
@@ -94,13 +102,43 @@ export function AlertWizard({
     (initialRule?.adjust_type ?? initialDraft?.adjust_type) === "none" ? "none" : "qfq",
   );
   const [formError, setFormError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const submittingRef = useRef(isSubmitting);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { submittingRef.current = isSubmitting; }, [isSubmitting]);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    openerRef.current = document.activeElement as HTMLElement | null;
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      // A foreground modal owns its keys; never close the drawer behind it.
+      if (!dialogRef.current || !dialogRef.current.contains(event.target as Node)) return;
+      if (event.key === "Escape") {
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        if (!submittingRef.current) onCloseRef.current();
+      } else if (event.key === "Tab" && trapDialogTab(dialogRef.current, event.shiftKey)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown, true);
+      openerRef.current?.focus();
+    };
+  }, [open]);
 
   const editing = initialRule !== null && initialRule !== undefined;
   const title = editing ? "编辑监听规则" : "新建监听规则";
   const selectedState = useMemo(() => ALERT_STATE_OPTIONS.find((item) => item.id === stateId), [stateId]);
 
   const searchQuery = useQuery({
-    queryKey: ["security-search", securityQuery.trim()],
+    queryKey: queryKeys.securitySearch(securityQuery),
     queryFn: () => searchSecurities(securityQuery.trim()),
     enabled: open && securityQuery.trim().length >= 2 && selectedSecurity?.symbol !== securityQuery.trim(),
     staleTime: 60_000,
@@ -153,16 +191,16 @@ export function AlertWizard({
     ? editing ? "后端尚未提供修改监听规则接口。" : "后端尚未提供创建监听规则接口。"
     : submitError instanceof Error ? submitError.message : null;
 
-  return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-app/80 px-4 py-8 backdrop-blur-sm" role="presentation">
-      <div className="mx-auto max-w-xl rounded-panel border border-line bg-panel shadow-panel" role="dialog" aria-modal="true" aria-labelledby="alert-wizard-title">
+  return createPortal(
+    <div className="fixed inset-0 z-[70] overflow-y-auto bg-app/80 px-4 py-8 backdrop-blur-sm" role="presentation">
+      <div ref={dialogRef} className="mx-auto max-w-xl rounded-panel border border-line bg-panel shadow-panel" role="dialog" aria-modal="true" aria-labelledby="alert-wizard-title">
         <div className="flex items-start justify-between border-b border-line px-5 py-4">
           <div>
             <p className="text-xs font-medium uppercase tracking-[0.16em] text-brand">Alert workflow</p>
             <h2 id="alert-wizard-title" className="mt-1 text-lg font-semibold text-primary">{title}</h2>
             <p className="mt-1 text-xs text-muted">选择股票，再选择后端状态或数值条件。</p>
           </div>
-          <button type="button" onClick={onClose} className="rounded border border-line bg-card px-2 py-1 text-xs text-secondary hover:text-primary" aria-label="关闭监听规则窗口">
+          <button ref={closeRef} type="button" disabled={isSubmitting} onClick={onClose} className="rounded border border-line bg-card px-2 py-1 text-xs text-secondary hover:text-primary" aria-label="关闭监听规则窗口">
             关闭
           </button>
         </div>
@@ -263,6 +301,7 @@ export function AlertWizard({
                         setIndicator(next);
                         setParameters(getDefaultIndicatorParameters(next));
                         setField("");
+                        setThreshold(next === "DIVIDEND_YIELD" ? "4" : "70");
                       }} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-2 text-sm font-normal text-primary">
                       {ALERT_INDICATOR_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.title}</option>)}
                     </select>
@@ -272,7 +311,7 @@ export function AlertWizard({
                       {ALERT_OPERATOR_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.id} · {option.title}</option>)}
                     </select>
                   </label>
-                  <label htmlFor="alert-threshold" className="text-xs font-medium text-secondary">阈值
+                  <label htmlFor="alert-threshold" className="text-xs font-medium text-secondary">阈值{indicator === "DIVIDEND_YIELD" ? "（%）" : ""}
                     <input id="alert-threshold" type="number" step="any" value={threshold} onChange={(event) => setThreshold(event.target.value)} className="mt-2 h-10 w-full rounded-panel border border-line bg-card px-3 text-sm font-normal text-primary" />
                   </label>
                 </div>
@@ -325,5 +364,5 @@ export function AlertWizard({
         </form>
       </div>
     </div>
-  );
+  , document.body);
 }

@@ -76,7 +76,8 @@ export function buildAlertPayload(form) {
   const indicator = form.indicator.trim().toUpperCase();
   payload.indicator = indicator;
   payload.operator = form.operator;
-  payload.threshold = threshold;
+  // Display percentages, persist decimal ratios. Do not alter non-yield thresholds.
+  payload.threshold = indicator === "DIVIDEND_YIELD" ? threshold / 100 : threshold;
   payload.parameters = form.parameters && typeof form.parameters === "object" ? form.parameters : getDefaultIndicatorParameters(indicator);
   const fields = getIndicatorFieldOptions(indicator);
   if (fields.length > 1 || indicator === "MA") {
@@ -101,4 +102,19 @@ export function shouldShowNotificationRetry(record) {
   if (!record || typeof record !== "object") return false;
   const status = typeof record.status === "string" ? record.status.toUpperCase() : "";
   return status === "FAILED" || (status === "PENDING" && record.retryable === true);
+}
+
+/** Convert a persisted decimal yield threshold to the percentage users enter. */
+export function displayAlertThreshold(indicator, threshold) {
+  if (threshold === null || threshold === undefined) return String(indicator ?? "").toUpperCase() === "DIVIDEND_YIELD" ? "4" : "70";
+  if (String(indicator ?? "").toUpperCase() !== "DIVIDEND_YIELD") return String(threshold);
+  const ratio = Number(threshold);
+  return Number.isFinite(ratio) ? String(Number((ratio * 100).toPrecision(12))) : String(threshold);
+}
+
+export function alertThresholdLabel(indicator, threshold) {
+  if (threshold == null) return "";
+  return String(indicator ?? "").toUpperCase() === "DIVIDEND_YIELD"
+    ? `${displayAlertThreshold(indicator, threshold)}%`
+    : String(threshold);
 }

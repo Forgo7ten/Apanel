@@ -1,5 +1,7 @@
 "use client";
 
+import { queryKeys } from "@/lib/query-keys.mjs";
+
 import { useQuery } from "@tanstack/react-query";
 import { usePathname } from "next/navigation";
 
@@ -28,7 +30,7 @@ export function Header() {
   const pathname = usePathname() ?? "/watch";
   const page = getPageMeta(pathname);
   const healthQuery = useQuery({
-    queryKey: ["backend-health"],
+    queryKey: queryKeys.backendHealth(),
     queryFn: getBackendHealth,
     refetchInterval: HEALTH_REFRESH_INTERVAL_MS,
     refetchIntervalInBackground: false,
